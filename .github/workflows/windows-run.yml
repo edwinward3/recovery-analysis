@@ -1,0 +1,86 @@
+name: windows-run
+
+# Run RUN.bat from start to finish on Windows, on both Python versions it accepts.
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  run-bat:
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Install deps (for building the fake input files only)
+        run: python -m pip install -r requirements.txt
+
+      - name: Build fake input files
+        run: python .github/make_ci_inputs.py
+
+      - name: Run RUN.bat end to end
+        shell: cmd
+        env:
+          RECOVERY_NO_PAUSE: "1"
+        run: RUN.bat fold.csv ch.csv
+
+      - name: Check the results file exists and show it
+        shell: pwsh
+        run: |
+          if (-not (Test-Path outputs/SUMMARY.txt)) { throw "outputs/SUMMARY.txt was not produced" }
+          Get-Content outputs/SUMMARY.txt
+
+      - name: Check the disclosure report is clean
+        shell: pwsh
+        # look for "DO NOT EGRESS", not "VIOLATION": the check ignores case, so the clean
+        # report's own "ZERO violations" line would match "VIOLATION" and fail a good run.
+        run: |
+          $report = "outputs/safety_check.txt"
+          if (-not (Test-Path $report)) { throw "no disclosure report was written" }
+          $text = Get-Content $report -Raw
+          Write-Host $text
+          if ($text -match "DO NOT EGRESS") { throw "disclosure gate refused egress" }
+
+      - name: Re-run to prove setup is skipped and a second run still works
+        shell: cmd
+        env:
+          RECOVERY_NO_PAUSE: "1"
+        run: RUN.bat fold.csv ch.csv
+
+  offline-bundle:
+    # Check the offline install: with a wheels folder present, RUN.bat installs from it and
+    # never goes online. The wheels are built here rather than stored in the repo (they are large).
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Install deps (only to build the fake input files below)
+        run: python -m pip install -r requirements.txt
+      - name: Build fake input files
+        run: python .github/make_ci_inputs.py
+      - name: Build the wheels folder and lock file
+        # RUN.bat installs from these wheels only, so this checks the offline path even though
+        # the packages were also installed above.
+        shell: pwsh
+        run: |
+          python -m pip download -r requirements.txt -d wheels
+          Copy-Item requirements.txt requirements.lock
+      - name: Run RUN.bat offline (installs from wheels, no PyPI)
+        shell: cmd
+        env:
+          RECOVERY_NO_PAUSE: "1"
+        run: RUN.bat fold.csv ch.csv
+      - name: Check the results file exists
+        shell: pwsh
+        run: if (-not (Test-Path outputs/SUMMARY.txt)) { throw "outputs/SUMMARY.txt was not produced" }

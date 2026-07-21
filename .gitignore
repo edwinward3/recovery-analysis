@@ -1,0 +1,17 @@
+# Local virtual environment created by RUN.bat / setup
+.venv/
+
+# Run outputs (contain analysis results; not source)
+outputs/
+
+# Python bytecode
+__pycache__/
+*.pyc
+
+# OS clutter
+.DS_Store
+wheels/
+requirements.lock
+ch.csv
+fold.csv
+*.csv
