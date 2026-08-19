@@ -4,6 +4,7 @@ Inputs are fixed settings and fake in-memory records. Outputs exist only in
 temporary test folders and contain no confidential or row-level RT data.
 """
 
+import math
 from pathlib import Path
 
 import pandas as pd
@@ -14,6 +15,7 @@ from recovery.reporting import (
     build_data_audit_counts,
     build_population_sensitivities,
     create_run_paths,
+    peak_memory_mb,
     source_fingerprint,
     write_summary,
 )
@@ -25,6 +27,12 @@ def test_repository_settings_are_valid() -> None:
     settings = load_settings(Path(__file__).parents[1] / "settings.toml")
     assert settings.auto_threshold == 0.85
     assert settings.sample_auto + settings.sample_review + settings.sample_fallback == 1_000
+
+
+def test_peak_memory_measurement_is_positive() -> None:
+    peak = peak_memory_mb()
+    assert math.isfinite(peak)
+    assert peak > 0
 
 
 def test_settings_reject_unknown_or_bad_values(tmp_path: Path) -> None:

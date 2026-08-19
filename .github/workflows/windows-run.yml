@@ -182,12 +182,27 @@ jobs:
           $env:SCALE_RUN_ROOT = $run.FullName
           python -c "import os; from pathlib import Path; from recovery.selftest import _assert_match_truth; _assert_match_truth(Path(os.environ['SCALE_RUN_ROOT']), Path('scale inputs !/synthetic_ground_truth.csv'))"
           $log = Import-Csv (Join-Path $run.FullName "egress_candidate\E5_run_log.csv")
-          $peakText = ($log | Measure-Object -Property peak_memory_mb -Maximum).Maximum
-          if ([string]::IsNullOrWhiteSpace([string]$peakText)) { throw "scale run did not report peak memory" }
-          $peak = [double]$peakText
-          if ([double]::IsNaN($peak) -or [double]::IsInfinity($peak)) { throw "scale peak memory is not finite: $peakText" }
-          if ($peak -gt 8192) { throw "peak memory exceeded 8 GB: $peak MB" }
           $manifest = Get-Content (Join-Path $run.FullName "egress_candidate\E5_run_manifest.json") -Raw | ConvertFrom-Json
+          function ConvertTo-ValidPeak([object]$raw, [string]$source) {
+            $text = [string]$raw
+            $value = 0.0
+            if ([string]::IsNullOrWhiteSpace($text) -or -not [double]::TryParse(
+              $text,
+              [System.Globalization.NumberStyles]::Float,
+              [System.Globalization.CultureInfo]::InvariantCulture,
+              [ref]$value
+            )) { throw "$source did not report numeric peak memory: $text" }
+            if ([double]::IsNaN($value) -or [double]::IsInfinity($value) -or $value -le 0) {
+              throw "$source reported unavailable or invalid peak memory: $text"
+            }
+            return $value
+          }
+          $peaks = @($log | ForEach-Object {
+            ConvertTo-ValidPeak $_.peak_memory_mb "E5 stage '$($_.stage)'"
+          })
+          $peaks += ConvertTo-ValidPeak $manifest.runtime.peak_memory_mb "E5 manifest"
+          $peak = ($peaks | Measure-Object -Maximum).Maximum
+          if ($peak -gt 8192) { throw "peak memory exceeded 8 GB: $peak MB" }
           if ($manifest.disclosure.status -ne "pass") { throw "scale disclosure gate did not pass" }
           New-Item -ItemType Directory -Force "scale evidence" | Out-Null
           @(

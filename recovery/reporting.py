@@ -580,28 +580,7 @@ def peak_memory_mb() -> float:
 
     if os.name == "nt":
         try:
-            import ctypes
-            from ctypes import wintypes
-
-            class Counters(ctypes.Structure):
-                _fields_ = [
-                    ("cb", wintypes.DWORD),
-                    ("PageFaultCount", wintypes.DWORD),
-                    ("PeakWorkingSetSize", ctypes.c_size_t),
-                    ("WorkingSetSize", ctypes.c_size_t),
-                    ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
-                    ("QuotaPagedPoolUsage", ctypes.c_size_t),
-                    ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
-                    ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
-                    ("PagefileUsage", ctypes.c_size_t),
-                    ("PeakPagefileUsage", ctypes.c_size_t),
-                ]
-
-            counters = Counters()
-            counters.cb = ctypes.sizeof(counters)
-            handle = ctypes.windll.kernel32.GetCurrentProcess()
-            ctypes.windll.psapi.GetProcessMemoryInfo(handle, ctypes.byref(counters), counters.cb)
-            return counters.PeakWorkingSetSize / (1024 * 1024)
+            return _windows_peak_memory_mb()
         except Exception:
             return float("nan")
     try:
@@ -611,6 +590,51 @@ def peak_memory_mb() -> float:
         return value / 1024 if sys.platform != "darwin" else value / (1024 * 1024)
     except Exception:
         return float("nan")
+
+
+def _windows_peak_memory_mb() -> float:
+    """Read the current process peak with correctly typed 64-bit WinAPI calls."""
+
+    import ctypes
+    from ctypes import wintypes
+
+    class Counters(ctypes.Structure):
+        _fields_ = [
+            ("cb", wintypes.DWORD),
+            ("PageFaultCount", wintypes.DWORD),
+            ("PeakWorkingSetSize", ctypes.c_size_t),
+            ("WorkingSetSize", ctypes.c_size_t),
+            ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+            ("QuotaPagedPoolUsage", ctypes.c_size_t),
+            ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+            ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+            ("PagefileUsage", ctypes.c_size_t),
+            ("PeakPagefileUsage", ctypes.c_size_t),
+        ]
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    psapi = ctypes.WinDLL("psapi", use_last_error=True)
+    get_current_process = kernel32.GetCurrentProcess
+    get_current_process.argtypes = []
+    get_current_process.restype = wintypes.HANDLE
+    get_process_memory = psapi.GetProcessMemoryInfo
+    get_process_memory.argtypes = [
+        wintypes.HANDLE,
+        ctypes.POINTER(Counters),
+        wintypes.DWORD,
+    ]
+    get_process_memory.restype = wintypes.BOOL
+
+    counters = Counters()
+    counters.cb = ctypes.sizeof(counters)
+    if not get_process_memory(
+        get_current_process(), ctypes.byref(counters), counters.cb
+    ):
+        raise ctypes.WinError(ctypes.get_last_error())
+    peak = counters.PeakWorkingSetSize / (1024 * 1024)
+    if peak <= 0:
+        raise OSError("Windows returned a non-positive peak working set")
+    return peak
 
 
 def _write_csv(path: Path, table: pd.DataFrame) -> str:
