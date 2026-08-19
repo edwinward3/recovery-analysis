@@ -1,0 +1,3 @@
+# Developer and CI packages; never installed by the RT launcher.
+-r requirements.txt
+pytest==9.1.1

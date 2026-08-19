@@ -1,0 +1,36 @@
+# Purpose: fixed, reviewable matching, cohort, sample and acceptance settings.
+# Input to the offline pipeline; values contain no RT data and create no output themselves.
+# Any change is recorded by fingerprint in E5_run_manifest.json.
+
+[matching]
+auto_threshold = 0.85
+review_threshold = 0.70
+auto_margin = 0.05
+
+[cohort]
+primary_min_months = 12
+primary_max_months = 36
+prior_history_months = 24
+
+[review_sample]
+diagnostic_seed = 20260618
+locked_seed = 20260619
+sample_auto = 500
+sample_review = 300
+sample_fallback = 200
+
+[acceptance]
+min_test_rows = 1000
+min_test_each_class = 100
+min_calibration_each_class = 50
+isotonic_each_class = 200
+auc_floor = 0.70
+match_precision_floor = 0.98
+match_precision_lower_ci_floor = 0.95
+max_calibration_gap = 0.03
+min_calibration_slope = 0.80
+max_calibration_slope = 1.20
+bootstrap_replicates = 1000
+
+[runtime]
+min_cell_n = 10

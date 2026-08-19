@@ -1,78 +1,201 @@
-"""Self-test. Runs the whole thing on fake data, no real file needed. Run this first.
+"""Exercise the real offline pipeline using deterministic synthetic data only.
 
-It checks the packages are installed, builds a tiny fake Companies House file and judgment file,
-runs every step into a temporary folder, and confirms the disclosure gate is clean. Prints
-SELF-TEST: PASS only if all of that worked. No internet, no other programs, no real data.
+Inputs are generated fake RT and Companies House records. Outputs are either a
+requested synthetic input bundle or a temporary diagnostic run that is deleted
+on exit. The test checks planted match identities, corruption-class behaviour,
+model/report production and the disclosure boundary. No network or shell calls
+are made by this module and no confidential data is read.
 """
 
-import os
-import sys
-import tempfile
+from __future__ import annotations
+
+from argparse import ArgumentParser
 from pathlib import Path
+from tempfile import TemporaryDirectory
+from typing import Sequence
+import sys
 
-# engine.py is in this folder; this line lets the "import engine" below find it
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import pandas as pd
+
+from .disclosure import validate_egress
+from .run import MATCH_FILENAME, PAIR_FILENAME, analyze
+from .synthetic import make_synthetic_bundle, write_bundle
 
 
-def main() -> int:
-    print(f"python: {sys.version.split()[0]}  platform: {sys.platform}")
-    try:
-        import matplotlib  # noqa: F401
-        import numpy  # noqa: F401
-        import pandas  # noqa: F401
-        import rapidfuzz  # noqa: F401
-        import scipy  # noqa: F401
-        import sklearn  # noqa: F401
-    except ImportError as exc:
-        print(f"SELF-TEST: FAIL, missing dependency: {exc}", file=sys.stderr)
-        return 1
+_EXPECTED_EGRESS = {
+    "SUMMARY.txt",
+    "E1_data_audit.csv",
+    "E1_data_funnel.csv",
+    "E2_match_coverage.csv",
+    "E2_unmatched_reasons.csv",
+    "E2_match_methods.csv",
+    "E2_match_by_defendant_type.csv",
+    "E2_match_by_judgment_vintage.csv",
+    "E2_incorporation_guards.csv",
+    "E3_model_comparison.csv",
+    "E3_calibration.csv",
+    "E3_feature_effects.csv",
+    "E3_split_counts.csv",
+    "E4_sensitivities.csv",
+    "E4_lift.csv",
+    "E4_limitations.txt",
+    "E5_run_log.csv",
+    "E5_run_manifest.json",
+}
 
-    import engine
+_EXPECTED_TIERS = {
+    "clean": "auto",
+    "punctuation": "auto",
+    "review_name": "review",
+    "trading": "auto",
+    "former": "auto",
+    "postcode_drift": "fallback_review",
+    "ambiguous": "review",
+    "unmatched": "unmatched",
+}
 
-    try:
-        # 60 fake companies and 800 fake judgments
-        names = [f"COMPANY {i} LIMITED" for i in range(60)]
-        ch = engine.generate_ch_bulk(names, seed=0)
-        fold, _ = engine.generate_fold(
-            n_rows=800, ch_names=names, seed=0, ch_bulk=ch, plant_signal=True
-        )
-        # temp folder, auto-deleted on exit
-        with tempfile.TemporaryDirectory() as d:
-            outdir = Path(d) / "outputs"
-            outdir.mkdir()
-            ch_path = Path(d) / "ch.csv"
-            ch.to_csv(ch_path, index=False)
-            fold_path = Path(d) / "fold.csv"
-            # write UK dates (day/month/year) like a real file; the copy in memory keeps its
-            # date columns for the steps below.
-            fold_to_write = fold.copy()
-            for col in ("Date Inserted", "JudgmentDate"):
-                fold_to_write[col] = fold_to_write[col].dt.strftime("%d/%m/%Y")
-            fold_to_write.to_csv(fold_path, index=False)
 
-            engine.run_audit(fold_path, outdir)
-            index = engine.load_ch_index(ch_path)
-            matched = engine.match_judgments(fold, index)
-            engine.match_report(fold, matched)["tier_counts"].to_csv(
-                outdir / "match_counts.csv", index=False
-            )
-            feats = engine.build_features(matched, fold, index)
-            labelled = engine.build_labelled(fold)
-            result = engine.fit_pfull(feats, labelled["primary"])
-            engine.write_model_files(result, labelled, outdir)
-            engine.write_breakdown_files(engine.breakdown_report(result.holdout, feats, fold, labelled), outdir)
-            engine.write_run_log([{"stage": "self-test", "rows": len(fold), "note": "ok"}], outdir)
-            disc = engine.apply_disclosure(outdir)
-            if disc["violations"]:
-                print(f"SELF-TEST: FAIL, disclosure violations: {disc['violations']}", file=sys.stderr)
-                return 1
-            print(f"backend: {result.backend}  AUC: {result.auc_oot:.4f}")
-    except Exception as exc:  # noqa: BLE001 (a self-test must report ANY failure, not crash silently)
-        print(f"SELF-TEST: FAIL, {type(exc).__name__}: {exc}", file=sys.stderr)
-        return 1
+def _parser() -> ArgumentParser:
+    parser = ArgumentParser(description="Run the synthetic recovery-analysis test")
+    parser.add_argument(
+        "--write-inputs",
+        metavar="DIRECTORY",
+        help="write synthetic inputs for a launcher or scale test and stop",
+    )
+    parser.add_argument("--n-companies", type=int, default=1_600)
+    parser.add_argument("--format", choices=("xlsx", "csv"), default="xlsx")
+    parser.add_argument(
+        "--no-prior-rows",
+        action="store_true",
+        help="omit earlier history rows so n-companies equals judgment rows",
+    )
+    parser.add_argument("--settings", default="settings.toml")
+    return parser
 
-    print("SELF-TEST: PASS. Whole chain ran, disclosure gate clean.")
+
+def _write_inputs(args: object) -> int:
+    bundle = make_synthetic_bundle(
+        args.n_companies,
+        include_prior_rows=not args.no_prior_rows,
+    )
+    paths = write_bundle(
+        bundle,
+        args.write_inputs,
+        excel=args.format == "xlsx",
+    )
+    for path in paths:
+        print(path)
+    print(
+        f"SYNTHETIC INPUTS: PASS ({len(bundle.judgments):,} judgment rows; "
+        f"{args.n_companies:,} target companies)"
+    )
     return 0
+
+
+def _assert_match_truth(run_root: Path, truth_path: Path) -> None:
+    matches = pd.read_csv(
+        run_root / "rt_internal" / MATCH_FILENAME,
+        dtype={"ID": "string", "matched_company_number": "string"},
+    )
+    truth = pd.read_csv(
+        truth_path,
+        dtype={"ID": "string", "expected_company_number": "string"},
+    )
+    checked = truth.merge(matches, on="ID", how="left", validate="one_to_one")
+    if checked["tier"].isna().any():
+        raise AssertionError("one or more planted target judgments were not matched")
+
+    proposed = checked["tier"].ne("unmatched")
+    wrong = checked.loc[
+        proposed
+        & checked["matched_company_number"].ne(checked["expected_company_number"])
+    ]
+    if not wrong.empty:
+        raise AssertionError(f"{len(wrong)} proposed matches have the wrong identity")
+
+    observed = (
+        checked.groupby("corruption_class", observed=True)["tier"]
+        .agg(lambda values: tuple(sorted(set(values))))
+        .to_dict()
+    )
+    expected = {key: (value,) for key, value in _EXPECTED_TIERS.items()}
+    if observed != expected:
+        raise AssertionError(
+            f"corruption-class tiers differ from ground truth: {observed!r}"
+        )
+
+
+def _assert_outputs(run_root: Path, truth_path: Path) -> None:
+    egress = run_root / "egress_candidate"
+    actual = {path.name for path in egress.iterdir() if path.is_file()}
+    missing = sorted(_EXPECTED_EGRESS - actual)
+    if missing:
+        raise AssertionError(f"missing aggregate outputs: {missing}")
+    validate_egress(egress)
+
+    pairs = pd.read_csv(run_root / "rt_internal" / PAIR_FILENAME)
+    if len(pairs) != 1_000:
+        raise AssertionError(f"match-review file has {len(pairs)} rows, expected 1,000")
+    allocation = pairs["review_tier"].value_counts().to_dict()
+    expected_allocation = {"auto": 500, "review": 300, "fallback_review": 200}
+    if allocation != expected_allocation:
+        raise AssertionError(f"review allocation differs: {allocation!r}")
+
+    comparison = pd.read_csv(egress / "E3_model_comparison.csv")
+    if set(comparison["model"]) != {
+        "prospective.logistic",
+        "prospective.lightgbm",
+        "snapshot_exploratory.logistic",
+        "snapshot_exploratory.lightgbm",
+    }:
+        raise AssertionError("the four declared model fits were not all reported")
+    split_rows = pd.read_csv(egress / "E3_split_counts.csv")
+    if set(split_rows["split"]) != {"train", "validation", "calibration", "test"}:
+        raise AssertionError("the four declared partitions were not all reported")
+
+    _assert_match_truth(run_root, truth_path)
+
+
+def _run_full(args: object) -> int:
+    if args.n_companies < 1_600:
+        raise ValueError("the full self-test requires at least 1,600 companies")
+    bundle = make_synthetic_bundle(
+        args.n_companies,
+        include_prior_rows=not args.no_prior_rows,
+    )
+    with TemporaryDirectory(prefix="recovery-selftest-") as temporary:
+        root = Path(temporary)
+        judgments, companies, truth = write_bundle(
+            bundle,
+            root / "inputs !",
+            excel=args.format == "xlsx",
+        )
+        paths = analyze(
+            stage="diagnostic",
+            judgments_path=judgments,
+            companies_house_path=companies,
+            observation_date=bundle.observation_date,
+            settings_path=args.settings,
+            output_base=root / "outputs !",
+            run_id="selftest",
+        )
+        _assert_outputs(paths.root, truth)
+    print(
+        "SELF-TEST: PASS. Planted match identities, four model fits, E1-E5 "
+        "and the disclosure boundary all passed."
+    )
+    return 0
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = _parser().parse_args(argv)
+    try:
+        if args.write_inputs:
+            return _write_inputs(args)
+        return _run_full(args)
+    except Exception as exc:
+        print(f"SELF-TEST: FAIL: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":

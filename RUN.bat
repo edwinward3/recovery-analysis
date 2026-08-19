@@ -1,84 +1,159 @@
+@rem Purpose: prepare the pinned environment and launch one RT analysis run.
+@rem Inputs: local source, optional wheel bundle, RT extract, CH bulk file, stage and date.
+@rem Outputs: segregated RT-internal files and disclosure-checked aggregate candidates.
+@rem Sensitivity: inputs stay local; setup may contact PyPI only when no wheel bundle is present.
 @echo off
-setlocal disabledelayedexpansion
-REM Work in the folder this script sits in, so the Python setup, recovery\ and outputs are all created and read here.
+setlocal DisableDelayedExpansion
 cd /d "%~dp0"
-title Recovery analysis
+title Registry Trust recovery analysis
 
-REM Sets up Python once, self-tests on fake data, then runs the four steps on your two files.
-REM Special handling of "!" is turned off, so a dragged-in path that contains "!" is not damaged.
+set "SETUP_ONLY="
+if /i "%~1"=="--setup-only" set "SETUP_ONLY=1"
 
-set "JUD=%~1"
-set "CH=%~2"
+if not exist "requirements.lock" goto missing_lock
+where python >nul 2>nul
+if errorlevel 1 goto bad_python
+python -c "import platform,struct,sys; ok=platform.python_implementation()=='CPython' and sys.version_info[:2] in ((3,13),(3,14)) and struct.calcsize('P')==8 and platform.machine().lower() in ('amd64','x86_64'); raise SystemExit(0 if ok else 1)" >nul 2>nul
+if errorlevel 1 goto bad_python
 
-REM .setup-ok is written only after the install succeeds, so a failed install is retried.
-if exist ".venv\.setup-ok" goto ready
+set "PY_TAG="
+for /f "delims=" %%V in ('python -c "import sys; print('py'+str(sys.version_info.major)+str(sys.version_info.minor))"') do set "PY_TAG=%%V"
+if not defined PY_TAG goto bad_python
+set "SETUP_KEY="
+for /f "delims=" %%K in ('python -c "import hashlib,sys; print('.'.join(map(str,sys.version_info[:3]))+'-'+hashlib.sha256(open('requirements.lock','rb').read()).hexdigest())"') do set "SETUP_KEY=%%K"
+if not defined SETUP_KEY goto setup_failed
 
-where python >nul 2>nul || (echo Python is not installed. Install Python 3.13 or 3.14 from python.org, tick "Add python.exe to PATH", then run this again. & echo. & pause & exit /b 1)
-python -c "import sys; sys.exit(0 if sys.version_info[:2] in ((3,13),(3,14)) else 1)" 2>nul || (echo Wrong Python version. Install Python 3.13 or 3.14 from python.org, tick "Add python.exe to PATH", then run this again. & echo. & pause & exit /b 1)
+set "INSTALLED_KEY="
+if not exist ".venv\.setup-key" goto install
+for /f "usebackq delims=" %%K in (".venv\.setup-key") do set "INSTALLED_KEY=%%K"
+if not exist ".venv\Scripts\python.exe" goto install
+if "%INSTALLED_KEY%"=="%SETUP_KEY%" goto environment_ready
 
-echo Setting up (first run only)...
-if not exist ".venv\Scripts\python.exe" python -m venv .venv || goto setupfail
-call ".venv\Scripts\activate.bat" || goto setupfail
+:install
+echo Preparing the fixed Python environment...
+if exist ".venv" rmdir /s /q ".venv"
+python -m venv ".venv"
+if errorlevel 1 goto setup_failed
+if exist "wheels\%PY_TAG%\*.whl" goto install_offline
+echo Downloading the fixed packages from PyPI. No RT data is read or sent during setup.
+".venv\Scripts\python.exe" -m pip install --require-hashes --only-binary=:all: -r "requirements.lock"
+if errorlevel 1 goto setup_failed
+goto install_done
 
-if exist "wheels" (
-  echo Installing the bundled packages. No internet needed.
-  python -m pip install --no-index --find-links wheels -r requirements.lock -q || goto setupfail
-) else (
-  echo Installing packages from PyPI. This is the only step that uses the internet.
-  python -m pip install -r requirements.txt -q || goto setupfail
-)
-echo ok> ".venv\.setup-ok"
-goto selftest
+:install_offline
+echo Installing the fixed packages from the local wheel folder. No internet is needed.
+".venv\Scripts\python.exe" -m pip install --no-index --find-links "wheels\%PY_TAG%" --require-hashes --only-binary=:all: -r "requirements.lock"
+if errorlevel 1 goto setup_failed
 
-:setupfail
-echo.
-echo Setup failed. See the message above.
-echo If this machine has no internet, or blocks it, ask us for the offline package bundle.
-echo Nothing has left the machine.
-echo.
-if "%RECOVERY_NO_PAUSE%"=="" pause
-exit /b 1
+:install_done
+> ".venv\.setup-key" echo %SETUP_KEY%
 
-:ready
-call ".venv\Scripts\activate.bat"
+:environment_ready
+if defined SETUP_ONLY exit /b 0
 
-:selftest
 echo Running the self-test on fake data...
-python recovery\selftest.py || goto stop
+".venv\Scripts\python.exe" -m recovery.selftest
+if errorlevel 1 goto run_failed
 
-:files
-echo.
-if not "%~1"=="" goto dequote
-set /p "JUD=Drag the court-judgment file here and press Enter: "
-set /p "CH=Drag the Companies House file here and press Enter: "
-:dequote
-REM A dragged-in path arrives wrapped in double quotes; remove them so the path can be checked and opened.
-set "JUD=%JUD:"=%"
-set "CH=%CH:"=%"
+set "STAGE=%~1"
+set "JUDGMENTS=%~2"
+set "COMPANIES=%~3"
+set "OBSERVATION=%~4"
+set "OUTPUT_BASE=%~5"
+set "INTERACTIVE="
 
-if not exist "%JUD%" (echo Cannot find the judgment file: %JUD% & goto stop)
-if not exist "%CH%" (echo Cannot find the Companies House file: %CH% & goto stop)
+if defined STAGE goto have_stage
+set "INTERACTIVE=1"
+set /p "STAGE=Which run? [1 = diagnostic, 2 = locked] (1): "
+if not defined STAGE set "STAGE=1"
+
+:have_stage
+set "STAGE=%STAGE:"=%"
+if "%STAGE%"=="1" set "STAGE=diagnostic"
+if "%STAGE%"=="2" set "STAGE=locked"
+if /i "%STAGE%"=="diagnostic" goto stage_ok
+if /i "%STAGE%"=="locked" goto stage_ok
+goto bad_stage
+
+:stage_ok
+if defined JUDGMENTS goto have_judgments
+set "INTERACTIVE=1"
+set /p "JUDGMENTS=Drag the RT judgment CSV/XLSX here and press Enter: "
+
+:have_judgments
+if defined COMPANIES goto have_companies
+set "INTERACTIVE=1"
+set /p "COMPANIES=Drag the Companies House CSV/ZIP here and press Enter: "
+
+:have_companies
+set "JUDGMENTS=%JUDGMENTS:"=%"
+set "COMPANIES=%COMPANIES:"=%"
+if not exist "%JUDGMENTS%" goto missing_judgments
+if not exist "%COMPANIES%" goto missing_companies
+
+if not defined INTERACTIVE goto arguments_ready
+if defined OBSERVATION goto arguments_ready
+set /p "OBSERVATION=Observation date YYYY-MM-DD (blank = today): "
+
+:arguments_ready
+set "OBSERVATION=%OBSERVATION:"=%"
+set "OUTPUT_BASE=%OUTPUT_BASE:"=%"
+if not defined OUTPUT_BASE set "OUTPUT_BASE=outputs"
 
 echo.
-echo Reading judgments...
-python recovery\1_audit.py --input "%JUD%" --outdir outputs || goto stop
-echo Matching to Companies House. This takes about 45-55 minutes...
-python recovery\2_match.py --fold "%JUD%" --ch "%CH%" --outdir outputs || goto stop
-echo Fitting model...
-python recovery\3_fit.py --fold "%JUD%" --ch "%CH%" --outdir outputs || goto stop
-echo Writing outputs...
-python recovery\4_results.py --fold "%JUD%" --ch "%CH%" --outdir outputs || goto stop
+echo Running %STAGE% analysis. Raw and RT-internal files stay on this machine.
+if defined OBSERVATION goto run_with_date
+".venv\Scripts\python.exe" -m recovery.run analyze --stage "%STAGE%" --judgments "%JUDGMENTS%" --companies-house "%COMPANIES%" --settings "settings.toml" --output-base "%OUTPUT_BASE%"
+if errorlevel 1 goto run_failed
+goto run_succeeded
 
+:run_with_date
+".venv\Scripts\python.exe" -m recovery.run analyze --stage "%STAGE%" --judgments "%JUDGMENTS%" --companies-house "%COMPANIES%" --observation-date "%OBSERVATION%" --settings "settings.toml" --output-base "%OUTPUT_BASE%"
+if errorlevel 1 goto run_failed
+
+:run_succeeded
 echo.
-echo Done. Results are in the outputs folder. Open outputs\SUMMARY.txt.
-echo.
+echo Done. Open the newest run folder beneath "%OUTPUT_BASE%".
+echo RT must review egress_candidate before anything leaves this machine.
 if "%RECOVERY_NO_PAUSE%"=="" pause
 exit /b 0
 
+:bad_python
+echo.
+echo STOP: 64-bit Python 3.13 or 3.14 must be installed and first on PATH.
+goto stop
+
+:missing_lock
+echo.
+echo STOP: requirements.lock is missing. Download the complete reviewed repository again.
+goto stop
+
+:setup_failed
+echo.
+echo STOP: Python setup failed. See the message above.
+echo If PyPI is blocked on this machine, ask for the optional reviewed wheel folder.
+echo No RT data was read or sent during setup.
+goto stop
+
+:bad_stage
+echo.
+echo STOP: Choose 1/diagnostic or 2/locked.
+goto stop
+
+:missing_judgments
+echo.
+echo STOP: Cannot find the RT judgment file: "%JUDGMENTS%"
+goto stop
+
+:missing_companies
+echo.
+echo STOP: Cannot find the Companies House file: "%COMPANIES%"
+goto stop
+
+:run_failed
+echo.
+echo STOP: The run did not complete. No output is cleared to leave RT.
+
 :stop
-echo.
-echo Stopped before finishing. Nothing has left the machine.
-echo.
-REM Always pause on an error so the message stays on screen.
 if "%RECOVERY_NO_PAUSE%"=="" pause
 exit /b 1

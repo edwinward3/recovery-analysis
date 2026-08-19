@@ -1,86 +1,213 @@
+# Purpose: test the real Windows launchers on synthetic, non-confidential data.
+# Inputs are generated fixtures; outputs are CI-only reports and no RT data is accessed.
+# Analysis is local; setup may download the fixed packages tested here.
 name: windows-run
-
-# Run RUN.bat from start to finish on Windows, on both Python versions it accepts.
 
 on:
   push:
   pull_request:
   workflow_dispatch:
+    inputs:
+      run_500k_scale_gate:
+        description: "Run the exact 500,000-row cold Windows release gate"
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+env:
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
 
 jobs:
-  run-bat:
+  windows-test:
     runs-on: windows-latest
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
         python: ["3.13", "3.14"]
     steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: ${{ matrix.python }}
 
-      - name: Install deps (for building the fake input files only)
-        run: python -m pip install -r requirements.txt
-
-      - name: Build fake input files
-        run: python .github/make_ci_inputs.py
-
-      - name: Run RUN.bat end to end
-        shell: cmd
-        env:
-          RECOVERY_NO_PAUSE: "1"
-        run: RUN.bat fold.csv ch.csv
-
-      - name: Check the results file exists and show it
+      - name: Unit tests and in-memory self-test
         shell: pwsh
         run: |
-          if (-not (Test-Path outputs/SUMMARY.txt)) { throw "outputs/SUMMARY.txt was not produced" }
-          Get-Content outputs/SUMMARY.txt
+          python -m pip install -r requirements-dev.txt
+          python -m pytest -q
+          python -m recovery.selftest
 
-      - name: Check the disclosure report is clean
+      - name: Write XLSX and ZIP inputs with awkward paths
         shell: pwsh
-        # look for "DO NOT EGRESS", not "VIOLATION": the check ignores case, so the clean
-        # report's own "ZERO violations" line would match "VIOLATION" and fail a good run.
-        run: |
-          $report = "outputs/safety_check.txt"
-          if (-not (Test-Path $report)) { throw "no disclosure report was written" }
-          $text = Get-Content $report -Raw
-          Write-Host $text
-          if ($text -match "DO NOT EGRESS") { throw "disclosure gate refused egress" }
+        run: python -m recovery.selftest --write-inputs "ci inputs !" --n-companies 1600
 
-      - name: Re-run to prove setup is skipped and a second run still works
-        shell: cmd
+      - name: Run both real Windows launchers
+        shell: pwsh
         env:
           RECOVERY_NO_PAUSE: "1"
-        run: RUN.bat fold.csv ch.csv
+        run: |
+          & .\RUN.bat diagnostic "ci inputs !\synthetic judgments.xlsx" "ci inputs !\BasicCompanyDataAsOneFile-2026-06-01.zip" 2026-06-01 "ci outputs !"
+          if ($LASTEXITCODE -ne 0) { throw "diagnostic RUN.bat failed with exit code $LASTEXITCODE" }
+          & .\RUN.bat locked "ci inputs !\synthetic judgments.xlsx" "ci inputs !\BasicCompanyDataAsOneFile-2026-06-01.zip" 2026-06-01 "ci outputs !"
+          if ($LASTEXITCODE -ne 0) { throw "locked RUN.bat failed with exit code $LASTEXITCODE" }
+
+      - name: Assert planted E1-E5 and internal pair outputs
+        shell: pwsh
+        run: |
+          $diagnostic = Get-ChildItem "ci outputs !" -Directory -Filter "diagnostic_*" | Sort-Object Name | Select-Object -Last 1
+          $locked = Get-ChildItem "ci outputs !" -Directory -Filter "locked_*" | Sort-Object Name | Select-Object -Last 1
+          if (-not $diagnostic -or -not $locked) { throw "both run directories were not produced" }
+          $expected = @(
+            "SUMMARY.txt",
+            "E1_data_audit.csv", "E1_data_funnel.csv",
+            "E2_match_coverage.csv", "E2_unmatched_reasons.csv", "E2_match_methods.csv",
+            "E2_match_by_defendant_type.csv", "E2_match_by_judgment_vintage.csv", "E2_incorporation_guards.csv",
+            "E3_model_comparison.csv", "E3_calibration.csv", "E3_feature_effects.csv", "E3_split_counts.csv",
+            "E4_sensitivities.csv", "E4_lift.csv", "E4_limitations.txt",
+            "E5_run_log.csv", "E5_run_manifest.json"
+          )
+          foreach ($run in @($diagnostic, $locked)) {
+            $egress = Join-Path $run.FullName "egress_candidate"
+            foreach ($name in $expected) {
+              if (-not (Test-Path (Join-Path $egress $name))) { throw "missing $($run.Name) aggregate output: $name" }
+            }
+            $summary = Get-Content (Join-Path $egress "SUMMARY.txt") -Raw
+            if ($summary -notmatch "Primary judgment-time model") { throw "primary model missing from $($run.Name) summary" }
+            if ($summary -notmatch "CURRENT-SNAPSHOT FEATURES") { throw "exploratory warning missing from $($run.Name) summary" }
+            $pair = Join-Path $run.FullName "rt_internal\RT_INTERNAL_match_pairs_1000.csv"
+            if (-not (Test-Path $pair)) { throw "$($run.Name) internal pair file missing" }
+            $pairs = Import-Csv $pair
+            if ($pairs.Count -ne 1000) { throw "$($run.Name) pair file has $($pairs.Count) rows, expected 1000" }
+            if (-not ($pairs | Where-Object { $_.source_company_name -match "ALPHA" } | Select-Object -First 1)) { throw "$($run.Name) planted names missing" }
+            $env:CI_EGRESS = $egress
+            python -c "import os; from recovery.disclosure import validate_egress; validate_egress(os.environ['CI_EGRESS'])"
+          }
+          $diagnosticPairs = Import-Csv (Join-Path $diagnostic.FullName "rt_internal\RT_INTERNAL_match_pairs_1000.csv")
+          $lockedPairs = Import-Csv (Join-Path $locked.FullName "rt_internal\RT_INTERNAL_match_pairs_1000.csv")
+          $diagnosticSeed = $diagnosticPairs.sample_seed | Select-Object -Unique | Select-Object -First 1
+          $lockedSeed = $lockedPairs.sample_seed | Select-Object -Unique | Select-Object -First 1
+          if ($diagnosticSeed -eq $lockedSeed) { throw "diagnostic and locked sample seeds are identical" }
+          if (($diagnosticPairs.ID -join ',') -eq ($lockedPairs.ID -join ',')) { throw "locked review sample did not change" }
+          $truth = Import-Csv "ci inputs !\synthetic_ground_truth.csv"
+          if (($truth.corruption_class | Sort-Object -Unique).Count -ne 8) { throw "synthetic corruption classes missing" }
+
+      - name: Run the review launcher and prove setup is cached
+        shell: pwsh
+        env:
+          RECOVERY_NO_PAUSE: "1"
+          PIP_NO_INDEX: "1"
+          PIP_INDEX_URL: "http://127.0.0.1:9/not-used"
+        run: |
+          $run = Get-ChildItem "ci outputs !" -Directory -Filter "locked_*" | Sort-Object Name | Select-Object -Last 1
+          $pair = Join-Path $run.FullName "rt_internal\RT_INTERNAL_match_pairs_1000.csv"
+          $rows = Import-Csv $pair
+          foreach ($row in $rows) { $row.review_decision = "correct" }
+          $rows | Export-Csv $pair -NoTypeInformation
+          $before = (Get-Item ".venv\.setup-key").LastWriteTimeUtc
+          & .\CHECK_MATCH_REVIEW.bat $pair "ci review outputs !"
+          if ($LASTEXITCODE -ne 0) { throw "CHECK_MATCH_REVIEW.bat failed" }
+          $after = (Get-Item ".venv\.setup-key").LastWriteTimeUtc
+          if ($before -ne $after) { throw "unchanged lock/version unexpectedly reinstalled the environment" }
+          if (-not (Test-Path "ci review outputs !\E2_review_quality.csv")) { throw "review CSV missing" }
+          if (-not (Test-Path "ci review outputs !\E2_review_quality.txt")) { throw "review text result missing" }
+          if (-not (Test-Path "ci review outputs !\FINAL_STATUS.json")) { throw "combined final-status JSON missing" }
+          if ((Get-Content "ci review outputs !\E2_review_quality.txt" -Raw) -notmatch "AUTO GATE: PASS") { throw "synthetic review gate did not pass" }
+          $final = Get-Content "ci review outputs !\FINAL_STATUS.json" -Raw | ConvertFrom-Json
+          if (-not $final.match_gate_passed) { throw "combined status did not retain the passed match gate" }
+          if ($final.combined_final_passed) { throw "small synthetic model unexpectedly passed the model gates" }
+          $env:CI_REVIEW_EGRESS = (Resolve-Path "ci review outputs !").Path
+          python -c "import os; from recovery.disclosure import validate_egress; validate_egress(os.environ['CI_REVIEW_EGRESS'])"
 
   offline-bundle:
-    # Check the offline install: with a wheels folder present, RUN.bat installs from it and
-    # never goes online. The wheels are built here rather than stored in the repo (they are large).
     runs-on: windows-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.13", "3.14"]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
-          python-version: "3.13"
-      - name: Install deps (only to build the fake input files below)
-        run: python -m pip install -r requirements.txt
-      - name: Build fake input files
-        run: python .github/make_ci_inputs.py
-      - name: Build the wheels folder and lock file
-        # RUN.bat installs from these wheels only, so this checks the offline path even though
-        # the packages were also installed above.
+          python-version: ${{ matrix.python }}
+      - name: Build the optional wheel folder
         shell: pwsh
         run: |
-          python -m pip download -r requirements.txt -d wheels
-          Copy-Item requirements.txt requirements.lock
-      - name: Run RUN.bat offline (installs from wheels, no PyPI)
-        shell: cmd
+          $tag = python -c "import sys; print('py'+str(sys.version_info.major)+str(sys.version_info.minor))"
+          New-Item -ItemType Directory -Force "wheels\$tag" | Out-Null
+          python -m pip download --require-hashes --only-binary=:all: -r requirements.lock -d "wheels\$tag"
+      - name: Prove the optional bundle sets up and runs offline
+        shell: pwsh
         env:
           RECOVERY_NO_PAUSE: "1"
-        run: RUN.bat fold.csv ch.csv
-      - name: Check the results file exists
+          PIP_NO_INDEX: "1"
+          PIP_INDEX_URL: "http://127.0.0.1:9/not-used"
+          HTTPS_PROXY: "http://127.0.0.1:9"
+          HTTP_PROXY: "http://127.0.0.1:9"
+        run: |
+          & .\RUN.bat --setup-only
+          if ($LASTEXITCODE -ne 0) { throw "offline setup failed" }
+          .\.venv\Scripts\python.exe -m recovery.selftest
+
+  manual-scale:
+    if: github.event_name == 'workflow_dispatch' && inputs.run_500k_scale_gate
+    runs-on: windows-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+      - name: Prepare developer test tools
         shell: pwsh
-        run: if (-not (Test-Path outputs/SUMMARY.txt)) { throw "outputs/SUMMARY.txt was not produced" }
+        run: python -m pip install -r requirements-dev.txt
+      - name: Generate requested scale and enforce the cold release gate
+        shell: pwsh
+        env:
+          RECOVERY_NO_PAUSE: "1"
+        run: |
+          python -m recovery.selftest --write-inputs "scale inputs !" --n-companies 500000 --format csv --no-prior-rows
+          $clock = [System.Diagnostics.Stopwatch]::StartNew()
+          & .\RUN.bat diagnostic "scale inputs !\synthetic judgments.csv" "scale inputs !\BasicCompanyDataAsOneFile-2026-06-01.zip" 2026-06-01 "scale outputs !"
+          $runExit = $LASTEXITCODE
+          $clock.Stop()
+          if ($runExit -ne 0) { throw "manual scale launcher failed" }
+          if ($clock.Elapsed.TotalSeconds -gt 7200) { throw "cold runtime exceeded two hours: $($clock.Elapsed)" }
+          $run = Get-ChildItem "scale outputs !" -Directory -Filter "diagnostic_*" | Sort-Object Name | Select-Object -Last 1
+          if (-not $run) { throw "scale run did not produce an output directory" }
+          $env:SCALE_RUN_ROOT = $run.FullName
+          python -c "import os; from pathlib import Path; from recovery.selftest import _assert_match_truth; _assert_match_truth(Path(os.environ['SCALE_RUN_ROOT']), Path('scale inputs !/synthetic_ground_truth.csv'))"
+          $log = Import-Csv (Join-Path $run.FullName "egress_candidate\E5_run_log.csv")
+          $peakText = ($log | Measure-Object -Property peak_memory_mb -Maximum).Maximum
+          if ([string]::IsNullOrWhiteSpace([string]$peakText)) { throw "scale run did not report peak memory" }
+          $peak = [double]$peakText
+          if ([double]::IsNaN($peak) -or [double]::IsInfinity($peak)) { throw "scale peak memory is not finite: $peakText" }
+          if ($peak -gt 8192) { throw "peak memory exceeded 8 GB: $peak MB" }
+          $manifest = Get-Content (Join-Path $run.FullName "egress_candidate\E5_run_manifest.json") -Raw | ConvertFrom-Json
+          if ($manifest.disclosure.status -ne "pass") { throw "scale disclosure gate did not pass" }
+          New-Item -ItemType Directory -Force "scale evidence" | Out-Null
+          @(
+            "EXACT_WINDOWS_SCALE_GATE=PASS",
+            "PYTHON=$(& python -c 'import platform; print(platform.python_version())')",
+            "JUDGMENT_ROWS=500000",
+            "PLANTED_MATCH_TRUTH=PASS",
+            "ELAPSED_SECONDS=$($clock.Elapsed.TotalSeconds)",
+            "PEAK_PROCESS_MEMORY_MB=$peak",
+            "DISCLOSURE_GATE=$($manifest.disclosure.status)",
+            "RUN_ID=$($manifest.run_id)"
+          ) | Set-Content -Encoding utf8 "scale evidence\scale_gate_evidence.txt"
+          Copy-Item (Join-Path $run.FullName "egress_candidate\E5_run_log.csv") "scale evidence\E5_run_log.csv"
+          Copy-Item (Join-Path $run.FullName "egress_candidate\E5_run_manifest.json") "scale evidence\E5_run_manifest.json"
+          Write-Host "Scale gate passed: $($clock.Elapsed.TotalSeconds) seconds; $peak MB peak"
+
+      - name: Preserve aggregate scale-gate evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: exact-500k-windows-scale-evidence
+          path: scale evidence
+          if-no-files-found: error
+          retention-days: 30

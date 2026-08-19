@@ -1,10 +1,10 @@
-# The packages this needs. RUN.bat installs them for you; to do it by hand:
-#   pip install -r requirements.txt
-numpy
-pandas
-scipy
-scikit-learn
-lightgbm
-openpyxl
-rapidfuzz
-matplotlib
+# Human-readable runtime versions. RUN.bat installs the hash-locked equivalents
+# from requirements.lock, using PyPI or an optional reviewed wheel folder.
+numpy==2.5.1
+pandas==3.0.3
+tzdata==2026.3
+scipy==1.18.0
+scikit-learn==1.9.0
+lightgbm==4.7.0
+openpyxl==3.1.5
+rapidfuzz==3.14.5
