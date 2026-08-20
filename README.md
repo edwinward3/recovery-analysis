@@ -15,7 +15,6 @@ The Companies House file is the free "BasicCompanyDataAsOneFile" download from
 https://download.companieshouse.gov.uk/. Leave it zipped.
 
 It also creates a separate file containing 1,000 matching pairs.
-This file contains company names and postcodes, so keep it on the RT machine.
 
 ## Your judgment file
 
