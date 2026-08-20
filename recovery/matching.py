@@ -1,11 +1,4 @@
-"""Match every valid RT judgment to Companies House, or explain why it did not.
-
-The Companies House file is read once. The normal route finds companies at the
-same postcode and compares their names; a separate conservative fallback finds
-a unique exact name when the postcode changed. Former names are used only when
-valid on the judgment date. This file makes no internet, shell or cache calls
-and writes no output itself.
-"""
+"""Matches the judgments to Companies House and makes the 1,000-pair file for RT."""
 
 from __future__ import annotations
 
@@ -72,10 +65,10 @@ _CH_HEADER_ALIASES: dict[str, str] = {
 }
 
 
-# ===== make names and postcodes comparable without changing the source files =====
+# Prepare names and postcodes for comparison
 
 def normalize_name(value: object) -> str:
-    """Return a conservative comparison form, stripping only terminal suffixes."""
+    """Make an ASCII uppercase form, removing qualifiers, punctuation and suffixes."""
 
     if value is None or pd.isna(value):
         return ""
@@ -139,7 +132,7 @@ class CHIndex:
     stats: Mapping[str, object]
 
 
-# ===== stream Companies House and keep only possible candidates =====
+# Read Companies House and keep possible candidates
 
 def _canon_header(value: object) -> str:
     return re.sub(r"[^a-z0-9]+", "", str(value).strip().lower())
@@ -391,7 +384,7 @@ def build_relevant_ch_index(
     return CHIndex(companies, by_postcode, by_exact_name, stats)
 
 
-# ===== choose one deterministic match decision for each RT row =====
+# Match each RT row
 
 @dataclass(frozen=True, slots=True)
 class _Candidate:
@@ -435,8 +428,7 @@ def _unique_exact_candidate(
     for source_field, raw_source, normalized_source in source_names:
         for company_number in index.by_exact_name.get(normalized_source, ()):
             record = index.companies[company_number]
-            # The postcode-free fallback is deliberately conservative: without
-            # an incorporation date the pre-judgment identity cannot be proved.
+            # Without an incorporation date, the company may not yet have existed.
             if record.incorporation_date is None or judgment_date < record.incorporation_date:
                 continue
             for period in record.valid_names(judgment_date):
@@ -599,7 +591,7 @@ def match_judgments(
     return pd.DataFrame(output)
 
 
-# ===== aggregate coverage, methods and unmatched reasons without names =====
+# Count matches and unmatched reasons
 
 def _count_table(series: pd.Series, column: str) -> pd.DataFrame:
     counts = series.fillna("missing").astype(str).value_counts(dropna=False, sort=False)
@@ -723,7 +715,7 @@ def match_diagnostics(
     }
 
 
-# ===== draw the 1,000 proposed pairs RT will check by hand =====
+# Select 1,000 matching pairs
 
 def _stable_rank(seed: int, tier: str, identifier: str, company_number: str) -> str:
     value = f"{seed}|{tier}|{identifier}|{company_number}".encode("utf-8")
@@ -760,14 +752,14 @@ def _equal_probability_systematic_sample(
     return ordered.iloc[positions].copy()
 
 
-def review_sample(
+def pair_sample(
     judgments: pd.DataFrame,
     matches: pd.DataFrame,
     settings: Settings,
     *,
     seed: int | None = None,
 ) -> pd.DataFrame:
-    """Select the confidential 500/300/200 pair sample, redistributing shortages."""
+    """Select 1,000 proposed matches, spread across the three matching tiers."""
 
     desired = {
         "auto": settings.sample_auto,
@@ -790,7 +782,7 @@ def review_sample(
     )
     missing = set((*sampling_columns, *canonical_source_columns)) - set(matches.columns)
     if missing:
-        raise ValueError(f"matches missing review column(s): {sorted(missing)}")
+        raise ValueError(f"matches missing pair-sample column(s): {sorted(missing)}")
 
     accepted_mask = matches["tier"].isin(desired)
     accepted = matches.loc[accepted_mask, sampling_columns].copy()
@@ -876,30 +868,27 @@ def review_sample(
     sampled = sampled.sort_values(["__tier_order", "ID"], kind="stable").drop(
         columns="__tier_order"
     ).reset_index(drop=True)
-    sampled.insert(
-        0,
-        "review_row_id",
-        [f"R{position:04d}" for position in range(1, len(sampled) + 1)],
-    )
-    sampled.insert(1, "review_tier", sampled["tier"])
-    sampled.insert(2, "review_decision", "")
-    sampled.insert(3, "review_notes", "")
-    sampled.insert(
-        4,
-        "data_classification",
-        "RT INTERNAL - CONTAINS IDENTIFIERS - DO NOT EGRESS",
-    )
     sampled["match_method"] = sampled["reason"]
-    sampled["sample_seed"] = actual_seed
-    sampled["sample_allocation"] = sampled["tier"].map(allocation).astype(int)
-    sampled["sampling_design"] = "equal_probability_systematic_stratified_v1"
-    sampled["sampling_weight"] = sampled["tier"].map(
-        {
-            tier: available[tier] / allocation[tier] if allocation[tier] else 0.0
-            for tier in desired
-        }
-    )
-    return sampled
+    columns = [
+        "ID",
+        "source_company_name",
+        "source_trading_name",
+        "source_postcode",
+        "matched_company_name",
+        "matched_name",
+        "matched_name_kind",
+        "matched_company_number",
+        "matched_company_postcode",
+        "IncorporationDate",
+        "score",
+        "runner_up_score",
+        "margin",
+        "tier",
+        "match_method",
+        "matched_on",
+        "JudgmentDate",
+    ]
+    return sampled.loc[:, [column for column in columns if column in sampled]].copy()
 
 
 __all__ = [
@@ -914,5 +903,5 @@ __all__ = [
     "match_judgments",
     "normalize_name",
     "normalize_postcode",
-    "review_sample",
+    "pair_sample",
 ]

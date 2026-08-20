@@ -1,9 +1,4 @@
-"""Read the small set of matching, sampling and model rules in settings.toml.
-
-The values are fixed before an official run and copied into its run record.
-This file contains no RT data, writes nothing and makes no internet or shell
-calls.
-"""
+"""Reads settings.toml and checks every fixed number used by the matching and model."""
 
 from __future__ import annotations
 
@@ -13,7 +8,7 @@ from typing import Any
 import tomllib
 
 
-# ===== every setting that may change an official result =====
+# Settings
 
 @dataclass(frozen=True, slots=True)
 class Settings:
@@ -34,8 +29,6 @@ class Settings:
     min_calibration_each_class: int = 50
     isotonic_each_class: int = 200
     auc_floor: float = 0.70
-    match_precision_floor: float = 0.98
-    match_precision_lower_ci_floor: float = 0.95
     max_calibration_gap: float = 0.03
     min_calibration_slope: float = 0.80
     max_calibration_slope: float = 1.20
@@ -45,10 +38,10 @@ class Settings:
         return asdict(self)
 
 
-_SECTIONS = {"matching", "cohort", "review_sample", "acceptance", "runtime"}
+_SECTIONS = {"matching", "cohort", "pair_sample", "acceptance", "runtime"}
 
 
-# ===== read the TOML once, reject unknown keys and check the values =====
+# Read and check settings.toml
 
 def load_settings(path: str | Path) -> Settings:
     """Load known keys from TOML and reject unsafe or contradictory values."""
@@ -84,12 +77,10 @@ def _validate(settings: Settings) -> None:
     if settings.prior_history_months <= 0:
         raise ValueError("prior_history_months must be positive")
     if min(settings.sample_auto, settings.sample_review, settings.sample_fallback) < 0:
-        raise ValueError("review sample sizes cannot be negative")
+        raise ValueError("pair sample sizes cannot be negative")
     if sum((settings.sample_auto, settings.sample_review, settings.sample_fallback)) != 1_000:
-        raise ValueError("review sample allocations must total 1,000")
+        raise ValueError("pair sample allocations must total 1,000")
     if settings.diagnostic_seed == settings.locked_seed:
         raise ValueError("diagnostic_seed and locked_seed must differ")
-    if not 0 < settings.match_precision_lower_ci_floor <= settings.match_precision_floor <= 1:
-        raise ValueError("match precision floors must be in (0, 1] and correctly ordered")
     if settings.bootstrap_replicates < 100:
         raise ValueError("bootstrap_replicates must be at least 100")

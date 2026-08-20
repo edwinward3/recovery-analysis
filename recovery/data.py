@@ -1,10 +1,4 @@
-"""Read and check the RT extract and stream the Companies House file.
-
-Every valid RT row is retained for matching; cohort filters belong to Run 2.
-``Date Inserted`` is used only to measure registration delay. Judgment age is
-measured from ``JudgmentDate`` to the supplied extract date. This file makes no
-internet, shell or cache calls and writes no analysis output.
-"""
+"""Reads the RT and Companies House files, checks them and prepares them for matching."""
 
 from __future__ import annotations
 
@@ -20,7 +14,7 @@ import pandas as pd
 
 DAYS_PER_MONTH = 30.44
 
-# ===== the columns and fixed values expected from RT =====
+# RT columns and allowed values
 
 REQUIRED_RT_COLUMNS: tuple[str, ...] = (
     "ID",
@@ -82,11 +76,11 @@ _CODED_VALUE_MAPS: dict[str, dict[str, str]] = {
 }
 
 
-# ===== the identifier-free facts recorded about the RT input =====
+# Information recorded about the RT file
 
 @dataclass(frozen=True, slots=True)
 class DataAudit:
-    """Identifier-free facts recording how the RT input was interpreted."""
+    """Facts about how the RT file was read; extra column names stay inside RT."""
 
     rows: int
     observation_date: str
@@ -113,7 +107,7 @@ class DataAudit:
         return asdict(self)
 
 
-# ===== read, standardise and validate the full RT extract =====
+# Read and check the RT file
 
 def _canon_header(value: object) -> str:
     return re.sub(r"[^a-z0-9]+", "", str(value).strip().lower())
@@ -194,8 +188,7 @@ def _standardise_headers(frame: pd.DataFrame) -> pd.DataFrame:
             result[column] = default
     extra_headers = tuple(str(column) for column in result.columns if column not in RT_COLUMNS)
     absent_optional = tuple(column for column in OPTIONAL_RT_COLUMNS if column not in seen)
-    # Extra input fields are audited but never carried through the confidential
-    # in-memory pipeline. This keeps the one RT frame narrow at full scale.
+    # Extra fields have been read for the audit; drop them before later steps.
     result = result.loc[:, list(RT_COLUMNS)].copy()
     result.attrs["extra_headers"] = extra_headers
     result.attrs["absent_optional"] = absent_optional
@@ -341,7 +334,7 @@ def read_rt_extract(
     return frame, audit
 
 
-# ===== read the large Companies House CSV or ZIP a piece at a time =====
+# Read the Companies House file in chunks
 
 def iter_ch_chunks(
     path: str | Path,

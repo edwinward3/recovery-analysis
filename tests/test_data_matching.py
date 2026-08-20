@@ -19,7 +19,7 @@ from recovery.matching import (
     match_diagnostics,
     match_judgments,
     normalize_name,
-    review_sample,
+    pair_sample,
 )
 
 
@@ -277,22 +277,19 @@ def test_diagnostics_are_aggregate_and_sample_is_deterministic_with_redistributi
         }
     )
 
-    first = review_sample(judgments, matches, settings)
-    second = review_sample(judgments, matches, settings)
+    first = pair_sample(judgments, matches, settings)
+    second = pair_sample(judgments, matches, settings)
 
     pd.testing.assert_frame_equal(first, second)
     assert len(first) == 1_000
-    assert first["review_tier"].value_counts().to_dict() == {
+    assert first["tier"].value_counts().to_dict() == {
         "auto": 600,
         "review": 350,
         "fallback_review": 50,
     }
-    assert first["review_decision"].eq("").all()
-    assert first["review_row_id"].is_unique
-    assert first["sampling_design"].eq(
-        "equal_probability_systematic_stratified_v1"
-    ).all()
-    assert first.groupby("review_tier")["sampling_weight"].nunique().eq(1).all()
+    assert "review_decision" not in first
+    assert "review_notes" not in first
+    assert "sampling_weight" not in first
     expected_sources = matches.set_index("ID")[[
         "source_company_name",
         "source_trading_name",
@@ -306,7 +303,7 @@ def test_diagnostics_are_aggregate_and_sample_is_deterministic_with_redistributi
     assert all("ID" not in table.columns for table in diagnostics.values())
 
 
-def test_name_normalisation_only_strips_terminal_legal_suffixes() -> None:
+def test_name_normalisation_handles_suffixes_and_formatting() -> None:
     assert normalize_name("A&B, Ltd.") == "A AND B"
     assert normalize_name("Limited Edition Designs Ltd") == "LIMITED EDITION DESIGNS"
     assert normalize_name("Example Ltd (in liquidation)") == "EXAMPLE"

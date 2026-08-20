@@ -1,11 +1,4 @@
-"""The last safety check before an aggregate result can leave RT.
-
-Only named allowlisted files can enter ``egress_candidate``. Small positive
-cells are removed, and sensitive headings, postcode or company-number patterns,
-company-style names and supplied known identifiers stop the copy. ``rt_internal``
-is deliberately outside that route. This file inspects local files only and
-makes no internet or shell calls.
-"""
+"""Copies the approved aggregate reports after checking small counts and identifying values."""
 
 from __future__ import annotations
 
@@ -74,7 +67,7 @@ _EXACT_IDENTIFIER_COLUMNS = frozenset(
 )
 
 
-# ===== what the safety check found =====
+# Results of the final check
 
 @dataclass(frozen=True, slots=True)
 class IdentifierFinding:
@@ -106,7 +99,7 @@ class DisclosureViolation(RuntimeError):
         super().__init__("egress disclosure gate failed" + (f": {summary}" if summary else ""))
 
 
-# ===== remove small cells and scan finished egress files =====
+# Remove small counts and check for identifying values
 
 def suppress_small_cells(
     frame: pd.DataFrame,
@@ -128,8 +121,7 @@ def suppress_small_cells(
         counts = pd.to_numeric(frame[column], errors="coerce")
         if counts.isna().any() or counts.lt(0).any():
             raise ValueError(f"disclosure count column {column!r} must be non-negative numeric")
-        # A structural zero reveals no underlying record. Positive cells below
-        # the threshold are suppressed conservatively at whole-row level.
+        # Keep zeros; drop a row when any positive count is below the limit.
         suppress |= counts.gt(0) & counts.lt(min_cell_n)
     return frame.loc[~suppress].reset_index(drop=True), int(suppress.sum())
 
@@ -138,20 +130,20 @@ def scan_identifiers(
     root: str | Path,
     *,
     known_identifiers: Iterable[str] = (),
-    ignore_rt_internal: bool = True,
+    ignore_working_files: bool = True,
 ) -> tuple[IdentifierFinding, ...]:
-    """Scan local text artefacts, ignoring only a top-level RT-internal sibling."""
+    """Scan local text files, ignoring only the named working-file folder."""
 
     base = Path(root)
     if not base.exists():
         return ()
     known = tuple(value.strip() for value in known_identifiers if value and value.strip())
     findings: list[IdentifierFinding] = []
-    skip_internal = ignore_rt_internal and base.name.casefold() != "egress"
+    skip_working = ignore_working_files and base.name.casefold() != "results"
     files = [base] if base.is_file() else sorted(path for path in base.rglob("*") if path.is_file())
     for path in files:
         relative = Path(path.name) if base.is_file() else path.relative_to(base)
-        if skip_internal and relative.parts and relative.parts[0].casefold() == "rt_internal":
+        if skip_working and relative.parts and relative.parts[0].casefold() == "working_files":
             continue
         if path.suffix.casefold() not in _TEXT_SUFFIXES:
             findings.append(
@@ -173,10 +165,10 @@ def scan_identifiers(
 def validate_egress(
     egress_dir: str | Path, *, known_identifiers: Iterable[str] = ()
 ) -> DisclosureReport:
-    """Validate an egress directory and raise on any possible identifier."""
+    """Run the configured identifier checks and raise on any finding."""
 
     findings = scan_identifiers(
-        egress_dir, known_identifiers=known_identifiers, ignore_rt_internal=False
+        egress_dir, known_identifiers=known_identifiers, ignore_working_files=False
     )
     report = DisclosureReport(passed=not findings, findings=findings)
     if findings:
@@ -184,7 +176,7 @@ def validate_egress(
     return report
 
 
-# ===== copy only approved aggregate files into a clean egress directory =====
+# Copy the approved reports
 
 def stage_egress(
     source_dir: str | Path,
@@ -198,7 +190,7 @@ def stage_egress(
 
     ``allowlist`` maps each relative filename to its disclosure count column(s),
     or to ``None`` for a count-free aggregate.  Unlisted source files are never
-    copied.  ``rt_internal`` paths cannot be allowlisted.
+    copied. The named working-file folder cannot be allowlisted.
     """
 
     source_root = Path(source_dir).resolve()
@@ -213,8 +205,8 @@ def stage_egress(
         relative = Path(raw_name)
         if relative.is_absolute() or ".." in relative.parts or not relative.parts:
             raise ValueError(f"unsafe egress allowlist path: {raw_name!r}")
-        if relative.parts[0].casefold() == "rt_internal":
-            raise ValueError("RT-internal files cannot be staged for egress")
+        if relative.parts[0].casefold() == "working_files":
+            raise ValueError("named working files cannot be copied into the reports")
         if relative.suffix.casefold() not in _TEXT_SUFFIXES:
             raise ValueError(f"egress file type is not allowlisted: {raw_name!r}")
         source_path = source_root / relative
@@ -252,7 +244,7 @@ def stage_egress(
                     suppressed.append((str(relative), removed))
 
         findings = scan_identifiers(
-            staging, known_identifiers=known_identifiers, ignore_rt_internal=False
+            staging, known_identifiers=known_identifiers, ignore_working_files=False
         )
         if findings:
             raise DisclosureViolation(
@@ -271,7 +263,7 @@ def stage_egress(
             shutil.copy2(staging / relative, target)
 
     findings = scan_identifiers(
-        destination, known_identifiers=known_identifiers, ignore_rt_internal=False
+        destination, known_identifiers=known_identifiers, ignore_working_files=False
     )
     report = DisclosureReport(
         passed=not findings,
@@ -284,7 +276,7 @@ def stage_egress(
     return report
 
 
-# ===== identifier checks used for CSV and text files =====
+# Checks for CSV and text files
 
 def _scan_csv(
     path: Path, relative: Path, known_identifiers: tuple[str, ...]

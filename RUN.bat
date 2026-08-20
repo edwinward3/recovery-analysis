@@ -1,8 +1,5 @@
-@rem Sets up Python, checks the code on fake data, then runs the selected stage locally.
-@rem Run 1 matches the full RT extract only. Run 2 adds the satisfaction models and
-@rem remains available for testing but is not offered interactively until RT agrees it.
-@rem Raw names and matches stay in rt_internal; only checked aggregate reports go
-@rem to egress_candidate.
+@rem Sets up Python, runs the fake-data self-test, then runs the selected stage.
+@rem Run 2 is kept for later and is not offered when RUN.bat is double-clicked.
 @echo off
 setlocal DisableDelayedExpansion
 cd /d "%~dp0"
@@ -104,7 +101,6 @@ if not defined OUTPUT_BASE set "OUTPUT_BASE=outputs"
 echo.
 if /i "%STAGE%"=="diagnostic" echo Running Run 1: full-data matching only. No satisfaction model will be trained.
 if /i "%STAGE%"=="locked" echo Running Run 2: locked matching plus the agreed satisfaction models.
-echo Raw and RT-internal files stay on this machine.
 if defined OBSERVATION goto run_with_date
 ".venv\Scripts\python.exe" -m recovery.run analyze --stage "%STAGE%" --judgments "%JUDGMENTS%" --companies-house "%COMPANIES%" --settings "settings.toml" --output-base "%OUTPUT_BASE%"
 if errorlevel 1 goto run_failed
@@ -116,9 +112,7 @@ if errorlevel 1 goto run_failed
 
 :run_succeeded
 echo.
-echo Done. Open the newest run folder beneath "%OUTPUT_BASE%".
-if /i "%STAGE%"=="diagnostic" echo Complete the 1,000-pair file in rt_internal before changing the matcher.
-echo RT must review egress_candidate before anything leaves this machine.
+echo Done. The summary and matching-pair file are shown above.
 if "%RECOVERY_NO_PAUSE%"=="" pause
 exit /b 0
 

@@ -338,7 +338,7 @@ class SelectionAndCalibrationTests(TestCase):
         self.assertEqual(len(table), 3)
         self.assertEqual(sum(row["rows"] for row in table), 3)
 
-    def test_acceptance_uses_primary_test_and_match_audit_guards(self) -> None:
+    def test_acceptance_uses_only_primary_model_test_guards(self) -> None:
         run = SimpleNamespace(
             family="prospective",
             algorithm="logistic",
@@ -364,20 +364,11 @@ class SelectionAndCalibrationTests(TestCase):
             cohort,
             settings,
             training_prevalence=0.10,
-            match_precision=0.99,
-            match_precision_lower_ci=0.97,
         )
         self.assertTrue(accepted["passed"])
-        rejected = assess_acceptance(
-            run,
-            cohort,
-            settings,
-            training_prevalence=0.10,
-            match_precision=None,
-            match_precision_lower_ci=None,
-        )
-        self.assertFalse(rejected["passed"])
-        self.assertIn("match_audit_not_supplied", rejected["reasons"])
+        self.assertNotIn("match_precision_floor", accepted["guards"])
+        self.assertNotIn("match_precision_lower_ci_floor", accepted["guards"])
+        self.assertFalse(any("match" in reason for reason in accepted["reasons"]))
 
     def test_acceptance_fails_closed_on_non_finite_gate_values(self) -> None:
         metrics = {
@@ -419,8 +410,6 @@ class SelectionAndCalibrationTests(TestCase):
                     cohort,
                     settings,
                     training_prevalence=0.10,
-                    match_precision=0.99,
-                    match_precision_lower_ci=0.97,
                 )
                 self.assertFalse(result["passed"])
                 self.assertIn(expected_reason, result["reasons"])
@@ -437,30 +426,9 @@ class SelectionAndCalibrationTests(TestCase):
             cohort,
             settings,
             training_prevalence=0.10,
-            match_precision=0.99,
-            match_precision_lower_ci=0.97,
         )
         self.assertFalse(bad_auc_interval["passed"])
         self.assertIn("auc_lower_ci_not_above_chance", bad_auc_interval["reasons"])
-
-        for precision, lower, expected_reason in (
-            (float("nan"), 0.97, "match_precision_below_floor"),
-            (0.99, float("nan"), "match_precision_lower_ci_below_floor"),
-            (1.01, 0.97, "match_precision_below_floor"),
-            (0.99, 1.01, "match_precision_lower_ci_below_floor"),
-            (0.99, 0.995, "match_precision_lower_ci_below_floor"),
-        ):
-            with self.subTest(precision=precision, lower=lower):
-                result = assess_acceptance(
-                    run,
-                    cohort,
-                    settings,
-                    training_prevalence=0.10,
-                    match_precision=precision,
-                    match_precision_lower_ci=lower,
-                )
-                self.assertFalse(result["passed"])
-                self.assertIn(expected_reason, result["reasons"])
 
     def test_missing_lightgbm_is_a_clear_failure(self) -> None:
         tiny = _prepared_numeric_cohort(80)
@@ -527,12 +495,7 @@ class EndToEndTests(TestCase):
             "recovery.models._require_lightgbm", return_value=_FakeLightGBMModule
         ):
             warnings.simplefilter("ignore", RuntimeWarning)
-            evaluation = fit_evaluate_models(
-                cohort,
-                settings,
-                match_precision=0.99,
-                match_precision_lower_ci=0.97,
-            )
+            evaluation = fit_evaluate_models(cohort, settings)
         self.assertEqual(
             set(evaluation.runs),
             {
@@ -555,6 +518,9 @@ class EndToEndTests(TestCase):
             self.assertEqual(first_json, second_json)
             payload = json.loads(first_json)
             self.assertEqual(payload["schema_version"], 1)
+            self.assertNotIn("match_audit", payload)
+            self.assertFalse(hasattr(evaluation, "match_precision"))
+            self.assertFalse(hasattr(evaluation, "match_precision_lower_ci"))
             files = [path.name for path in Path(directory).iterdir()]
             self.assertTrue(all(not name.endswith((".pkl", ".pickle")) for name in files))
             self.assertTrue(

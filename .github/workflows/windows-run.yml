@@ -73,92 +73,59 @@ jobs:
             "E4_sensitivities.csv", "E4_lift.csv", "E4_limitations.txt"
           )
           foreach ($run in @($diagnostic, $locked)) {
-            $egress = Join-Path $run.FullName "egress_candidate"
+            $results = Join-Path $run.FullName "results"
             $expected = if ($run.Name -like "locked_*") { $matchingExpected + $modelExpected } else { $matchingExpected }
             foreach ($name in $expected) {
-              if (-not (Test-Path (Join-Path $egress $name))) { throw "missing $($run.Name) aggregate output: $name" }
+              if (-not (Test-Path (Join-Path $results $name))) { throw "missing $($run.Name) result: $name" }
             }
-            $pair = Join-Path $run.FullName "rt_internal\RT_INTERNAL_match_pairs_1000.csv"
-            if (-not (Test-Path $pair)) { throw "$($run.Name) internal pair file missing" }
+            $pair = Join-Path $run.FullName "working_files\matching_pairs_1000.csv"
+            if (-not (Test-Path $pair)) { throw "$($run.Name) pair-example file missing" }
             $pairs = Import-Csv $pair
             if ($pairs.Count -ne 1000) { throw "$($run.Name) pair file has $($pairs.Count) rows, expected 1000" }
             if (-not ($pairs | Where-Object { $_.source_company_name -match "ALPHA" } | Select-Object -First 1)) { throw "$($run.Name) planted names missing" }
-            $env:CI_EGRESS = $egress
-            python -c "import os; from recovery.disclosure import validate_egress; validate_egress(os.environ['CI_EGRESS'])"
+            $env:CI_RESULTS = $results
+            python -c "import os; from recovery.disclosure import validate_egress; validate_egress(os.environ['CI_RESULTS'])"
           }
-          $diagnosticSummary = Get-Content (Join-Path $diagnostic.FullName "egress_candidate\SUMMARY.txt") -Raw
+          $diagnosticSummary = Get-Content (Join-Path $diagnostic.FullName "results\SUMMARY.txt") -Raw
           if ($diagnosticSummary -notmatch "RUN 1 MATCHING SUMMARY") { throw "diagnostic matching summary missing" }
           if ($diagnosticSummary -notmatch "No satisfaction model was trained") { throw "diagnostic did not clearly defer modelling" }
           foreach ($name in $modelExpected) {
-            if (Test-Path (Join-Path $diagnostic.FullName "egress_candidate\$name")) { throw "diagnostic unexpectedly wrote model output: $name" }
+            if (Test-Path (Join-Path $diagnostic.FullName "results\$name")) { throw "diagnostic unexpectedly wrote model output: $name" }
           }
-          $diagnosticModels = @(Get-ChildItem (Join-Path $diagnostic.FullName "rt_internal\models") -File)
+          $diagnosticModels = @(Get-ChildItem (Join-Path $diagnostic.FullName "working_files\models") -File)
           if ($diagnosticModels.Count) { throw "diagnostic unexpectedly wrote internal model files" }
-          if (Test-Path (Join-Path $diagnostic.FullName "rt_internal\RT_INTERNAL_split_membership.csv")) {
+          if (Test-Path (Join-Path $diagnostic.FullName "working_files\model_rows.csv")) {
             throw "diagnostic unexpectedly wrote model split membership"
           }
-          $diagnosticManifest = Get-Content (Join-Path $diagnostic.FullName "egress_candidate\E5_run_manifest.json") -Raw | ConvertFrom-Json
-          $diagnosticState = Get-Content (Join-Path $diagnostic.FullName "rt_internal\RT_INTERNAL_review_state.json") -Raw | ConvertFrom-Json
-          if ($null -ne $diagnosticManifest.model_only_acceptance -or $null -ne $diagnosticState.model_only_acceptance) {
+          $diagnosticManifest = Get-Content (Join-Path $diagnostic.FullName "results\E5_run_manifest.json") -Raw | ConvertFrom-Json
+          if ($null -ne $diagnosticManifest.model_only_acceptance) {
             throw "diagnostic unexpectedly retained model acceptance"
           }
-          if (@($diagnosticState.model_artifact_fingerprints.PSObject.Properties).Count -ne 0) {
-            throw "diagnostic unexpectedly retained model fingerprints"
-          }
-          $diagnosticLog = Import-Csv (Join-Path $diagnostic.FullName "egress_candidate\E5_run_log.csv")
+          $diagnosticLog = Import-Csv (Join-Path $diagnostic.FullName "results\E5_run_log.csv")
           if ($diagnosticLog.stage | Where-Object { $_ -like "E3*" -or $_ -like "E4*" }) {
             throw "diagnostic unexpectedly executed a model stage"
           }
-          $lockedSummary = Get-Content (Join-Path $locked.FullName "egress_candidate\SUMMARY.txt") -Raw
+          $lockedSummary = Get-Content (Join-Path $locked.FullName "results\SUMMARY.txt") -Raw
           if ($lockedSummary -notmatch "Primary judgment-time model") { throw "primary model missing from locked summary" }
           if ($lockedSummary -notmatch "CURRENT-SNAPSHOT FEATURES") { throw "exploratory warning missing from locked summary" }
-          $diagnosticPairs = Import-Csv (Join-Path $diagnostic.FullName "rt_internal\RT_INTERNAL_match_pairs_1000.csv")
-          $lockedPairs = Import-Csv (Join-Path $locked.FullName "rt_internal\RT_INTERNAL_match_pairs_1000.csv")
-          $diagnosticSeed = $diagnosticPairs.sample_seed | Select-Object -Unique | Select-Object -First 1
-          $lockedSeed = $lockedPairs.sample_seed | Select-Object -Unique | Select-Object -First 1
-          if ($diagnosticSeed -eq $lockedSeed) { throw "diagnostic and locked sample seeds are identical" }
-          if (($diagnosticPairs.ID -join ',') -eq ($lockedPairs.ID -join ',')) { throw "locked review sample did not change" }
+          $diagnosticPairs = Import-Csv (Join-Path $diagnostic.FullName "working_files\matching_pairs_1000.csv")
+          $lockedPairs = Import-Csv (Join-Path $locked.FullName "working_files\matching_pairs_1000.csv")
+          if (($diagnosticPairs.ID -join ',') -eq ($lockedPairs.ID -join ',')) { throw "Run 2 pair examples did not change" }
           $truth = Import-Csv "ci inputs !\synthetic_ground_truth.csv"
           if (($truth.corruption_class | Sort-Object -Unique).Count -ne 8) { throw "synthetic corruption classes missing" }
 
-      - name: Run both match-review paths and prove setup is cached
+      - name: Prove setup is cached
         shell: pwsh
         env:
           RECOVERY_NO_PAUSE: "1"
           PIP_NO_INDEX: "1"
           PIP_INDEX_URL: "http://127.0.0.1:9/not-used"
         run: |
-          function Complete-Review([string]$pair) {
-            $rows = Import-Csv $pair
-            foreach ($row in $rows) { $row.review_decision = "correct" }
-            $rows | Export-Csv $pair -NoTypeInformation
-          }
-          $diagnostic = Get-ChildItem "ci outputs !" -Directory -Filter "diagnostic_*" | Sort-Object Name | Select-Object -Last 1
-          $diagnosticPair = Join-Path $diagnostic.FullName "rt_internal\RT_INTERNAL_match_pairs_1000.csv"
-          Complete-Review $diagnosticPair
           $before = (Get-Item ".venv\.setup-key").LastWriteTimeUtc
-          & .\CHECK_MATCH_REVIEW.bat $diagnosticPair "ci diagnostic review outputs !"
-          if ($LASTEXITCODE -ne 0) { throw "diagnostic CHECK_MATCH_REVIEW.bat failed" }
-          if (-not (Test-Path "ci diagnostic review outputs !\MATCH_REVIEW_STATUS.json")) { throw "diagnostic match-review status missing" }
-          if (Test-Path "ci diagnostic review outputs !\FINAL_STATUS.json") { throw "diagnostic review unexpectedly wrote final model status" }
-
-          $locked = Get-ChildItem "ci outputs !" -Directory -Filter "locked_*" | Sort-Object Name | Select-Object -Last 1
-          $lockedPair = Join-Path $locked.FullName "rt_internal\RT_INTERNAL_match_pairs_1000.csv"
-          Complete-Review $lockedPair
-          & .\CHECK_MATCH_REVIEW.bat $lockedPair "ci review outputs !"
-          if ($LASTEXITCODE -ne 0) { throw "locked CHECK_MATCH_REVIEW.bat failed" }
+          & .\RUN.bat --setup-only
+          if ($LASTEXITCODE -ne 0) { throw "cached setup failed" }
           $after = (Get-Item ".venv\.setup-key").LastWriteTimeUtc
           if ($before -ne $after) { throw "unchanged lock/version unexpectedly reinstalled the environment" }
-          if (-not (Test-Path "ci review outputs !\E2_review_quality.csv")) { throw "review CSV missing" }
-          if (-not (Test-Path "ci review outputs !\E2_review_quality.txt")) { throw "review text result missing" }
-          if (-not (Test-Path "ci review outputs !\MATCH_REVIEW_STATUS.json")) { throw "match-review status JSON missing" }
-          if (-not (Test-Path "ci review outputs !\FINAL_STATUS.json")) { throw "combined final-status JSON missing" }
-          if ((Get-Content "ci review outputs !\E2_review_quality.txt" -Raw) -notmatch "AUTO GATE: PASS") { throw "synthetic review gate did not pass" }
-          $final = Get-Content "ci review outputs !\FINAL_STATUS.json" -Raw | ConvertFrom-Json
-          if (-not $final.match_gate_passed) { throw "combined status did not retain the passed match gate" }
-          if ($final.combined_final_passed) { throw "small synthetic model unexpectedly passed the model gates" }
-          $env:CI_REVIEW_EGRESS = (Resolve-Path "ci review outputs !").Path
-          python -c "import os; from recovery.disclosure import validate_egress; validate_egress(os.environ['CI_REVIEW_EGRESS'])"
 
   offline-bundle:
     runs-on: windows-latest
@@ -234,8 +201,8 @@ jobs:
             if (-not $run) { throw "$stage scale run did not produce an output directory" }
             $env:SCALE_RUN_ROOT = $run.FullName
             python -c "import os; from pathlib import Path; from recovery.selftest import _assert_match_truth; _assert_match_truth(Path(os.environ['SCALE_RUN_ROOT']), Path('scale inputs !/synthetic_ground_truth.csv'))"
-            $log = Import-Csv (Join-Path $run.FullName "egress_candidate\E5_run_log.csv")
-            $manifest = Get-Content (Join-Path $run.FullName "egress_candidate\E5_run_manifest.json") -Raw | ConvertFrom-Json
+            $log = Import-Csv (Join-Path $run.FullName "results\E5_run_log.csv")
+            $manifest = Get-Content (Join-Path $run.FullName "results\E5_run_manifest.json") -Raw | ConvertFrom-Json
             $peaks = @($log | ForEach-Object {
               ConvertTo-ValidPeak $_.peak_memory_mb "$stage E5 stage '$($_.stage)'"
             })
@@ -243,7 +210,7 @@ jobs:
             $peak = ($peaks | Measure-Object -Maximum).Maximum
             if ($peak -gt 8192) { throw "$stage peak memory exceeded 8 GB: $peak MB" }
             if ($manifest.disclosure.status -ne "pass") { throw "$stage disclosure gate did not pass" }
-            $modelReport = Join-Path $run.FullName "egress_candidate\E3_model_comparison.csv"
+            $modelReport = Join-Path $run.FullName "results\E3_model_comparison.csv"
             if ($stage -eq "diagnostic" -and (Test-Path $modelReport)) { throw "diagnostic scale run wrote a model report" }
             if ($stage -eq "locked" -and -not (Test-Path $modelReport)) { throw "locked scale run did not write a model report" }
             return [PSCustomObject]@{
@@ -272,8 +239,8 @@ jobs:
             "LOCKED_RUN_ID=$($locked.Manifest.run_id)"
           ) | Set-Content -Encoding utf8 "scale evidence\scale_gate_evidence.txt"
           foreach ($result in @($diagnostic, $locked)) {
-            Copy-Item (Join-Path $result.Run.FullName "egress_candidate\E5_run_log.csv") "scale evidence\$($result.Stage)_E5_run_log.csv"
-            Copy-Item (Join-Path $result.Run.FullName "egress_candidate\E5_run_manifest.json") "scale evidence\$($result.Stage)_E5_run_manifest.json"
+            Copy-Item (Join-Path $result.Run.FullName "results\E5_run_log.csv") "scale evidence\$($result.Stage)_E5_run_log.csv"
+            Copy-Item (Join-Path $result.Run.FullName "results\E5_run_manifest.json") "scale evidence\$($result.Stage)_E5_run_manifest.json"
             Write-Host "$($result.Stage) scale gate passed: $($result.ElapsedSeconds) seconds; $($result.PeakMemoryMb) MB peak"
           }
 

@@ -1,11 +1,4 @@
-"""Prepare and evaluate the deferred Run 2 satisfaction models.
-
-Run 1 does not call this file. Run 2 keeps identifiers only in its internal
-cohort, then writes aggregate metrics and local model descriptions. The primary
-features are intended to be available at judgment; present-day Companies House
-features are kept in a separate exploratory family. Nothing here connects to
-the internet or starts another program.
-"""
+"""Run 2 only. Builds the company facts, fits the four models and checks the results."""
 
 from __future__ import annotations
 
@@ -35,7 +28,7 @@ from sklearn.preprocessing import StandardScaler
 from .config import Settings
 
 
-# ===== fixed Run 2 splits, features and accepted input fields =====
+# Model splits, features and input fields
 
 SPLIT_ORDER: tuple[str, ...] = ("train", "validation", "calibration", "test")
 SPLIT_FRACTIONS: tuple[float, ...] = (0.60, 0.15, 0.10, 0.15)
@@ -123,7 +116,7 @@ class LightGBMUnavailableError(RuntimeError):
     """Raised when the required LightGBM package is unavailable."""
 
 
-# ===== internal cohort, calibration and model results =====
+# Model data and results
 
 @dataclass(slots=True)
 class PreparedCohort:
@@ -280,8 +273,6 @@ class ModelEvaluation:
     champions: dict[str, str]
     primary_acceptance: dict[str, Any]
     training_prevalence: float
-    match_precision: float | None = None
-    match_precision_lower_ci: float | None = None
 
     def to_public_dict(self) -> dict[str, Any]:
         return {
@@ -290,17 +281,13 @@ class ModelEvaluation:
             "training_prevalence": self.training_prevalence,
             "champions": dict(self.champions),
             "primary_acceptance": self.primary_acceptance,
-            "match_audit": {
-                "precision": self.match_precision,
-                "precision_lower_ci": self.match_precision_lower_ci,
-            },
             "runs": {
                 name: run.to_public_dict() for name, run in sorted(self.runs.items())
             },
         }
 
 
-# ===== build the locked cohort and chronological split =====
+# Build the Run 2 sample and date splits
 
 def prepare_model_cohort(
     judgments: pd.DataFrame,
@@ -436,8 +423,7 @@ def prepare_model_cohort(
     if missing_snapshot:
         warnings.append("snapshot features entirely missing: " + ", ".join(missing_snapshot))
 
-    # Keep the model frame deliberately narrow so source names/status strings do
-    # not travel beyond cohort construction.
+    # Keep only the IDs, dates, labels, splits and model features used below.
     keep = [
         "ID",
         "matched_company_number",
@@ -472,13 +458,11 @@ def assign_chronological_splits(frame: pd.DataFrame) -> pd.DataFrame:
     if ordered["JudgmentDate"].isna().any():
         raise ModelDataError("chronological split cannot use missing judgment dates")
 
-    # Select boundaries only between whole judgment-date groups.  Proportions
-    # can therefore be approximate when one court date contains many rows.
+    # Keep each judgment date in one split, so the shares can be approximate.
     group_sizes = ordered.groupby("JudgmentDate", sort=True).size()
     group_count = len(group_sizes)
     if group_count < len(SPLIT_ORDER):
-        # Keep tiny audit cohorts constructible. Model fitting later gives the
-        # more useful empty-split error instead of silently reusing a date.
+        # Let tiny cohorts reach the clearer empty-split check below.
         date_labels = np.array(SPLIT_ORDER[:group_count], dtype=object)
     else:
         cumulative = group_sizes.cumsum().to_numpy()
@@ -510,20 +494,16 @@ def assign_chronological_splits(frame: pd.DataFrame) -> pd.DataFrame:
     return ordered
 
 
-# ===== fit, calibrate and evaluate the four declared model runs =====
+# Fit and test the four models
 
 def fit_evaluate_models(
     cohort: PreparedCohort,
     settings: Settings,
-    *,
-    match_precision: float | None = None,
-    match_precision_lower_ci: float | None = None,
 ) -> ModelEvaluation:
-    """Fit logistic and LightGBM on common splits and evaluate the locked test.
+    """Fit logistic and LightGBM for both sets of company facts.
 
-    LightGBM is a required declared challenger.  If its package is not
-    installed, this function fails clearly rather than silently changing the
-    analysis to a different estimator.
+    Validation chooses the preferred model before the test rows are opened.
+    Both models are then refitted, calibrated and measured on those same rows.
     """
 
     lgb_module = _require_lightgbm()
@@ -630,8 +610,6 @@ def fit_evaluate_models(
         cohort,
         settings,
         training_prevalence=training_prevalence,
-        match_precision=match_precision,
-        match_precision_lower_ci=match_precision_lower_ci,
     )
     return ModelEvaluation(
         cohort=cohort,
@@ -639,8 +617,6 @@ def fit_evaluate_models(
         champions=champions,
         primary_acceptance=acceptance,
         training_prevalence=training_prevalence,
-        match_precision=match_precision,
-        match_precision_lower_ci=match_precision_lower_ci,
     )
 
 
@@ -868,8 +844,6 @@ def assess_acceptance(
     settings: Settings,
     *,
     training_prevalence: float,
-    match_precision: float | None,
-    match_precision_lower_ci: float | None,
 ) -> dict[str, Any]:
     """Apply the locked primary acceptance guards to the prospective champion."""
 
@@ -930,24 +904,6 @@ def assess_acceptance(
         or brier_improvement <= 0
     ):
         reasons.append("brier_not_better_than_training_prevalence")
-    if match_precision is None or match_precision_lower_ci is None:
-        reasons.append("match_audit_not_supplied")
-    else:
-        precision = _finite_or_none(match_precision)
-        precision_lower = _finite_or_none(match_precision_lower_ci)
-        if (
-            precision is None
-            or not 0.0 <= precision <= 1.0
-            or precision < settings.match_precision_floor
-        ):
-            reasons.append("match_precision_below_floor")
-        if (
-            precision_lower is None
-            or not 0.0 <= precision_lower <= 1.0
-            or (precision is not None and precision_lower > precision)
-            or precision_lower <= settings.match_precision_lower_ci_floor
-        ):
-            reasons.append("match_precision_lower_ci_below_floor")
     return {
         "status": "pass" if not reasons else "fail",
         "passed": not reasons,
@@ -963,8 +919,6 @@ def assess_acceptance(
                 settings.min_calibration_slope,
                 settings.max_calibration_slope,
             ],
-            "match_precision_floor": settings.match_precision_floor,
-            "match_precision_lower_ci_floor": settings.match_precision_lower_ci_floor,
             "training_prevalence": training_prevalence,
             "point_in_time_family_only": True,
         },
@@ -972,7 +926,7 @@ def assess_acceptance(
     }
 
 
-# ===== write stable internal model descriptions =====
+# Save the model files
 
 def write_model_artifacts(
     evaluation: ModelEvaluation,
@@ -1031,7 +985,7 @@ def write_model_artifacts(
     return written
 
 
-# ===== construct judgment-time and exploratory snapshot features =====
+# Build the model inputs
 
 def _add_prior_judgment_features(
     targets: pd.DataFrame,
@@ -1133,9 +1087,7 @@ def _add_snapshot_features(targets: pd.DataFrame, observation_date: pd.Timestamp
         else:
             targets[output] = np.nan
 
-    # The matcher deliberately carries the reviewable raw CH snapshot fields.
-    # Derive the five declared snapshot features here rather than asking matching
-    # code to perform modelling transformations.
+    # Build the five snapshot features here, after matching.
     raw_n_charges = pd.to_numeric(
         targets.get("Mortgages.NumMortCharges", pd.Series(np.nan, index=targets.index)),
         errors="coerce",
@@ -1393,8 +1345,7 @@ def _calibration_intercept_slope(
             max_iter=2_000,
         )
         with warnings.catch_warnings():
-            # Complete/semi-complete separation can make the calibration slope
-            # diverge. It is handled below as a non-finite acceptance failure.
+            # Separation can make the slope non-finite; the check below then fails.
             warnings.simplefilter("ignore", RuntimeWarning)
             model.fit(_logit(p).reshape(-1, 1), y)
         return float(model.intercept_[0]), float(model.coef_[0, 0])

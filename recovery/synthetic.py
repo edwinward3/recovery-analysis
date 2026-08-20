@@ -1,9 +1,4 @@
-"""Create deterministic fake RT and Companies House inputs for tests only.
-
-Outputs contain no real identifiers.  The generator plants known matching
-corruptions and a modest satisfaction signal so the full offline pipeline can be
-tested without reading or writing confidential data.
-"""
+"""Creates the fake RT and Companies House files used by the self-test."""
 
 from __future__ import annotations
 

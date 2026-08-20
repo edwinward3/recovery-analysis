@@ -1,10 +1,4 @@
-"""Write the files RT reads after each run.
-
-Run 1 gets the data audit, matching reports, short summary and run record. Run
-2 adds the model reports. This file writes aggregate information only; names,
-company numbers, individual matches and predictions never enter these reports.
-It does not connect to the internet or start another program.
-"""
+"""Writes SUMMARY.txt and the detailed count, matching, model and run files."""
 
 from __future__ import annotations
 
@@ -26,13 +20,13 @@ import pandas as pd
 from .config import Settings
 
 
-# ===== create a fresh output folder and record each stage =====
+# Output folders and run times
 
 @dataclass(frozen=True, slots=True)
 class RunPaths:
     root: Path
-    egress: Path
-    internal: Path
+    results: Path
+    working: Path
     models: Path
 
 
@@ -70,16 +64,16 @@ def create_run_paths(base: str | Path, stage: str, run_id: str | None = None) ->
     root = Path(base) / f"{stage}_{token}"
     if root.exists():
         raise FileExistsError(f"output directory already exists: {root}")
-    egress = root / "egress_candidate"
-    internal = root / "rt_internal"
-    models = internal / "models"
-    for path in (egress, internal, models):
+    results = root / "results"
+    working = root / "working_files"
+    models = working / "models"
+    for path in (results, working, models):
         path.mkdir(parents=True, exist_ok=False)
-    return RunPaths(root=root, egress=egress, internal=internal, models=models)
+    return RunPaths(root=root, results=results, working=working, models=models)
 
 
 def source_fingerprint(package_dir: str | Path, settings_path: str | Path) -> str:
-    """Hash the readable source and settings to identify the exact run inputs."""
+    """Hash the Python files and settings, but not the data or Python setup."""
 
     digest = hashlib.sha256()
     sources = sorted(Path(package_dir).glob("*.py")) + [Path(settings_path)]
@@ -94,7 +88,7 @@ def write_json(path: str | Path, value: Any) -> None:
     Path(path).write_text(text + "\n", encoding="utf-8")
 
 
-# ===== E1: what was in the RT extract and what reached each stage =====
+# E1 data audit
 
 def write_e1(
     egress: Path,
@@ -203,8 +197,7 @@ def build_data_audit_counts(
             rows.append(
                 {
                     "dimension": "extra_input_column_not_used",
-                    # Unknown headings can themselves contain client wording.
-                    # Record their presence without copying the raw text out.
+                    # Replace unknown headings because they may contain client wording.
                     "value": f"extra_column_{position}",
                     "rows": support,
                     "share": 1.0,
@@ -235,7 +228,7 @@ def build_data_audit_counts(
     return pd.DataFrame(rows).sort_values(["dimension", "value"], kind="stable")
 
 
-# ===== E2: how every judgment matched, or why it did not =====
+# E2 matching results
 
 def write_e2(egress: Path, diagnostics: dict[str, pd.DataFrame]) -> list[str]:
     names = {
@@ -253,7 +246,7 @@ def write_e2(egress: Path, diagnostics: dict[str, pd.DataFrame]) -> list[str]:
     return files
 
 
-# ===== E3 and E4: Run 2 model results and sensitivity checks =====
+# E3 and E4 model results
 
 def build_model_tables(
     evaluation: Any,
@@ -509,7 +502,7 @@ def write_e3_e4(
     return files
 
 
-# ===== E5 and SUMMARY: the run record and the first page RT should open =====
+# E5 run record and summary
 
 def write_e5(
     egress: Path,
@@ -518,7 +511,7 @@ def write_e5(
     *,
     min_cell_n: int = 10,
 ) -> list[str]:
-    """Write a finalized, small-cell-safe run record."""
+    """Write E5 after applying its schema-specific public redactions."""
 
     log = _public_run_log(pd.DataFrame(recorder.stages), min_cell_n)
     log_path = egress / "E5_run_log.csv"
@@ -552,7 +545,7 @@ def write_summary(path: str | Path, context: dict[str, Any]) -> None:
     splits = context.get("splits", {})
     min_cell_n = int(context.get("min_cell_n", 10))
     lines = [
-        "DRAFT — RT REVIEW REQUIRED — NOT AUTHORISED FOR EXTERNAL USE",
+        "RT INTERNAL — NOT AUTHORISED FOR EXTERNAL USE",
         "RECOVERY ANALYSIS — SUMMARY",
         "===========================",
         f"Run stage                     {context.get('stage', 'unknown')}",
@@ -604,15 +597,15 @@ def write_summary(path: str | Path, context: dict[str, Any]) -> None:
         "  - Companies House bulk contains live companies and cannot match every defendant.",
         "  - Review and fallback matches do not enter the headline model.",
         "  - Current-snapshot features may post-date the judgment and are exploratory only.",
-        "  - RT review and permission are required before any result or model artefact leaves.",
+        "  - RT permission is required before any result or model artefact leaves.",
         "",
-        "Detailed aggregate reports in egress_candidate",
+        "Other reports in this folder",
         "  E1 data audit and exclusion funnel",
         "  E2 matching coverage and diagnosis",
         "  E3 model comparison, calibration and effects",
         "  E4 population sensitivities, lift and limitations",
         "  E5 timings, memory, fingerprints and artefact manifest",
-        f"RT-internal pair file: {context.get('pair_file', 'not produced')} (DO NOT EGRESS)",
+        f"Matching pairs: {context.get('pair_file', 'not produced')}",
     ]
     Path(path).write_text("\n".join(lines) + "\n", encoding="utf-8")
 
@@ -624,7 +617,7 @@ def _write_matching_summary(path: str | Path, context: dict[str, Any]) -> None:
     match = context.get("match", {})
     min_cell_n = int(context.get("min_cell_n", 10))
     lines = [
-        "DRAFT — RT REVIEW REQUIRED — NOT AUTHORISED FOR EXTERNAL USE",
+        "RT INTERNAL — NOT AUTHORISED FOR EXTERNAL USE",
         "RECOVERY ANALYSIS — RUN 1 MATCHING SUMMARY",
         "==========================================",
         f"Run status                    {context.get('status', 'PROVISIONAL')}",
@@ -651,24 +644,24 @@ def _write_matching_summary(path: str | Path, context: dict[str, Any]) -> None:
         "  - Every valid row was sent through matching, with no age, status,",
         "    defendant-type or jurisdiction filter.",
         "  - No satisfaction model was trained or assessed.",
-        "  - The 1,000 proposed pairs must be checked to measure match quality.",
+        "  - It created a separate file containing 1,000 matching pairs.",
         "",
         "Important limits",
         "  - A high match rate does not prove that the proposed matches are correct.",
         "  - The free Companies House file contains a present-day live-company snapshot.",
         "  - Address changes, dissolved companies and non-company defendants can remain unmatched.",
-        "  - RT review and permission are required before any result leaves.",
+        "  - RT permission is required before any result leaves.",
         "",
-        "Detailed aggregate reports in egress_candidate",
+        "Other reports in this folder",
         "  E1 data audit and matching funnel",
         "  E2 matching coverage, methods and unmatched reasons",
         "  E5 timings, memory, settings and run record",
-        f"RT-internal pair file: {context.get('pair_file', 'not produced')} (DO NOT EGRESS)",
+        f"Matching pairs: {context.get('pair_file', 'not produced')}",
     ]
     Path(path).write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
-# ===== local memory measurement and small formatting helpers =====
+# Memory and formatting
 
 def peak_memory_mb() -> float:
     """Return process peak resident memory using only the standard library."""
@@ -838,7 +831,7 @@ def _public_run_log(log: pd.DataFrame, min_cell_n: int) -> pd.DataFrame:
 
 
 def _public_manifest(manifest: dict[str, Any], min_cell_n: int) -> dict[str, Any]:
-    """Remove data-derived small cells from the public E5 receipt."""
+    """Redact the declared CH, cohort and disclosure counts from public E5."""
 
     public = deepcopy(manifest)
     stats = public.get("ch_index_stats", {})

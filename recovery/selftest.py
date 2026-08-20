@@ -1,9 +1,7 @@
-"""Run both real stages on fake data before any RT file is opened.
+"""Self-test. Runs matching and the model on fake data before any RT file is opened.
 
-The test checks that Run 1 processes every row and writes no model results, then
-checks that Run 2 makes the four declared fits. It also checks known matching
-examples, the 1,000-pair files and the disclosure boundary. Everything is
-synthetic and temporary; no confidential data, internet or shell calls are used.
+It checks the known matches, the four model fits, the pair files and the final
+output check. ``--write-inputs`` saves the fake files for the Windows tests.
 """
 
 from __future__ import annotations
@@ -12,6 +10,7 @@ from argparse import ArgumentParser
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Sequence
+import json
 import sys
 
 import pandas as pd
@@ -57,7 +56,7 @@ _EXPECTED_TIERS = {
 }
 
 
-# ===== command-line options and optional synthetic input writer =====
+# Options and fake input files
 
 def _parser() -> ArgumentParser:
     parser = ArgumentParser(description="Run the synthetic recovery-analysis test")
@@ -96,11 +95,11 @@ def _write_inputs(args: object) -> int:
     return 0
 
 
-# ===== check exact planted matches and each stage's promised files =====
+# Check the known matches and output files
 
 def _assert_match_truth(run_root: Path, truth_path: Path) -> None:
     matches = pd.read_csv(
-        run_root / "rt_internal" / MATCH_FILENAME,
+        run_root / "working_files" / MATCH_FILENAME,
         dtype={"ID": "string", "matched_company_number": "string"},
     )
     truth = pd.read_csv(
@@ -132,8 +131,8 @@ def _assert_match_truth(run_root: Path, truth_path: Path) -> None:
 
 
 def _assert_outputs(run_root: Path, truth_path: Path, *, stage: str) -> None:
-    egress = run_root / "egress_candidate"
-    actual = {path.name for path in egress.iterdir() if path.is_file()}
+    results = run_root / "results"
+    actual = {path.name for path in results.iterdir() if path.is_file()}
     expected = _MATCHING_EGRESS | (_MODEL_EGRESS if stage == "locked" else set())
     missing = sorted(expected - actual)
     if missing:
@@ -143,23 +142,30 @@ def _assert_outputs(run_root: Path, truth_path: Path, *, stage: str) -> None:
         raise AssertionError(
             f"matching-only diagnostic wrote model outputs: {unexpected_models}"
         )
-    validate_egress(egress)
+    validate_egress(results)
 
-    pairs = pd.read_csv(run_root / "rt_internal" / PAIR_FILENAME)
+    manifest = json.loads(
+        (results / "E5_run_manifest.json").read_text(encoding="utf-8")
+    )
+    for relative in manifest["artifact_manifest"]["working_files"]:
+        if not (run_root / "working_files" / relative).is_file():
+            raise AssertionError(f"manifest lists a missing working file: {relative}")
+
+    pairs = pd.read_csv(run_root / "working_files" / PAIR_FILENAME)
     if len(pairs) != 1_000:
-        raise AssertionError(f"match-review file has {len(pairs)} rows, expected 1,000")
-    allocation = pairs["review_tier"].value_counts().to_dict()
+        raise AssertionError(f"match-example file has {len(pairs)} rows, expected 1,000")
+    allocation = pairs["tier"].value_counts().to_dict()
     expected_allocation = {"auto": 500, "review": 300, "fallback_review": 200}
     if allocation != expected_allocation:
-        raise AssertionError(f"review allocation differs: {allocation!r}")
+        raise AssertionError(f"pair allocation differs: {allocation!r}")
 
-    matches = pd.read_csv(run_root / "rt_internal" / MATCH_FILENAME)
-    coverage = pd.read_csv(egress / "E2_match_coverage.csv")
+    matches = pd.read_csv(run_root / "working_files" / MATCH_FILENAME)
+    coverage = pd.read_csv(results / "E2_match_coverage.csv")
     if int(coverage["rows"].sum()) != len(matches):
         raise AssertionError("E2 coverage does not account for every matching decision")
 
     if stage == "locked":
-        comparison = pd.read_csv(egress / "E3_model_comparison.csv")
+        comparison = pd.read_csv(results / "E3_model_comparison.csv")
         if set(comparison["model"]) != {
             "prospective.logistic",
             "prospective.lightgbm",
@@ -167,7 +173,7 @@ def _assert_outputs(run_root: Path, truth_path: Path, *, stage: str) -> None:
             "snapshot_exploratory.lightgbm",
         }:
             raise AssertionError("the four declared model fits were not all reported")
-        split_rows = pd.read_csv(egress / "E3_split_counts.csv")
+        split_rows = pd.read_csv(results / "E3_split_counts.csv")
         if set(split_rows["split"]) != {
             "train",
             "validation",
@@ -176,14 +182,14 @@ def _assert_outputs(run_root: Path, truth_path: Path, *, stage: str) -> None:
         }:
             raise AssertionError("the four declared partitions were not all reported")
     else:
-        summary = (egress / "SUMMARY.txt").read_text(encoding="utf-8")
+        summary = (results / "SUMMARY.txt").read_text(encoding="utf-8")
         if "No satisfaction model was trained or assessed" not in summary:
             raise AssertionError("diagnostic summary does not state that modelling was skipped")
 
     _assert_match_truth(run_root, truth_path)
 
 
-# ===== run matching-only Run 1 and locked model Run 2 end to end =====
+# Run both stages
 
 def _run_full(args: object) -> int:
     if args.n_companies < 1_600:

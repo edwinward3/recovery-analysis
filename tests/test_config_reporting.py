@@ -45,7 +45,7 @@ def test_settings_reject_unknown_or_bad_values(tmp_path: Path) -> None:
         load_settings(bad)
     same_seed = tmp_path / "same-seed.toml"
     same_seed.write_text(
-        "[review_sample]\ndiagnostic_seed=7\nlocked_seed=7\n",
+        "[pair_sample]\ndiagnostic_seed=7\nlocked_seed=7\n",
         encoding="utf-8",
     )
     with pytest.raises(ValueError, match="must differ"):
@@ -54,8 +54,8 @@ def test_settings_reject_unknown_or_bad_values(tmp_path: Path) -> None:
 
 def test_run_paths_do_not_overwrite(tmp_path: Path) -> None:
     paths = create_run_paths(tmp_path, "diagnostic", "known")
-    assert paths.egress.is_dir()
-    assert paths.internal.is_dir()
+    assert paths.results.is_dir()
+    assert paths.working.is_dir()
     assert paths.models.is_dir()
     with pytest.raises(FileExistsError):
         create_run_paths(tmp_path, "diagnostic", "known")
