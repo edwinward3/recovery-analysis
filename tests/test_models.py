@@ -34,7 +34,9 @@ from recovery.models import (
     fit_calibrator,
     fit_evaluate_models,
     prepare_model_cohort,
+    reliability_table,
     write_model_artifacts,
+    _add_prior_judgment_features,
     _select_model_matches,
 )
 
@@ -222,6 +224,49 @@ class CohortTests(TestCase):
             (split.groupby("JudgmentDate")["split"].nunique() == 1).all()
         )
 
+    def test_prior_history_offsets_cover_multiple_and_absent_companies(self) -> None:
+        targets = pd.DataFrame(
+            {
+                "matched_company_number": [" C2 ", "C-missing", "C1"],
+                "JudgmentDate": pd.to_datetime(
+                    ["2025-06-15", "2025-03-01", "2025-01-01"]
+                ),
+            }
+        )
+        history = pd.DataFrame(
+            {
+                "matched_company_number": ["C1", "C2", "C1", "C2", "C1", "C2"],
+                "JudgmentDate": pd.to_datetime(
+                    [
+                        "2024-12-01",
+                        "2025-06-15",  # same day: never prior
+                        "2022-12-31",  # outside C1's 24-month window
+                        "2023-06-15",  # exact 24-month boundary
+                        "2023-01-01",  # exact 24-month boundary
+                        "2024-06-15",
+                    ]
+                ),
+                "_amount_numeric": [np.nan, 999.0, 50.0, 20.0, 10.0, 30.0],
+            }
+        )
+
+        _add_prior_judgment_features(targets, history, 24)
+
+        self.assertEqual(
+            targets["prior_judgment_count_24m"].tolist(), [2, 0, 2]
+        )
+        self.assertEqual(
+            targets["prior_judgment_value_24m"].tolist(), [50.0, 0.0, 10.0]
+        )
+        self.assertEqual(
+            float(targets.loc[0, "days_since_prior_judgment_24m"]), 365.0
+        )
+        self.assertTrue(pd.isna(targets.loc[1, "days_since_prior_judgment_24m"]))
+        self.assertEqual(
+            float(targets.loc[2, "days_since_prior_judgment_24m"]), 31.0
+        )
+        self.assertEqual(targets["no_prior_judgment_24m"].tolist(), [0, 1, 0])
+
 
 class SelectionAndCalibrationTests(TestCase):
     def test_conservative_champion_rule(self) -> None:
@@ -288,6 +333,11 @@ class SelectionAndCalibrationTests(TestCase):
         self.assertIn("brier_improvement_vs_null", intervals)
         self.assertGreater(intervals["brier_improvement_vs_null"]["lower"], 0)
 
+    def test_reliability_table_uses_fewer_bins_for_a_small_test_split(self) -> None:
+        table = reliability_table([0, 1, 0], [0.1, 0.8, 0.2])
+        self.assertEqual(len(table), 3)
+        self.assertEqual(sum(row["rows"] for row in table), 3)
+
     def test_acceptance_uses_primary_test_and_match_audit_guards(self) -> None:
         run = SimpleNamespace(
             family="prospective",
@@ -328,6 +378,89 @@ class SelectionAndCalibrationTests(TestCase):
         )
         self.assertFalse(rejected["passed"])
         self.assertIn("match_audit_not_supplied", rejected["reasons"])
+
+    def test_acceptance_fails_closed_on_non_finite_gate_values(self) -> None:
+        metrics = {
+            "n": 2_000,
+            "n_positive": 200,
+            "n_negative": 1_800,
+            "roc_auc": 0.75,
+            "calibration_gap": 0.01,
+            "calibration_slope": 1.0,
+            "brier_improvement_vs_null": 0.02,
+        }
+        intervals = {"roc_auc": {"lower": 0.65, "upper": 0.82}}
+        settings = Settings()
+        cohort = _prepared_numeric_cohort(100)
+
+        metric_cases = (
+            ("n", "test_rows_below_minimum"),
+            ("n_positive", "test_class_count_below_minimum"),
+            ("roc_auc", "auc_below_floor"),
+            ("calibration_gap", "calibration_gap_above_maximum"),
+            (
+                "brier_improvement_vs_null",
+                "brier_not_better_than_training_prevalence",
+            ),
+        )
+        for metric, expected_reason in metric_cases:
+            bad_metrics = dict(metrics)
+            bad_metrics[metric] = float("nan")
+            run = SimpleNamespace(
+                family="prospective",
+                algorithm="logistic",
+                calibration=SimpleNamespace(powered=True),
+                test_metrics_calibrated=bad_metrics,
+                bootstrap_intervals=intervals,
+            )
+            with self.subTest(metric=metric):
+                result = assess_acceptance(
+                    run,
+                    cohort,
+                    settings,
+                    training_prevalence=0.10,
+                    match_precision=0.99,
+                    match_precision_lower_ci=0.97,
+                )
+                self.assertFalse(result["passed"])
+                self.assertIn(expected_reason, result["reasons"])
+
+        run = SimpleNamespace(
+            family="prospective",
+            algorithm="logistic",
+            calibration=SimpleNamespace(powered=True),
+            test_metrics_calibrated=metrics,
+            bootstrap_intervals={"roc_auc": {"lower": float("nan"), "upper": 0.82}},
+        )
+        bad_auc_interval = assess_acceptance(
+            run,
+            cohort,
+            settings,
+            training_prevalence=0.10,
+            match_precision=0.99,
+            match_precision_lower_ci=0.97,
+        )
+        self.assertFalse(bad_auc_interval["passed"])
+        self.assertIn("auc_lower_ci_not_above_chance", bad_auc_interval["reasons"])
+
+        for precision, lower, expected_reason in (
+            (float("nan"), 0.97, "match_precision_below_floor"),
+            (0.99, float("nan"), "match_precision_lower_ci_below_floor"),
+            (1.01, 0.97, "match_precision_below_floor"),
+            (0.99, 1.01, "match_precision_lower_ci_below_floor"),
+            (0.99, 0.995, "match_precision_lower_ci_below_floor"),
+        ):
+            with self.subTest(precision=precision, lower=lower):
+                result = assess_acceptance(
+                    run,
+                    cohort,
+                    settings,
+                    training_prevalence=0.10,
+                    match_precision=precision,
+                    match_precision_lower_ci=lower,
+                )
+                self.assertFalse(result["passed"])
+                self.assertIn(expected_reason, result["reasons"])
 
     def test_missing_lightgbm_is_a_clear_failure(self) -> None:
         tiny = _prepared_numeric_cohort(80)
@@ -410,6 +543,10 @@ class EndToEndTests(TestCase):
             },
         )
         self.assertIn(evaluation.champions["prospective"], {"logistic", "lightgbm"})
+        for key in ("prospective.lightgbm", "snapshot_exploratory.lightgbm"):
+            parameters = evaluation.runs[key].model.estimator.get_params()
+            self.assertEqual(parameters["subsample"], 0.8)
+            self.assertEqual(parameters["subsample_freq"], 1)
         with TemporaryDirectory() as directory:
             first = write_model_artifacts(evaluation, directory)
             first_json = Path(first["evaluation"]).read_text(encoding="utf-8")

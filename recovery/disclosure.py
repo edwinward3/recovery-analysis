@@ -1,8 +1,10 @@
-"""Stage only approved aggregate artefacts and enforce RT disclosure controls.
+"""The last safety check before an aggregate result can leave RT.
 
-The scanner skips a sibling ``rt_internal`` area but never skips anything
-inside an egress directory.  It performs local file inspection only: no
-network or shell operations.
+Only named allowlisted files can enter ``egress_candidate``. Small positive
+cells are removed, and sensitive headings, postcode or company-number patterns,
+company-style names and supplied known identifiers stop the copy. ``rt_internal``
+is deliberately outside that route. This file inspects local files only and
+makes no internet or shell calls.
 """
 
 from __future__ import annotations
@@ -43,6 +45,7 @@ _SAFE_EIGHT_DIGIT_COLUMNS = frozenset(
         "locked_seed",
         "observation_date",
         "run_seed",
+        "sample_seed",
         "seed",
         "snapshot_date",
     }
@@ -70,6 +73,8 @@ _EXACT_IDENTIFIER_COLUMNS = frozenset(
     }
 )
 
+
+# ===== what the safety check found =====
 
 @dataclass(frozen=True, slots=True)
 class IdentifierFinding:
@@ -100,6 +105,8 @@ class DisclosureViolation(RuntimeError):
         )
         super().__init__("egress disclosure gate failed" + (f": {summary}" if summary else ""))
 
+
+# ===== remove small cells and scan finished egress files =====
 
 def suppress_small_cells(
     frame: pd.DataFrame,
@@ -148,7 +155,11 @@ def scan_identifiers(
             continue
         if path.suffix.casefold() not in _TEXT_SUFFIXES:
             findings.append(
-                IdentifierFinding(str(relative), "uninspectable_file", "file type is not allowlisted")
+                IdentifierFinding(
+                    str(relative),
+                    "uninspectable_file",
+                    "file type is not allowlisted",
+                )
             )
             continue
         if path.suffix.casefold() == ".csv":
@@ -172,6 +183,8 @@ def validate_egress(
         raise DisclosureViolation(report)
     return report
 
+
+# ===== copy only approved aggregate files into a clean egress directory =====
 
 def stage_egress(
     source_dir: str | Path,
@@ -270,6 +283,8 @@ def stage_egress(
         raise DisclosureViolation(report)
     return report
 
+
+# ===== identifier checks used for CSV and text files =====
 
 def _scan_csv(
     path: Path, relative: Path, known_identifiers: tuple[str, ...]

@@ -1,9 +1,10 @@
-"""Offline, auditable matching of RT defendants to Companies House companies.
+"""Match every valid RT judgment to Companies House, or explain why it did not.
 
-The bulk file is streamed once and only postcode or exact-name candidates are
-retained.  Historical names are usable only for dates on which they were valid;
-an unknown incorporation date can never produce an automatic match.  This
-module performs no network, shell, cache, or output operations.
+The Companies House file is read once. The normal route finds companies at the
+same postcode and compares their names; a separate conservative fallback finds
+a unique exact name when the postcode changed. Former names are used only when
+valid on the judgment date. This file makes no internet, shell or cache calls
+and writes no output itself.
 """
 
 from __future__ import annotations
@@ -71,6 +72,8 @@ _CH_HEADER_ALIASES: dict[str, str] = {
 }
 
 
+# ===== make names and postcodes comparable without changing the source files =====
+
 def normalize_name(value: object) -> str:
     """Return a conservative comparison form, stripping only terminal suffixes."""
 
@@ -135,6 +138,8 @@ class CHIndex:
     by_exact_name: Mapping[str, tuple[str, ...]]
     stats: Mapping[str, object]
 
+
+# ===== stream Companies House and keep only possible candidates =====
 
 def _canon_header(value: object) -> str:
     return re.sub(r"[^a-z0-9]+", "", str(value).strip().lower())
@@ -386,6 +391,8 @@ def build_relevant_ch_index(
     return CHIndex(companies, by_postcode, by_exact_name, stats)
 
 
+# ===== choose one deterministic match decision for each RT row =====
+
 @dataclass(frozen=True, slots=True)
 class _Candidate:
     record: CompanyRecord
@@ -592,6 +599,8 @@ def match_judgments(
     return pd.DataFrame(output)
 
 
+# ===== aggregate coverage, methods and unmatched reasons without names =====
+
 def _count_table(series: pd.Series, column: str) -> pd.DataFrame:
     counts = series.fillna("missing").astype(str).value_counts(dropna=False, sort=False)
     table = counts.rename_axis(column).reset_index(name="rows")
@@ -626,7 +635,10 @@ def match_diagnostics(
     unmatched_reasons = _count_table(
         joined.loc[joined["tier"].eq("unmatched"), "reason"], "reason"
     )
-    method = joined.loc[~joined["tier"].eq("unmatched"), ["tier", "matched_on", "matched_name_kind"]].copy()
+    method = joined.loc[
+        ~joined["tier"].eq("unmatched"),
+        ["tier", "matched_on", "matched_name_kind"],
+    ].copy()
     if method.empty:
         method_counts = pd.DataFrame(columns=["tier", "matched_on", "matched_name_kind", "rows"])
     else:
@@ -710,6 +722,8 @@ def match_diagnostics(
         "guard_counts": guard_counts,
     }
 
+
+# ===== draw the 1,000 proposed pairs RT will check by hand =====
 
 def _stable_rank(seed: int, tier: str, identifier: str, company_number: str) -> str:
     value = f"{seed}|{tier}|{identifier}|{company_number}".encode("utf-8")
@@ -862,7 +876,11 @@ def review_sample(
     sampled = sampled.sort_values(["__tier_order", "ID"], kind="stable").drop(
         columns="__tier_order"
     ).reset_index(drop=True)
-    sampled.insert(0, "review_row_id", [f"R{position:04d}" for position in range(1, len(sampled) + 1)])
+    sampled.insert(
+        0,
+        "review_row_id",
+        [f"R{position:04d}" for position in range(1, len(sampled) + 1)],
+    )
     sampled.insert(1, "review_tier", sampled["tier"])
     sampled.insert(2, "review_decision", "")
     sampled.insert(3, "review_notes", "")

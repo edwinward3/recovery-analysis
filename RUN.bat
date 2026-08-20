@@ -1,7 +1,8 @@
-@rem Purpose: prepare the pinned environment and launch one RT analysis run.
-@rem Inputs: local source, optional wheel bundle, RT extract, CH bulk file, stage and date.
-@rem Outputs: segregated RT-internal files and disclosure-checked aggregate candidates.
-@rem Sensitivity: inputs stay local; setup may contact PyPI only when no wheel bundle is present.
+@rem Sets up Python, checks the code on fake data, then runs the selected stage locally.
+@rem Run 1 matches the full RT extract only. Run 2 adds the satisfaction models and
+@rem remains available for testing but is not offered interactively until RT agrees it.
+@rem Raw names and matches stay in rt_internal; only checked aggregate reports go
+@rem to egress_candidate.
 @echo off
 setlocal DisableDelayedExpansion
 cd /d "%~dp0"
@@ -64,8 +65,8 @@ set "INTERACTIVE="
 
 if defined STAGE goto have_stage
 set "INTERACTIVE=1"
-set /p "STAGE=Which run? [1 = diagnostic, 2 = locked] (1): "
-if not defined STAGE set "STAGE=1"
+set "STAGE=diagnostic"
+echo Run 1 selected: full-data matching only.
 
 :have_stage
 set "STAGE=%STAGE:"=%"
@@ -93,7 +94,7 @@ if not exist "%COMPANIES%" goto missing_companies
 
 if not defined INTERACTIVE goto arguments_ready
 if defined OBSERVATION goto arguments_ready
-set /p "OBSERVATION=Observation date YYYY-MM-DD (blank = today): "
+set /p "OBSERVATION=RT extract date YYYY-MM-DD (blank = today): "
 
 :arguments_ready
 set "OBSERVATION=%OBSERVATION:"=%"
@@ -101,7 +102,9 @@ set "OUTPUT_BASE=%OUTPUT_BASE:"=%"
 if not defined OUTPUT_BASE set "OUTPUT_BASE=outputs"
 
 echo.
-echo Running %STAGE% analysis. Raw and RT-internal files stay on this machine.
+if /i "%STAGE%"=="diagnostic" echo Running Run 1: full-data matching only. No satisfaction model will be trained.
+if /i "%STAGE%"=="locked" echo Running Run 2: locked matching plus the agreed satisfaction models.
+echo Raw and RT-internal files stay on this machine.
 if defined OBSERVATION goto run_with_date
 ".venv\Scripts\python.exe" -m recovery.run analyze --stage "%STAGE%" --judgments "%JUDGMENTS%" --companies-house "%COMPANIES%" --settings "settings.toml" --output-base "%OUTPUT_BASE%"
 if errorlevel 1 goto run_failed
@@ -114,6 +117,7 @@ if errorlevel 1 goto run_failed
 :run_succeeded
 echo.
 echo Done. Open the newest run folder beneath "%OUTPUT_BASE%".
+if /i "%STAGE%"=="diagnostic" echo Complete the 1,000-pair file in rt_internal before changing the matcher.
 echo RT must review egress_candidate before anything leaves this machine.
 if "%RECOVERY_NO_PAUSE%"=="" pause
 exit /b 0
@@ -137,7 +141,7 @@ goto stop
 
 :bad_stage
 echo.
-echo STOP: Choose 1/diagnostic or 2/locked.
+echo STOP: Choose 1 for full-data matching or 2 for the agreed satisfaction/model run.
 goto stop
 
 :missing_judgments

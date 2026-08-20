@@ -1,7 +1,8 @@
-"""Read and validate the transparent analysis settings.
+"""Read the small set of matching, sampling and model rules in settings.toml.
 
-Input: ``settings.toml``. Output: an immutable ``Settings`` object. This file
-contains no RT data and performs no network, shell, or output operations.
+The values are fixed before an official run and copied into its run record.
+This file contains no RT data, writes nothing and makes no internet or shell
+calls.
 """
 
 from __future__ import annotations
@@ -11,6 +12,8 @@ from pathlib import Path
 from typing import Any
 import tomllib
 
+
+# ===== every setting that may change an official result =====
 
 @dataclass(frozen=True, slots=True)
 class Settings:
@@ -44,6 +47,8 @@ class Settings:
 
 _SECTIONS = {"matching", "cohort", "review_sample", "acceptance", "runtime"}
 
+
+# ===== read the TOML once, reject unknown keys and check the values =====
 
 def load_settings(path: str | Path) -> Settings:
     """Load known keys from TOML and reject unsafe or contradictory values."""

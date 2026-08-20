@@ -1,10 +1,9 @@
-"""Exercise the real offline pipeline using deterministic synthetic data only.
+"""Run both real stages on fake data before any RT file is opened.
 
-Inputs are generated fake RT and Companies House records. Outputs are either a
-requested synthetic input bundle or a temporary diagnostic run that is deleted
-on exit. The test checks planted match identities, corruption-class behaviour,
-model/report production and the disclosure boundary. No network or shell calls
-are made by this module and no confidential data is read.
+The test checks that Run 1 processes every row and writes no model results, then
+checks that Run 2 makes the four declared fits. It also checks known matching
+examples, the 1,000-pair files and the disclosure boundary. Everything is
+synthetic and temporary; no confidential data, internet or shell calls are used.
 """
 
 from __future__ import annotations
@@ -22,7 +21,7 @@ from .run import MATCH_FILENAME, PAIR_FILENAME, analyze
 from .synthetic import make_synthetic_bundle, write_bundle
 
 
-_EXPECTED_EGRESS = {
+_MATCHING_EGRESS = {
     "SUMMARY.txt",
     "E1_data_audit.csv",
     "E1_data_funnel.csv",
@@ -32,6 +31,11 @@ _EXPECTED_EGRESS = {
     "E2_match_by_defendant_type.csv",
     "E2_match_by_judgment_vintage.csv",
     "E2_incorporation_guards.csv",
+    "E5_run_log.csv",
+    "E5_run_manifest.json",
+}
+
+_MODEL_EGRESS = {
     "E3_model_comparison.csv",
     "E3_calibration.csv",
     "E3_feature_effects.csv",
@@ -39,8 +43,6 @@ _EXPECTED_EGRESS = {
     "E4_sensitivities.csv",
     "E4_lift.csv",
     "E4_limitations.txt",
-    "E5_run_log.csv",
-    "E5_run_manifest.json",
 }
 
 _EXPECTED_TIERS = {
@@ -54,6 +56,8 @@ _EXPECTED_TIERS = {
     "unmatched": "unmatched",
 }
 
+
+# ===== command-line options and optional synthetic input writer =====
 
 def _parser() -> ArgumentParser:
     parser = ArgumentParser(description="Run the synthetic recovery-analysis test")
@@ -92,6 +96,8 @@ def _write_inputs(args: object) -> int:
     return 0
 
 
+# ===== check exact planted matches and each stage's promised files =====
+
 def _assert_match_truth(run_root: Path, truth_path: Path) -> None:
     matches = pd.read_csv(
         run_root / "rt_internal" / MATCH_FILENAME,
@@ -125,12 +131,18 @@ def _assert_match_truth(run_root: Path, truth_path: Path) -> None:
         )
 
 
-def _assert_outputs(run_root: Path, truth_path: Path) -> None:
+def _assert_outputs(run_root: Path, truth_path: Path, *, stage: str) -> None:
     egress = run_root / "egress_candidate"
     actual = {path.name for path in egress.iterdir() if path.is_file()}
-    missing = sorted(_EXPECTED_EGRESS - actual)
+    expected = _MATCHING_EGRESS | (_MODEL_EGRESS if stage == "locked" else set())
+    missing = sorted(expected - actual)
     if missing:
         raise AssertionError(f"missing aggregate outputs: {missing}")
+    unexpected_models = sorted(_MODEL_EGRESS & actual) if stage == "diagnostic" else []
+    if unexpected_models:
+        raise AssertionError(
+            f"matching-only diagnostic wrote model outputs: {unexpected_models}"
+        )
     validate_egress(egress)
 
     pairs = pd.read_csv(run_root / "rt_internal" / PAIR_FILENAME)
@@ -141,20 +153,37 @@ def _assert_outputs(run_root: Path, truth_path: Path) -> None:
     if allocation != expected_allocation:
         raise AssertionError(f"review allocation differs: {allocation!r}")
 
-    comparison = pd.read_csv(egress / "E3_model_comparison.csv")
-    if set(comparison["model"]) != {
-        "prospective.logistic",
-        "prospective.lightgbm",
-        "snapshot_exploratory.logistic",
-        "snapshot_exploratory.lightgbm",
-    }:
-        raise AssertionError("the four declared model fits were not all reported")
-    split_rows = pd.read_csv(egress / "E3_split_counts.csv")
-    if set(split_rows["split"]) != {"train", "validation", "calibration", "test"}:
-        raise AssertionError("the four declared partitions were not all reported")
+    matches = pd.read_csv(run_root / "rt_internal" / MATCH_FILENAME)
+    coverage = pd.read_csv(egress / "E2_match_coverage.csv")
+    if int(coverage["rows"].sum()) != len(matches):
+        raise AssertionError("E2 coverage does not account for every matching decision")
+
+    if stage == "locked":
+        comparison = pd.read_csv(egress / "E3_model_comparison.csv")
+        if set(comparison["model"]) != {
+            "prospective.logistic",
+            "prospective.lightgbm",
+            "snapshot_exploratory.logistic",
+            "snapshot_exploratory.lightgbm",
+        }:
+            raise AssertionError("the four declared model fits were not all reported")
+        split_rows = pd.read_csv(egress / "E3_split_counts.csv")
+        if set(split_rows["split"]) != {
+            "train",
+            "validation",
+            "calibration",
+            "test",
+        }:
+            raise AssertionError("the four declared partitions were not all reported")
+    else:
+        summary = (egress / "SUMMARY.txt").read_text(encoding="utf-8")
+        if "No satisfaction model was trained or assessed" not in summary:
+            raise AssertionError("diagnostic summary does not state that modelling was skipped")
 
     _assert_match_truth(run_root, truth_path)
 
+
+# ===== run matching-only Run 1 and locked model Run 2 end to end =====
 
 def _run_full(args: object) -> int:
     if args.n_companies < 1_600:
@@ -170,19 +199,29 @@ def _run_full(args: object) -> int:
             root / "inputs !",
             excel=args.format == "xlsx",
         )
-        paths = analyze(
+        diagnostic = analyze(
             stage="diagnostic",
             judgments_path=judgments,
             companies_house_path=companies,
             observation_date=bundle.observation_date,
             settings_path=args.settings,
             output_base=root / "outputs !",
-            run_id="selftest",
+            run_id="selftest_diagnostic",
         )
-        _assert_outputs(paths.root, truth)
+        _assert_outputs(diagnostic.root, truth, stage="diagnostic")
+        locked = analyze(
+            stage="locked",
+            judgments_path=judgments,
+            companies_house_path=companies,
+            observation_date=bundle.observation_date,
+            settings_path=args.settings,
+            output_base=root / "outputs !",
+            run_id="selftest_locked",
+        )
+        _assert_outputs(locked.root, truth, stage="locked")
     print(
-        "SELF-TEST: PASS. Planted match identities, four model fits, E1-E5 "
-        "and the disclosure boundary all passed."
+        "SELF-TEST: PASS. Matching-only Run 1, locked Run 2, planted match "
+        "identities, four model fits and the disclosure boundary all passed."
     )
     return 0
 

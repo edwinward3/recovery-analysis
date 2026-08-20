@@ -1,8 +1,9 @@
-"""Offline readers and validation for RT and Companies House inputs.
+"""Read and check the RT extract and stream the Companies House file.
 
-``Date Inserted`` is treated only as the register-entry date.  Judgment age is
-always measured from the explicit observation date supplied by the caller.
-This module performs no network, shell, cache, or output operations.
+Every valid RT row is retained for matching; cohort filters belong to Run 2.
+``Date Inserted`` is used only to measure registration delay. Judgment age is
+measured from ``JudgmentDate`` to the supplied extract date. This file makes no
+internet, shell or cache calls and writes no analysis output.
 """
 
 from __future__ import annotations
@@ -18,6 +19,8 @@ import pandas as pd
 
 
 DAYS_PER_MONTH = 30.44
+
+# ===== the columns and fixed values expected from RT =====
 
 REQUIRED_RT_COLUMNS: tuple[str, ...] = (
     "ID",
@@ -79,6 +82,8 @@ _CODED_VALUE_MAPS: dict[str, dict[str, str]] = {
 }
 
 
+# ===== the identifier-free facts recorded about the RT input =====
+
 @dataclass(frozen=True, slots=True)
 class DataAudit:
     """Identifier-free facts recording how the RT input was interpreted."""
@@ -107,6 +112,8 @@ class DataAudit:
     def as_dict(self) -> dict[str, object]:
         return asdict(self)
 
+
+# ===== read, standardise and validate the full RT extract =====
 
 def _canon_header(value: object) -> str:
     return re.sub(r"[^a-z0-9]+", "", str(value).strip().lower())
@@ -333,6 +340,8 @@ def read_rt_extract(
     )
     return frame, audit
 
+
+# ===== read the large Companies House CSV or ZIP a piece at a time =====
 
 def iter_ch_chunks(
     path: str | Path,

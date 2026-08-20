@@ -1,7 +1,7 @@
 """Create deterministic fake RT and Companies House inputs for tests only.
 
 Outputs contain no real identifiers.  The generator plants known matching
-corruptions and a modest payment signal so the full offline pipeline can be
+corruptions and a modest satisfaction signal so the full offline pipeline can be
 tested without reading or writing confidential data.
 """
 

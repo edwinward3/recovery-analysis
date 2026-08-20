@@ -1,6 +1,6 @@
-@rem Purpose: validate RT's completed internal match sample against the locked gates.
-@rem Input: one completed review CSV/XLSX. Output: aggregate precision and bound final status.
-@rem Sensitivity: named pairs stay local; setup may contact PyPI before the file is read.
+@rem Checks RT's answers in a completed 1,000-pair file and writes aggregate results only.
+@rem A Run 1 pass confirms sampled automatic-match quality, not every match or a model.
+@rem The named pair file stays inside RT; setup may contact PyPI before it is read.
 @echo off
 setlocal DisableDelayedExpansion
 cd /d "%~dp0"
@@ -28,7 +28,7 @@ if errorlevel 1 goto review_failed
 
 echo.
 echo Match-review gate passed. Aggregate results are in "%OUTPUT_DIR%".
-echo Open FINAL_STATUS.txt there to see whether the saved model gates also passed.
+echo Open MATCH_REVIEW_STATUS.txt there for the matching result.
 echo The completed pair file remains RT-internal and must not leave.
 if "%RECOVERY_NO_PAUSE%"=="" pause
 exit /b 0

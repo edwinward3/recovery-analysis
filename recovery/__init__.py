@@ -1,8 +1,7 @@
-"""Offline Registry Trust recovery-analysis package.
+"""Local Registry Trust matching and deferred satisfaction analysis.
 
-Inputs may contain confidential judgment and company identifiers.  Modules in
-this package perform no network or shell operations; only aggregate artefacts
-explicitly written to ``egress_candidate`` are candidates for RT review.
+The analysis modules never send data or start another program. Named rows stay
+in ``rt_internal``; only checked aggregate files can enter ``egress_candidate``.
 """
 
-__version__ = "3.0.0"
+__version__ = "3.1.0"

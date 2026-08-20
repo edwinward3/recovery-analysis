@@ -1,15 +1,17 @@
-"""Write aggregate E1–E5 reports and segregate confidential artefacts.
+"""Write the files RT reads after each run.
 
-Inputs are in-memory aggregate tables plus run metadata. Outputs go either to
-``egress_candidate`` or ``rt_internal``. This module performs no network or
-shell operations and never places row-level predictions in the egress area.
+Run 1 gets the data audit, matching reports, short summary and run record. Run
+2 adds the model reports. This file writes aggregate information only; names,
+company numbers, individual matches and predictions never enter these reports.
+It does not connect to the internet or start another program.
 """
 
 from __future__ import annotations
 
+from copy import deepcopy
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Iterator
 import hashlib
@@ -23,6 +25,8 @@ import pandas as pd
 
 from .config import Settings
 
+
+# ===== create a fresh output folder and record each stage =====
 
 @dataclass(frozen=True, slots=True)
 class RunPaths:
@@ -86,8 +90,11 @@ def source_fingerprint(package_dir: str | Path, settings_path: str | Path) -> st
 
 
 def write_json(path: str | Path, value: Any) -> None:
-    Path(path).write_text(json.dumps(value, indent=2, sort_keys=True, default=_json_default) + "\n", encoding="utf-8")
+    text = json.dumps(value, indent=2, sort_keys=True, default=_json_default)
+    Path(path).write_text(text + "\n", encoding="utf-8")
 
+
+# ===== E1: what was in the RT extract and what reached each stage =====
 
 def write_e1(
     egress: Path,
@@ -172,7 +179,14 @@ def build_data_audit_counts(
     add("status_x_type_x_jurisdiction_x_vintage", combined)
     support = int(len(frame))
     for column in frame.columns:
-        if column.startswith(("registration_lag_", "age_at_", "judgment_year", "amount_band", "observation_age_band")):
+        derived_prefixes = (
+            "registration_lag_",
+            "age_at_",
+            "judgment_year",
+            "amount_band",
+            "observation_age_band",
+        )
+        if column.startswith(derived_prefixes):
             continue
         rows.append(
             {
@@ -183,11 +197,15 @@ def build_data_audit_counts(
             }
         )
     if audit is not None:
-        for header in getattr(audit, "extra_headers", ()):
+        for position, _header in enumerate(
+            getattr(audit, "extra_headers", ()), start=1
+        ):
             rows.append(
                 {
                     "dimension": "extra_input_column_not_used",
-                    "value": str(header),
+                    # Unknown headings can themselves contain client wording.
+                    # Record their presence without copying the raw text out.
+                    "value": f"extra_column_{position}",
                     "rows": support,
                     "share": 1.0,
                 }
@@ -217,6 +235,8 @@ def build_data_audit_counts(
     return pd.DataFrame(rows).sort_values(["dimension", "value"], kind="stable")
 
 
+# ===== E2: how every judgment matched, or why it did not =====
+
 def write_e2(egress: Path, diagnostics: dict[str, pd.DataFrame]) -> list[str]:
     names = {
         "tier_counts": "E2_match_coverage.csv",
@@ -232,6 +252,8 @@ def write_e2(egress: Path, diagnostics: dict[str, pd.DataFrame]) -> list[str]:
         files.append(_write_csv(egress / filename, table))
     return files
 
+
+# ===== E3 and E4: Run 2 model results and sensitivity checks =====
 
 def build_model_tables(
     evaluation: Any,
@@ -487,15 +509,21 @@ def write_e3_e4(
     return files
 
 
+# ===== E5 and SUMMARY: the run record and the first page RT should open =====
+
 def write_e5(
     egress: Path,
     recorder: RunRecorder,
     manifest: dict[str, Any],
+    *,
+    min_cell_n: int = 10,
 ) -> list[str]:
-    log = pd.DataFrame(recorder.stages)
+    """Write a finalized, small-cell-safe run record."""
+
+    log = _public_run_log(pd.DataFrame(recorder.stages), min_cell_n)
     log_path = egress / "E5_run_log.csv"
     log.to_csv(log_path, index=False)
-    manifest = dict(manifest)
+    manifest = _public_manifest(manifest, min_cell_n)
     manifest["warnings"] = recorder.warnings
     manifest["runtime"] = {
         "python": sys.version,
@@ -510,7 +538,11 @@ def write_e5(
 
 
 def write_summary(path: str | Path, context: dict[str, Any]) -> None:
-    """Write the deliberately short cover page; detailed values remain E1–E5."""
+    """Write a short cover page for either the matching or model stage."""
+
+    if context.get("scope") == "matching_only":
+        _write_matching_summary(path, context)
+        return
 
     counts = context.get("counts", {})
     match = context.get("match", {})
@@ -518,6 +550,7 @@ def write_summary(path: str | Path, context: dict[str, Any]) -> None:
     exploratory = context.get("exploratory", {})
     gates = context.get("gates", {})
     splits = context.get("splits", {})
+    min_cell_n = int(context.get("min_cell_n", 10))
     lines = [
         "DRAFT — RT REVIEW REQUIRED — NOT AUTHORISED FOR EXTERNAL USE",
         "RECOVERY ANALYSIS — SUMMARY",
@@ -527,30 +560,39 @@ def write_summary(path: str | Path, context: dict[str, Any]) -> None:
         f"Statuses observed on           {context.get('observation_date', 'unknown')}",
         "",
         "Data funnel",
-        f"  Judgments read               {_fmt_count(counts.get('rows_read'))}",
-        f"  Corporate E&W, valid label   {_fmt_count(counts.get('corporate_ew_labelled'))}",
-        f"  Aged 12–36 months            {_fmt_count(counts.get('primary_age_eligible'))}",
-        f"  Auto-matched eligible        {_fmt_count(counts.get('auto_matched_eligible'))}",
-        f"  Unique companies/model rows  {_fmt_count(counts.get('model_rows'))}",
-        f"  Satisfied / Unsatisfied      {_fmt_count(counts.get('satisfied'))} / {_fmt_count(counts.get('unsatisfied'))}",
+        f"  Judgments read               {_fmt_count(counts.get('rows_read'), min_cell_n)}",
+        "  Corporate E&W, valid label   "
+        f"{_fmt_count(counts.get('corporate_ew_labelled'), min_cell_n)}",
+        "  Aged 12–36 months            "
+        f"{_fmt_count(counts.get('primary_age_eligible'), min_cell_n)}",
+        "  Auto-matched eligible        "
+        f"{_fmt_count(counts.get('auto_matched_eligible'), min_cell_n)}",
+        f"  Unique companies/model rows  {_fmt_count(counts.get('model_rows'), min_cell_n)}",
+        "  Satisfied / Unsatisfied      "
+        f"{_fmt_count(counts.get('satisfied'), min_cell_n)} / "
+        f"{_fmt_count(counts.get('unsatisfied'), min_cell_n)}",
         "",
         "Matching coverage (coverage, not accuracy)",
-        f"  Corporate denominator        {_fmt_count(match.get('denominator'))}",
-        f"  Auto                          {_fmt_count(match.get('auto'))}",
-        f"  Review                        {_fmt_count(match.get('review'))}",
-        f"  Fallback review               {_fmt_count(match.get('fallback_review'))}",
-        f"  Unmatched                     {_fmt_count(match.get('unmatched'))}",
+        f"  Corporate denominator        {_fmt_count(match.get('denominator'), min_cell_n)}",
+        f"  Auto                          {_fmt_count(match.get('auto'), min_cell_n)}",
+        f"  Review                        {_fmt_count(match.get('review'), min_cell_n)}",
+        f"  Fallback review               {_fmt_count(match.get('fallback_review'), min_cell_n)}",
+        f"  Unmatched                     {_fmt_count(match.get('unmatched'), min_cell_n)}",
         "",
         "Primary judgment-time model",
         f"  Locked algorithm              {_fmt(primary.get('champion'))}",
-        f"  Train rows / positives        {_split_count(splits, 'train')}",
-        f"  Validation rows / positives   {_split_count(splits, 'validation')}",
-        f"  Calibration rows / positives  {_split_count(splits, 'calibration')}",
-        f"  Test rows / positives         {_split_count(splits, 'test')}",
+        f"  Train rows / positives        {_split_count(splits, 'train', min_cell_n)}",
+        f"  Validation rows / positives   {_split_count(splits, 'validation', min_cell_n)}",
+        f"  Calibration rows / positives  {_split_count(splits, 'calibration', min_cell_n)}",
+        f"  Test rows / positives         {_split_count(splits, 'test', min_cell_n)}",
         f"  ROC-AUC (95% CI)              {_metric_ci(primary, 'roc_auc')}",
         f"  Average precision             {_fmt_float(primary.get('average_precision'))}",
-        f"  Brier / prevalence baseline   {_fmt_float(primary.get('brier'))} / {_fmt_float(primary.get('baseline_brier'))}",
-        f"  Mean predicted / observed     {_fmt_float(primary.get('mean_predicted'))} / {_fmt_float(primary.get('observed_rate'))}",
+        "  Brier / prevalence baseline   "
+        f"{_fmt_float(primary.get('brier'))} / "
+        f"{_fmt_float(primary.get('baseline_brier'))}",
+        "  Mean predicted / observed     "
+        f"{_fmt_float(primary.get('mean_predicted'))} / "
+        f"{_fmt_float(primary.get('observed_rate'))}",
         f"  Primary model gates           {_fmt(gates.get('primary_model'))}",
         "",
         "EXPLORATORY — CURRENT-SNAPSHOT FEATURES — NOT PROSPECTIVE",
@@ -574,6 +616,59 @@ def write_summary(path: str | Path, context: dict[str, Any]) -> None:
     ]
     Path(path).write_text("\n".join(lines) + "\n", encoding="utf-8")
 
+
+def _write_matching_summary(path: str | Path, context: dict[str, Any]) -> None:
+    """Write Run 1's full-dataset matching summary without model results."""
+
+    counts = context.get("counts", {})
+    match = context.get("match", {})
+    min_cell_n = int(context.get("min_cell_n", 10))
+    lines = [
+        "DRAFT — RT REVIEW REQUIRED — NOT AUTHORISED FOR EXTERNAL USE",
+        "RECOVERY ANALYSIS — RUN 1 MATCHING SUMMARY",
+        "==========================================",
+        f"Run status                    {context.get('status', 'PROVISIONAL')}",
+        f"RT extract date                {context.get('observation_date', 'unknown')}",
+        "",
+        "Full-dataset matching",
+        f"  Judgments read               {_fmt_count(counts.get('rows_read'), min_cell_n)}",
+        "  Matching decisions           "
+        f"{_fmt_count(counts.get('matching_decisions'), min_cell_n)}",
+        "  Missing company name         "
+        f"{_fmt_count(counts.get('missing_company_name'), min_cell_n)}",
+        f"  Missing postcode             {_fmt_count(counts.get('missing_postcode'), min_cell_n)}",
+        "",
+        "Matching coverage (coverage, not accuracy)",
+        f"  Full-dataset denominator     {_fmt_count(match.get('denominator'), min_cell_n)}",
+        f"  Auto                          {_fmt_count(match.get('auto'), min_cell_n)}",
+        f"  Review                        {_fmt_count(match.get('review'), min_cell_n)}",
+        f"  Fallback review               {_fmt_count(match.get('fallback_review'), min_cell_n)}",
+        f"  Unmatched                     {_fmt_count(match.get('unmatched'), min_cell_n)}",
+        f"  Same-postcode coverage        {_fmt_percent(match.get('postcode_coverage'))}",
+        f"  Coverage incl. fallback       {_fmt_percent(match.get('coverage'))}",
+        "",
+        "What this run did",
+        "  - Every valid row was sent through matching, with no age, status,",
+        "    defendant-type or jurisdiction filter.",
+        "  - No satisfaction model was trained or assessed.",
+        "  - The 1,000 proposed pairs must be checked to measure match quality.",
+        "",
+        "Important limits",
+        "  - A high match rate does not prove that the proposed matches are correct.",
+        "  - The free Companies House file contains a present-day live-company snapshot.",
+        "  - Address changes, dissolved companies and non-company defendants can remain unmatched.",
+        "  - RT review and permission are required before any result leaves.",
+        "",
+        "Detailed aggregate reports in egress_candidate",
+        "  E1 data audit and matching funnel",
+        "  E2 matching coverage, methods and unmatched reasons",
+        "  E5 timings, memory, settings and run record",
+        f"RT-internal pair file: {context.get('pair_file', 'not produced')} (DO NOT EGRESS)",
+    ]
+    Path(path).write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+# ===== local memory measurement and small formatting helpers =====
 
 def peak_memory_mb() -> float:
     """Return process peak resident memory using only the standard library."""
@@ -660,9 +755,14 @@ def _fmt_count(value: Any, min_cell_n: int = 10) -> str:
     return f"<{min_cell_n}" if 0 <= count < min_cell_n else f"{count:,}"
 
 
-def _split_count(splits: dict[str, Any], split: str) -> str:
+def _split_count(
+    splits: dict[str, Any], split: str, min_cell_n: int = 10
+) -> str:
     values = splits.get(split, {})
-    return f"{_fmt_count(values.get('rows'))} / {_fmt_count(values.get('positive'))}"
+    return (
+        f"{_fmt_count(values.get('rows'), min_cell_n)} / "
+        f"{_fmt_count(values.get('positive'), min_cell_n)}"
+    )
 
 
 def _fmt_float(value: Any) -> str:
@@ -670,6 +770,15 @@ def _fmt_float(value: Any) -> str:
         if value is None or pd.isna(value):
             return "n/a"
         return f"{float(value):.3f}"
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def _fmt_percent(value: Any) -> str:
+    try:
+        if value is None or pd.isna(value):
+            return "n/a"
+        return f"{100 * float(value):.1f}%"
     except (TypeError, ValueError):
         return str(value)
 
@@ -692,4 +801,62 @@ def _json_default(value: Any) -> Any:
 
 
 def _utc_now() -> str:
-    return datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+    return datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+_RUN_LOG_COUNT_COLUMNS = frozenset(
+    {
+        "ch_rows_read",
+        "ch_rows_retained",
+        "judgments_matched",
+        "model_rows",
+        "sample_rows",
+        "suppressed_rows",
+    }
+)
+
+
+def _redact_small_count(value: Any, min_cell_n: int) -> Any:
+    """Replace a positive observed count below the disclosure floor."""
+
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return value
+    if numeric.is_integer() and 0 < numeric < min_cell_n:
+        return f"<{min_cell_n}"
+    return value
+
+
+def _public_run_log(log: pd.DataFrame, min_cell_n: int) -> pd.DataFrame:
+    public = log.copy()
+    for column in _RUN_LOG_COUNT_COLUMNS & set(public.columns):
+        public[column] = public[column].map(
+            lambda value: _redact_small_count(value, min_cell_n)
+        )
+    return public
+
+
+def _public_manifest(manifest: dict[str, Any], min_cell_n: int) -> dict[str, Any]:
+    """Remove data-derived small cells from the public E5 receipt."""
+
+    public = deepcopy(manifest)
+    stats = public.get("ch_index_stats", {})
+    if isinstance(stats, dict):
+        for key, value in list(stats.items()):
+            if key != "analysis_fingerprint":
+                stats[key] = _redact_small_count(value, min_cell_n)
+
+    acceptance = public.get("model_only_acceptance")
+    if isinstance(acceptance, dict):
+        acceptance.pop("cohort_test_counts", None)
+        guards = acceptance.get("guards")
+        if isinstance(guards, dict):
+            guards.pop("training_prevalence", None)
+
+    disclosure = public.get("disclosure", {})
+    suppressed = disclosure.get("suppressed_rows", []) if isinstance(disclosure, dict) else []
+    for row in suppressed:
+        if isinstance(row, dict) and "rows" in row:
+            row["rows"] = _redact_small_count(row["rows"], min_cell_n)
+    return public

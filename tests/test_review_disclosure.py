@@ -141,6 +141,21 @@ class ReviewTests(unittest.TestCase):
             public = pd.read_csv(csv_path)
             self.assertNotIn("auto", public["tier"].tolist())
 
+    def test_rare_nonauto_outcome_is_not_revealed_in_text(self) -> None:
+        settings = Settings()
+        review = _completed_review(settings)
+        first_review = review.index[review["review_tier"].eq("review")][0]
+        review.loc[first_review, "review_decision"] = "uncertain"
+        result = parse_completed_review(review, settings)
+        with TemporaryDirectory() as temporary:
+            csv_path, txt_path = write_review_aggregates(result, temporary)
+            public = pd.read_csv(csv_path)
+            text = txt_path.read_text(encoding="utf-8")
+            self.assertNotIn("review", public["tier"].tolist())
+            self.assertIn("Uncertain decisions: <10", text)
+            self.assertNotIn("Uncertain decision present", text)
+            self.assertNotIn("0.996667", text)
+
 
 class DisclosureTests(unittest.TestCase):
     def test_small_cells_are_removed(self) -> None:

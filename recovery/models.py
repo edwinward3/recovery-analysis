@@ -1,9 +1,10 @@
-"""Build leakage-controlled cohorts and evaluate the two RT model families.
+"""Prepare and evaluate the deferred Run 2 satisfaction models.
 
-Inputs are standardised judgment rows and matches. Outputs are identifier-free
-metrics and local model descriptions, never row-level results. The primary
-features are available at judgment; current-snapshot features are exploratory.
-This module makes no network or shell calls.
+Run 1 does not call this file. Run 2 keeps identifiers only in its internal
+cohort, then writes aggregate metrics and local model descriptions. The primary
+features are intended to be available at judgment; present-day Companies House
+features are kept in a separate exploratory family. Nothing here connects to
+the internet or starts another program.
 """
 
 from __future__ import annotations
@@ -33,6 +34,8 @@ from sklearn.preprocessing import StandardScaler
 
 from .config import Settings
 
+
+# ===== fixed Run 2 splits, features and accepted input fields =====
 
 SPLIT_ORDER: tuple[str, ...] = ("train", "validation", "calibration", "test")
 SPLIT_FRACTIONS: tuple[float, ...] = (0.60, 0.15, 0.10, 0.15)
@@ -119,6 +122,8 @@ class ModelDataError(ValueError):
 class LightGBMUnavailableError(RuntimeError):
     """Raised when the required LightGBM package is unavailable."""
 
+
+# ===== internal cohort, calibration and model results =====
 
 @dataclass(slots=True)
 class PreparedCohort:
@@ -295,6 +300,8 @@ class ModelEvaluation:
         }
 
 
+# ===== build the locked cohort and chronological split =====
+
 def prepare_model_cohort(
     judgments: pd.DataFrame,
     matches: pd.DataFrame,
@@ -407,8 +414,10 @@ def prepare_model_cohort(
     )
 
     history_filter = corporate & ew & auto & has_company & merged["JudgmentDate"].notna()
-    history = merged.loc[history_filter].copy()
-    history["matched_company_number"] = history["matched_company_number"].astype(str).str.strip()
+    history = merged.loc[
+        history_filter,
+        ["matched_company_number", "JudgmentDate", "_amount_numeric"],
+    ]
     _add_prior_judgment_features(eligible, history, settings.prior_history_months)
     _add_snapshot_features(eligible, obs)
 
@@ -500,6 +509,8 @@ def assign_chronological_splits(frame: pd.DataFrame) -> pd.DataFrame:
     )
     return ordered
 
+
+# ===== fit, calibrate and evaluate the four declared model runs =====
 
 def fit_evaluate_models(
     cohort: PreparedCohort,
@@ -820,16 +831,18 @@ def reliability_table(
     *,
     bins: int = 10,
 ) -> list[dict[str, Any]]:
-    """Return deterministic equal-count reliability bins with support counts."""
+    """Return up to ``bins`` deterministic equal-count reliability groups."""
 
     y = np.asarray(labels, dtype=int)
     p = _clip_probabilities(np.asarray(probabilities, dtype=float))
     if len(y) != len(p):
         raise ValueError("labels and probabilities differ in length")
-    if not 1 <= bins <= max(len(y), 1):
-        raise ValueError("bins must be between one and the number of rows")
+    if len(y) == 0:
+        raise ValueError("cannot build reliability bins for an empty prediction set")
+    if bins < 1:
+        raise ValueError("bins must be positive")
     order = np.argsort(p, kind="mergesort")
-    groups = np.array_split(order, bins)
+    groups = np.array_split(order, min(bins, len(y)))
     rows: list[dict[str, Any]] = []
     for position, indices in enumerate(groups, start=1):
         if len(indices) == 0:
@@ -864,33 +877,76 @@ def assess_acceptance(
     reasons: list[str] = []
     if run.family != "prospective":
         reasons.append("snapshot_exploratory_only")
-    if metrics["n"] < settings.min_test_rows:
+    test_rows = _finite_or_none(metrics.get("n"))
+    positive = _finite_or_none(metrics.get("n_positive"))
+    negative = _finite_or_none(metrics.get("n_negative"))
+    if (
+        test_rows is None
+        or test_rows < 0
+        or not test_rows.is_integer()
+        or test_rows < settings.min_test_rows
+    ):
         reasons.append("test_rows_below_minimum")
-    if min(metrics["n_positive"], metrics["n_negative"]) < settings.min_test_each_class:
+    invalid_class_counts = (
+        positive is None
+        or negative is None
+        or positive < 0
+        or negative < 0
+        or not positive.is_integer()
+        or not negative.is_integer()
+        or test_rows is None
+        or positive + negative != test_rows
+    )
+    if invalid_class_counts or min(positive, negative) < settings.min_test_each_class:
         reasons.append("test_class_count_below_minimum")
     if not run.calibration.powered:
         reasons.append("calibration_underpowered")
     auc = _finite_or_none(metrics.get("roc_auc"))
-    if auc is None or auc < settings.auc_floor:
+    if auc is None or not 0.0 <= auc <= 1.0 or auc < settings.auc_floor:
         reasons.append("auc_below_floor")
-    auc_lower = run.bootstrap_intervals.get("roc_auc", {}).get("lower")
-    if auc_lower is None or auc_lower <= 0.50:
+    auc_lower = _finite_or_none(
+        run.bootstrap_intervals.get("roc_auc", {}).get("lower")
+    )
+    if auc_lower is None or not 0.0 <= auc_lower <= 1.0 or auc_lower <= 0.50:
         reasons.append("auc_lower_ci_not_above_chance")
-    if metrics["calibration_gap"] > settings.max_calibration_gap:
+    calibration_gap = _finite_or_none(metrics.get("calibration_gap"))
+    if (
+        calibration_gap is None
+        or calibration_gap < 0.0
+        or calibration_gap > settings.max_calibration_gap
+    ):
         reasons.append("calibration_gap_above_maximum")
     slope = _finite_or_none(metrics.get("calibration_slope"))
     if slope is None or not (
         settings.min_calibration_slope <= slope <= settings.max_calibration_slope
     ):
         reasons.append("calibration_slope_outside_range")
-    if metrics.get("brier_improvement_vs_null", -math.inf) <= 0:
+    brier_improvement = _finite_or_none(
+        metrics.get("brier_improvement_vs_null")
+    )
+    if (
+        brier_improvement is None
+        or not -1.0 <= brier_improvement <= 1.0
+        or brier_improvement <= 0
+    ):
         reasons.append("brier_not_better_than_training_prevalence")
     if match_precision is None or match_precision_lower_ci is None:
         reasons.append("match_audit_not_supplied")
     else:
-        if match_precision < settings.match_precision_floor:
+        precision = _finite_or_none(match_precision)
+        precision_lower = _finite_or_none(match_precision_lower_ci)
+        if (
+            precision is None
+            or not 0.0 <= precision <= 1.0
+            or precision < settings.match_precision_floor
+        ):
             reasons.append("match_precision_below_floor")
-        if match_precision_lower_ci <= settings.match_precision_lower_ci_floor:
+        if (
+            precision_lower is None
+            or not 0.0 <= precision_lower <= 1.0
+            or (precision is not None and precision_lower > precision)
+            or precision_lower <= settings.match_precision_lower_ci_floor
+        ):
             reasons.append("match_precision_lower_ci_below_floor")
     return {
         "status": "pass" if not reasons else "fail",
@@ -915,6 +971,8 @@ def assess_acceptance(
         "cohort_test_counts": cohort.split_counts.get("test", {}),
     }
 
+
+# ===== write stable internal model descriptions =====
 
 def write_model_artifacts(
     evaluation: ModelEvaluation,
@@ -973,6 +1031,8 @@ def write_model_artifacts(
     return written
 
 
+# ===== construct judgment-time and exploratory snapshot features =====
+
 def _add_prior_judgment_features(
     targets: pd.DataFrame,
     history: pd.DataFrame,
@@ -980,49 +1040,83 @@ def _add_prior_judgment_features(
 ) -> None:
     """Add strictly-prior event features without ever reading prior statuses."""
 
-    grouped: dict[str, tuple[np.ndarray, np.ndarray]] = {}
-    history_work = history.loc[
-        :, ["matched_company_number", "JudgmentDate", "_amount_numeric"]
-    ].copy()
-    history_work["_amount_numeric"] = (
-        pd.to_numeric(history_work["_amount_numeric"], errors="coerce")
+    history_companies = (
+        history["matched_company_number"]
+        .astype(str)
+        .str.strip()
+        .to_numpy(copy=False)
+    )
+    history_dates = pd.to_datetime(
+        history["JudgmentDate"], errors="coerce"
+    ).to_numpy(dtype="datetime64[ns]")
+    history_amounts = (
+        pd.to_numeric(history["_amount_numeric"], errors="coerce")
         .fillna(0.0)
         .clip(lower=0.0)
+        .to_numpy(dtype=float)
     )
-    history_work = history_work.sort_values(
-        ["matched_company_number", "JudgmentDate"], kind="mergesort"
-    )
-    for company, group in history_work.groupby("matched_company_number", sort=False):
-        dates = group["JudgmentDate"].to_numpy(dtype="datetime64[ns]")
-        amounts = group["_amount_numeric"].to_numpy(dtype=float)
-        grouped[str(company)] = (dates, amounts)
+    order = np.lexsort((history_dates, history_companies))
+    history_companies = history_companies[order]
+    history_dates = history_dates[order]
+    history_amounts = history_amounts[order]
 
-    empty_history = (
-        np.array([], dtype="datetime64[ns]"),
-        np.array([], dtype=float),
-    )
-    counts: list[int] = []
-    values: list[float] = []
-    recencies: list[float] = []
-    for company, target_date in zip(
-        targets["matched_company_number"].astype(str),
-        targets["JudgmentDate"],
-    ):
-        dates, amounts = grouped.get(company, empty_history)
-        target64 = np.datetime64(pd.Timestamp(target_date), "ns")
-        lower64 = np.datetime64(
-            pd.Timestamp(target_date) - pd.DateOffset(months=months), "ns"
+    target_count = len(targets)
+    counts = np.zeros(target_count, dtype=np.int64)
+    values = np.zeros(target_count, dtype=float)
+    recencies = np.full(target_count, np.nan, dtype=float)
+    if len(history_companies):
+        group_starts = np.flatnonzero(
+            np.r_[True, history_companies[1:] != history_companies[:-1]]
         )
-        left = int(np.searchsorted(dates, lower64, side="left"))
-        right = int(np.searchsorted(dates, target64, side="left"))  # strict before
-        count = right - left
-        counts.append(count)
-        values.append(float(amounts[left:right].sum()) if count else 0.0)
-        if count:
-            recency = (target64 - dates[right - 1]) / np.timedelta64(1, "D")
-            recencies.append(float(recency))
-        else:
-            recencies.append(float("nan"))
+        group_ends = np.r_[group_starts[1:], len(history_companies)]
+        unique_companies = history_companies[group_starts]
+
+        target_companies = (
+            targets["matched_company_number"]
+            .astype(str)
+            .str.strip()
+            .to_numpy(copy=False)
+        )
+        target_dates = pd.to_datetime(
+            targets["JudgmentDate"], errors="coerce"
+        ).to_numpy(dtype="datetime64[ns]")
+        lower_dates = (
+            pd.DatetimeIndex(target_dates) - pd.DateOffset(months=months)
+        ).to_numpy(dtype="datetime64[ns]")
+        group_positions = np.searchsorted(unique_companies, target_companies)
+        has_history = group_positions < len(unique_companies)
+        possible = np.flatnonzero(has_history)
+        has_history[possible] = (
+            unique_companies[group_positions[possible]]
+            == target_companies[possible]
+        )
+
+        for target_position in np.flatnonzero(has_history):
+            group_position = group_positions[target_position]
+            start = group_starts[group_position]
+            end = group_ends[group_position]
+            dates = history_dates[start:end]
+            left = int(
+                np.searchsorted(
+                    dates, lower_dates[target_position], side="left"
+                )
+            )
+            right = int(
+                np.searchsorted(
+                    dates, target_dates[target_position], side="left"
+                )
+            )  # strictly before the target judgment
+            count = right - left
+            counts[target_position] = count
+            if count:
+                values[target_position] = float(
+                    history_amounts[start + left : start + right].sum()
+                )
+                recencies[target_position] = float(
+                    (target_dates[target_position] - dates[right - 1])
+                    / np.timedelta64(1, "D")
+                )
+
     targets["prior_judgment_count_24m"] = counts
     targets["prior_judgment_value_24m"] = values
     targets["days_since_prior_judgment_24m"] = recencies
@@ -1156,6 +1250,7 @@ def _fit_lightgbm(
         max_depth=5,
         min_child_samples=100,
         subsample=0.8,
+        subsample_freq=1,
         colsample_bytree=0.8,
         reg_alpha=0.1,
         reg_lambda=1.0,
@@ -1200,7 +1295,11 @@ def _feature_effects(model: FittedNumericModel) -> list[dict[str, Any]]:
             )
         else:  # small test doubles need not implement the full Booster surface
             values = np.asarray(
-                getattr(model.estimator, "feature_importances_", np.zeros(len(model.feature_names))),
+                getattr(
+                    model.estimator,
+                    "feature_importances_",
+                    np.zeros(len(model.feature_names)),
+                ),
                 dtype=float,
             )
         effect_type = "lightgbm_gain"
@@ -1294,7 +1393,7 @@ def _calibration_intercept_slope(
             max_iter=2_000,
         )
         with warnings.catch_warnings():
-            # Complete/semi-complete separation can make the diagnostic slope
+            # Complete/semi-complete separation can make the calibration slope
             # diverge. It is handled below as a non-finite acceptance failure.
             warnings.simplefilter("ignore", RuntimeWarning)
             model.fit(_logit(p).reshape(-1, 1), y)

@@ -4,6 +4,7 @@ Inputs are fixed settings and fake in-memory records. Outputs exist only in
 temporary test folders and contain no confidential or row-level RT data.
 """
 
+import json
 import math
 from pathlib import Path
 
@@ -12,11 +13,13 @@ import pytest
 
 from recovery.config import Settings, load_settings
 from recovery.reporting import (
+    RunRecorder,
     build_data_audit_counts,
     build_population_sensitivities,
     create_run_paths,
     peak_memory_mb,
     source_fingerprint,
+    write_e5,
     write_summary,
 )
 from recovery.synthetic import make_synthetic_bundle, write_bundle
@@ -90,6 +93,74 @@ def test_summary_is_short_and_explicit(tmp_path: Path) -> None:
     assert "CURRENT-SNAPSHOT FEATURES" in text
     assert "<10" in text
     assert len(text.splitlines()) < 60
+
+
+def test_public_e5_redacts_small_observed_counts(tmp_path: Path) -> None:
+    recorder = RunRecorder(
+        stages=[
+            {
+                "stage": "E2_match",
+                "status": "ok",
+                "judgments_matched": 4,
+                "elapsed_seconds": 0.2,
+                "peak_memory_mb": 100.0,
+            }
+        ]
+    )
+    manifest = {
+        "schema_version": 1,
+        "ch_index_stats": {
+            "ch_rows_read": 100,
+            "companies_retained": 3,
+            "analysis_fingerprint": "a" * 64,
+        },
+        "model_only_acceptance": {
+            "status": "fail",
+            "passed": False,
+            "family": "prospective",
+            "algorithm": "logistic",
+            "reasons": ["test_class_count_below_minimum"],
+            "guards": {"training_prevalence": 0.01, "auc_floor": 0.70},
+            "cohort_test_counts": {"rows": 100, "positive": 1, "negative": 99},
+        },
+        "disclosure": {
+            "status": "pass",
+            "suppressed_rows": [{"file": "E4.csv", "rows": 2}],
+        },
+    }
+    write_e5(tmp_path, recorder, manifest, min_cell_n=10)
+    log = (tmp_path / "E5_run_log.csv").read_text(encoding="utf-8")
+    public = json.loads((tmp_path / "E5_run_manifest.json").read_text())
+    assert "<10" in log
+    assert public["ch_index_stats"]["companies_retained"] == "<10"
+    assert "cohort_test_counts" not in public["model_only_acceptance"]
+    assert "training_prevalence" not in public["model_only_acceptance"]["guards"]
+    assert public["disclosure"]["suppressed_rows"][0]["rows"] == "<10"
+
+
+def test_extra_input_heading_is_not_copied_to_public_audit() -> None:
+    judgments = pd.DataFrame(
+        {
+            "JudgmentStatus": ["Satisfied"] * 10,
+            "DefendantType": ["Corporate"] * 10,
+            "Jurisdiction": ["England and Wales"] * 10,
+            "JudgmentDate": pd.to_datetime(["2024-01-01"] * 10),
+        }
+    )
+    audit = type(
+        "Audit",
+        (),
+        {
+            "extra_headers": ("PRIVATE CLIENT NAME",),
+            "absent_optional_columns": (),
+            "invalid_amount_rows": 0,
+            "missing_company_name_rows": 0,
+            "missing_postcode_rows": 0,
+        },
+    )()
+    table = build_data_audit_counts(judgments, audit)
+    assert "PRIVATE CLIENT NAME" not in table["value"].astype(str).tolist()
+    assert "extra_column_1" in table["value"].astype(str).tolist()
 
 
 def test_population_sensitivities_expose_repeated_and_long_window_counts() -> None:

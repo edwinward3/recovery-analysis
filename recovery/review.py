@@ -1,8 +1,9 @@
-"""Validate RT's manual match review and emit aggregate-only quality results.
+"""Check RT's answers in a diagnostic or locked 1,000-pair file.
 
-Input rows remain RT-internal and may contain identifiers.  The returned and
-written results contain tier-level counts and Wilson intervals only.  This
-module performs no network or shell operations.
+The named rows stay inside RT. This file counts ``correct``, ``incorrect`` and
+``uncertain`` answers by matching tier, works out the automatic-match quality
+gate and writes aggregate results only. It does not connect to the internet or
+start another program.
 """
 
 from __future__ import annotations
@@ -43,8 +44,10 @@ _DECISION_ALIASES: Final = (
 _ROW_ID_ALIASES: Final = ("review_row_id", "sample_id", "row_id")
 
 
+# ===== the aggregate result returned to the launcher =====
+
 class ReviewFormatError(ValueError):
-    """The completed review file does not meet its locked schema."""
+    """The completed review file does not match its saved format."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -77,6 +80,8 @@ def wilson_interval(successes: int, total: int) -> tuple[float, float]:
     return max(0.0, centre - radius), min(1.0, centre + radius)
 
 
+# ===== read and validate all 1,000 RT decisions =====
+
 def parse_completed_review(
     source: str | Path | pd.DataFrame,
     settings: Settings,
@@ -84,7 +89,7 @@ def parse_completed_review(
     tier_column: str | None = None,
     decision_column: str | None = None,
 ) -> ReviewResult:
-    """Parse the locked 1,000-row review and evaluate the auto-match gate.
+    """Parse the saved 1,000-row review and evaluate the auto-match gate.
 
     Decisions are case-insensitive but must be exactly ``correct``,
     ``incorrect`` or ``uncertain``.  An uncertain decision is conservatively
@@ -196,7 +201,7 @@ def parse_completed_review(
 def _expected_allocation(
     rows: pd.DataFrame, tiers: pd.Series, settings: Settings
 ) -> dict[str, int]:
-    """Use the sample's locked allocation when a short tier was redistributed."""
+    """Use the recorded allocation when a short tier was redistributed."""
 
     allocation_column = next(
         (column for column in rows.columns if _canon(column) == "sample_allocation"),
@@ -221,6 +226,8 @@ def _expected_allocation(
         raise ReviewFormatError("sample allocation must total exactly 1,000 rows")
     return expected
 
+
+# ===== write only tier-level counts and precision results =====
 
 def write_review_aggregates(
     result: ReviewResult,
@@ -250,7 +257,16 @@ def write_review_aggregates(
     lines = [
         "RT MATCH-REVIEW QUALITY (AGGREGATE ONLY)",
         f"Completed rows: {result.total_rows}",
-        "Uncertain decision present: " + ("yes" if result.uncertain_rows else "no"),
+        "Uncertain decisions: "
+        + (
+            "none"
+            if result.uncertain_rows == 0
+            else (
+                f"<{min_cell_n}"
+                if result.uncertain_rows < min_cell_n
+                else f"{result.uncertain_rows:,}"
+            )
+        ),
         "AUTO GATE: " + ("PASS" if result.gate_passed else "FAIL"),
     ]
     if result.gate_reasons:
@@ -265,6 +281,8 @@ def write_review_aggregates(
     txt_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return csv_path, txt_path
 
+
+# ===== accept the saved CSV or an Excel copy without retaining its rows =====
 
 def _read_review(source: str | Path | pd.DataFrame) -> pd.DataFrame:
     if isinstance(source, pd.DataFrame):

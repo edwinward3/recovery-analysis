@@ -1,85 +1,89 @@
 # Recovery analysis
 
-Links Registry Trust commercial judgments to Companies House and tests whether
-information known at judgment can distinguish records later shown as
-`Satisfied` rather than `Unsatisfied`.
+Run 1 links the full Registry Trust extract to Companies House and shows how
+well the matching works. Run 2 is the later satisfaction analysis; do not use
+it until RT and Edwin have agreed what that analysis should mean.
 
-This is an academic analysis. Raw records and named matches stay inside RT, and
-nothing is authorised for external use unless RT approves it.
+Raw records and named matches stay inside RT. Nothing is authorised for
+external use unless RT approves it.
 
-## Run it
+## Run 1: check the matching
 
-1. Check that 64-bit Python 3.13 or 3.14 is installed and added to `PATH`.
-2. Double-click `RUN.bat`.
-3. Choose Run 1 or Run 2, then drag in the RT extract and Companies House file.
-4. Enter the date on which the fresh RT extract was produced.
-5. Open the newest folder beneath `outputs` when the run finishes.
+1. On GitHub, select **Code**, then **Download ZIP**, and extract the folder.
+2. Check that 64-bit Python 3.13 or 3.14 is installed and added to `PATH`.
+3. Double-click `RUN.bat`, which starts Run 1.
+4. Drag in the full RT judgment CSV/XLSX and Companies House CSV/ZIP.
+5. Enter the date on which the fresh RT extract was produced.
+6. Open the newest folder beneath `outputs` when the run finishes.
 
 On first use, `RUN.bat` downloads the fixed package versions in
-`requirements.lock`. That is the only internet use: the RT and Companies House
-files are processed locally and are never uploaded. If the RT machine cannot
-access PyPI, the same launcher can use a separately supplied `wheels` folder.
+`requirements.lock`. That is the only internet use; the data files stay local
+and are never uploaded. If PyPI is blocked, ask for the optional `wheels`
+folder and use the same launcher.
 
 Use the free Companies House `BasicCompanyDataAsOneFile` download and leave it
 zipped: <https://download.companieshouse.gov.uk/en_output.html>.
 
-## The two runs
+Run 1 uses the full extract for matching and does not train a satisfaction
+model. It reports results by defendant type, because Companies House covers
+companies and a single all-row match rate can be misleading. It shows coverage,
+unmatched reasons and 1,000 proposed pairs for RT to check.
 
-**Run 1 — diagnostic.** The code reports why records did or did not match and
-creates 1,000 proposed pairs for RT to check. Those checks tell us whether any
-matching rule genuinely needs changing.
+Match rate measures coverage. The pair review measures whether the links are
+actually correct.
 
-**Run 2 — locked.** After the matching rules are frozen, the code rematches from
-scratch, creates a different 1,000-pair sample and produces the final model
-results.
+## Check the 1,000 pairs
 
-For each sample, RT enters `correct`, `incorrect` or `uncertain` in the
-`review_decision` column, then double-clicks `CHECK_MATCH_REVIEW.bat` and selects
-the completed file. `uncertain` is treated as incorrect. The final result cannot
-pass unless the locked automatic matches pass the review gate.
+Open `RT_INTERNAL_match_pairs_1000.csv` in the run's `rt_internal` folder. For
+every row, enter exactly `correct`, `incorrect` or `uncertain` in
+`review_decision`. Do not change the sampled rows, filename, allocation columns
+or companion files. `uncertain` is treated as not confirmed.
+
+Save the file in its original folder. Double-click `CHECK_MATCH_REVIEW.bat`,
+drag in the completed file and choose where to put the aggregate result.
+
+The named pairs remain RT-internal. If the review shows a genuine matching
+problem, the rule can be corrected and Run 1 repeated. Matching rules should
+not be weakened merely to raise the headline percentage.
+
+## Run 2: deferred
+
+The satisfaction code is included so it can be tested in advance, but the
+double-click launcher currently starts Run 1 only. Run 2 will be enabled after
+RT and Edwin agree what `Satisfied` and `Unsatisfied` mean, the observation
+date, the eligible age range and the intended population. It will then rematch
+from scratch, draw a new review sample and run the locked models.
 
 ## RT judgment file
 
-CSV or XLSX, with these required columns (case and order do not matter):
+Required columns (case and order do not matter):
 
 `ID`, `Date Inserted`, `JudgmentDate`, `JudgmentStatus`, `DefendantType`,
 `Jurisdiction`, `Defendant Company Name`, `Defendant_Postcode`.
 
 `Amount`, `Defendant Trading Name` and `Defendant Address` are optional.
-
-`Date Inserted` is used only to audit registration delay. Judgment age is
-measured from `JudgmentDate` to the date of the fresh RT extract.
-
-## What it does
-
-- Matches by normalised postcode and company/trading name, including valid
-  former Companies House names.
-- Keeps automatic, review, different-postcode fallback and unmatched results
-  separate. Match rate is coverage; the 1,000-pair check measures accuracy.
-- Uses automatic matches for the primary E&W Corporate analysis and keeps the
-  other populations as separate diagnostics.
-- Fits a judgment-time model and a clearly marked exploratory model using
-  present-day Companies House fields.
-- Reports the full row funnel, matching results, model results, sensitivities
-  and run record as E1–E5.
+`Date Inserted` is the register-entry date, not necessarily the date on which
+the status was observed.
 
 ## Outputs
 
-Each run creates two separate folders:
+- `egress_candidate` contains aggregate, disclosure-checked reports for RT to
+  review, including `SUMMARY.txt`.
+- `rt_internal` contains named matches and other confidential working files.
+  It must remain inside RT.
 
-- `egress_candidate` contains only aggregate, disclosure-checked reports,
-  including the one-page `SUMMARY.txt` and E1–E5 files.
-- `rt_internal` contains named match pairs, the match table, partitions and
-  fitted-model files. It must remain inside RT.
+Nothing is sent automatically. RT should approve every egress candidate before
+returning or using it.
 
-RT should review every egress candidate before returning it.
+## The files
 
-## Reading and testing the code
+- `data.py` reads and checks the input files.
+- `matching.py` links defendants to companies and selects review pairs.
+- `review.py` checks RT's completed pair review.
+- `models.py` contains the deferred Run 2 satisfaction analysis.
+- `reporting.py` writes reports; `disclosure.py` checks what may leave RT.
+- `run.py` coordinates the process; `selftest.py` runs it on fake data.
 
-Each source file begins with a short explanation of its purpose and data
-sensitivity. `data.py`, `matching.py` and `models.py` perform the analysis;
-`reporting.py` and `disclosure.py` check the outputs; `review.py` checks the
-completed match sample; and `run.py` coordinates the complete process.
-
-The analysis package makes no network or shell calls. To test it without real
-data, run `python -m recovery.selftest`.
+Each source file starts with its purpose and data sensitivity. The analysis
+code makes no network or shell calls. To test it without real RT data, run
+`python -m recovery.selftest`.

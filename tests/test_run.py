@@ -15,18 +15,22 @@ from unittest.mock import patch
 
 import pandas as pd
 
-from recovery.disclosure import validate_egress
+from recovery.disclosure import DisclosureViolation, validate_egress
 from recovery.run import (
+    MATCH_FILENAME,
     RunFailure,
     STATE_FILENAME,
+    _analysis_allowlist,
     _bounded_known_identifiers,
     _json_fingerprint,
+    analyze,
     main,
     review_completed_sample,
     review_sample_digest,
 )
 from recovery.config import load_settings
-from recovery.reporting import source_fingerprint
+from recovery.reporting import source_fingerprint, write_e5 as real_write_e5
+from recovery.synthetic import make_synthetic_bundle, write_bundle
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -71,16 +75,27 @@ def _write_review_case(root: Path, *, stage: str = "locked") -> Path:
     frame["sample_seed"] = seed
     run_root = root / f"{stage}_fixture"
     internal = run_root / "rt_internal"
-    models = internal / "models"
     egress = run_root / "egress_candidate"
-    models.mkdir(parents=True)
+    internal.mkdir(parents=True)
     egress.mkdir()
     review_file = internal / "RT_INTERNAL_match_pairs_1000.csv"
     frame.to_csv(review_file, index=False, encoding="utf-8-sig")
     baseline = pd.read_csv(review_file, dtype="string", keep_default_na=False)
-    model_file = models / "model_evaluation.json"
-    model_file.write_text("{}\n", encoding="utf-8")
-    model_digest = sha256(model_file.read_bytes()).hexdigest()
+    model_hashes: dict[str, str] = {}
+    model_only: dict[str, object] | None = None
+    if stage == "locked":
+        models = internal / "models"
+        models.mkdir()
+        model_file = models / "model_evaluation.json"
+        model_file.write_text("{}\n", encoding="utf-8")
+        model_hashes[model_file.name] = sha256(model_file.read_bytes()).hexdigest()
+        model_only = {
+            "status": "pass",
+            "passed": True,
+            "reasons": [],
+            "family": "prospective",
+            "algorithm": "logistic",
+        }
     code_fingerprint = source_fingerprint(ROOT / "recovery", settings)
     state = {
         "schema_version": 1,
@@ -100,14 +115,8 @@ def _write_review_case(root: Path, *, stage: str = "locked") -> Path:
         "code_fingerprint": code_fingerprint,
         "rt_analysis_fingerprint": "1" * 64,
         "ch_analysis_fingerprint": "2" * 64,
-        "model_artifact_fingerprints": {model_file.name: model_digest},
-        "model_only_acceptance": {
-            "status": "pass",
-            "passed": True,
-            "reasons": [],
-            "family": "prospective",
-            "algorithm": "logistic",
-        },
+        "model_artifact_fingerprints": model_hashes,
+        "model_only_acceptance": model_only,
     }
     (internal / STATE_FILENAME).write_text(
         json.dumps(state), encoding="utf-8"
@@ -127,17 +136,86 @@ def _write_review_case(root: Path, *, stage: str = "locked") -> Path:
         "model_only_acceptance": state["model_only_acceptance"],
         "review_binding": {
             "review_state_sha256": _json_fingerprint(state),
-            "model_artifact_sha256": state["model_artifact_fingerprints"],
+            "model_artifact_sha256": model_hashes,
         },
         "disclosure": {"status": "pass"},
     }
     (egress / "E5_run_manifest.json").write_text(
         json.dumps(manifest), encoding="utf-8"
     )
+    for filename in _analysis_allowlist(stage):
+        if filename == "E5_run_manifest.json":
+            continue
+        path = egress / filename
+        if path.suffix == ".csv":
+            path.write_text("metric,rows\nfixture,1000\n", encoding="utf-8")
+        else:
+            path.write_text("aggregate fixture\n", encoding="utf-8")
     return review_file
 
 
 class ReviewOrchestrationTests(unittest.TestCase):
+    def test_diagnostic_run_matches_every_row_and_never_calls_models(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            bundle = make_synthetic_bundle(1_600, include_prior_rows=False)
+            judgments, companies, _ = write_bundle(
+                bundle,
+                root / "inputs",
+                excel=False,
+            )
+            with (
+                patch(
+                    "recovery.run.prepare_model_cohort",
+                    side_effect=AssertionError("Run 1 must not prepare a model cohort"),
+                ),
+                patch(
+                    "recovery.run.fit_evaluate_models",
+                    side_effect=AssertionError("Run 1 must not fit a model"),
+                ),
+            ):
+                paths = analyze(
+                    stage="diagnostic",
+                    judgments_path=judgments,
+                    companies_house_path=companies,
+                    observation_date=bundle.observation_date,
+                    settings_path=ROOT / "settings.toml",
+                    output_base=root / "outputs",
+                    run_id="matching_only",
+                )
+
+            matches = pd.read_csv(paths.internal / MATCH_FILENAME)
+            self.assertEqual(len(matches), len(bundle.judgments))
+            coverage = pd.read_csv(paths.egress / "E2_match_coverage.csv")
+            self.assertEqual(int(coverage["rows"].sum()), len(bundle.judgments))
+            self.assertFalse((paths.egress / "E3_model_comparison.csv").exists())
+            self.assertFalse((paths.internal / "RT_INTERNAL_split_membership.csv").exists())
+            summary = (paths.egress / "SUMMARY.txt").read_text(encoding="utf-8")
+            self.assertIn("RUN 1 MATCHING SUMMARY", summary)
+            self.assertIn("No satisfaction model was trained", summary)
+            state = json.loads(
+                (paths.internal / STATE_FILENAME).read_text(encoding="utf-8")
+            )
+            self.assertIsNone(state["model_only_acceptance"])
+            self.assertEqual(state["model_artifact_fingerprints"], {})
+
+            pair_file = paths.internal / "RT_INTERNAL_match_pairs_1000.csv"
+            pairs = pd.read_csv(pair_file, dtype="string", keep_default_na=False)
+            pairs["review_decision"] = "correct"
+            pairs.to_csv(pair_file, index=False, encoding="utf-8-sig")
+            review_output = root / "diagnostic review"
+            review = review_completed_sample(
+                review_file=pair_file,
+                settings_path=ROOT / "settings.toml",
+                output_dir=review_output,
+            )
+            self.assertTrue(review.match_review.gate_passed)
+            self.assertFalse(review.combined_passed)
+            self.assertTrue(
+                (review_output / "MATCH_REVIEW_STATUS.txt").is_file()
+            )
+            self.assertFalse((review_output / "FINAL_STATUS.txt").exists())
+
     def test_short_names_are_not_used_as_substring_disclosure_needles(self) -> None:
         sample = pd.DataFrame(
             {
@@ -195,6 +273,7 @@ class ReviewOrchestrationTests(unittest.TestCase):
             self.assertTrue(result.match_review.gate_passed)
             self.assertTrue(result.combined_passed)
             self.assertTrue((output / "E2_review_quality.csv").is_file())
+            self.assertTrue((output / "MATCH_REVIEW_STATUS.json").is_file())
             self.assertTrue((output / "FINAL_STATUS.json").is_file())
             validate_egress(output)
 
@@ -217,7 +296,7 @@ class ReviewOrchestrationTests(unittest.TestCase):
             )
             self.assertTrue(result.match_review.gate_passed)
 
-    def test_diagnostic_review_can_pass_accuracy_but_not_final_status(self) -> None:
+    def test_diagnostic_review_reports_matching_without_model_status(self) -> None:
         with TemporaryDirectory() as temporary:
             root = Path(temporary)
             review_file = _write_review_case(root, stage="diagnostic")
@@ -229,9 +308,74 @@ class ReviewOrchestrationTests(unittest.TestCase):
             self.assertTrue(result.match_review.gate_passed)
             self.assertFalse(result.combined_passed)
             self.assertIn(
-                "diagnostic_run_cannot_receive_final_status",
+                "satisfaction_model_deferred",
                 result.combined_reasons,
             )
+            output = root / "review result"
+            self.assertTrue((output / "MATCH_REVIEW_STATUS.json").is_file())
+            self.assertFalse((output / "FINAL_STATUS.json").exists())
+
+    def test_review_rejects_changed_analysis_egress(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            review_file = _write_review_case(root, stage="diagnostic")
+            egress = review_file.parent.parent / "egress_candidate"
+            unexpected = egress / "unexpected" / "safe.txt"
+            unexpected.parent.mkdir()
+            unexpected.write_text("changed\n", encoding="utf-8")
+            with self.assertRaisesRegex(
+                RunFailure, "egress files differ"
+            ):
+                review_completed_sample(
+                    review_file=review_file,
+                    settings_path=ROOT / "settings.toml",
+                    output_dir=root / "review result",
+                )
+
+    def test_locked_run_requires_explicit_extract_date(self) -> None:
+        with self.assertRaisesRegex(RunFailure, "explicit RT extract date"):
+            analyze(
+                stage="locked",
+                judgments_path="not opened.csv",
+                companies_house_path="not opened.zip",
+                observation_date=None,
+                settings_path=ROOT / "settings.toml",
+                output_base="not created",
+            )
+
+    def test_unsafe_final_e5_leaves_egress_empty(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            bundle = make_synthetic_bundle(1_600, include_prior_rows=False)
+            judgments, companies, _ = write_bundle(
+                bundle,
+                root / "inputs",
+                excel=False,
+            )
+
+            def write_unsafe_e5(*args: object, **kwargs: object) -> object:
+                written = real_write_e5(*args, **kwargs)
+                manifest_path = Path(args[0]) / "E5_run_manifest.json"
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                manifest["unsafe_test_value"] = "PRIVATE FIXTURE LIMITED"
+                manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+                return written
+
+            with (
+                patch("recovery.run.write_e5", side_effect=write_unsafe_e5),
+                self.assertRaises(DisclosureViolation),
+            ):
+                analyze(
+                    stage="diagnostic",
+                    judgments_path=judgments,
+                    companies_house_path=companies,
+                    observation_date=bundle.observation_date,
+                    settings_path=ROOT / "settings.toml",
+                    output_base=root / "outputs",
+                    run_id="atomic_failure",
+                )
+            egress = root / "outputs" / "diagnostic_atomic_failure" / "egress_candidate"
+            self.assertEqual(list(egress.iterdir()), [])
 
     def test_immutable_sample_edit_is_rejected(self) -> None:
         with TemporaryDirectory() as temporary:
