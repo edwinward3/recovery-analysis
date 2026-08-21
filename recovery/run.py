@@ -6,9 +6,10 @@ from datetime import date
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from typing import Any, Sequence
+from typing import Any, Callable, Sequence
 import argparse
 import hashlib
+import shutil
 import sys
 
 import pandas as pd
@@ -48,8 +49,6 @@ from .reporting import (
 # Output file names
 
 PAIR_FILENAME = "matching_pairs_1000.csv"
-MATCH_FILENAME = "matching_table.csv.gz"
-SPLIT_FILENAME = "model_rows.csv"
 
 
 class RunFailure(RuntimeError):
@@ -67,6 +66,7 @@ def analyze(
     settings_path: str | Path,
     output_base: str | Path,
     run_id: str | None = None,
+    _match_validator: Callable[[pd.DataFrame], None] | None = None,
 ) -> RunPaths:
     """Run full-data matching, then add modelling only for a locked Run 2."""
 
@@ -80,7 +80,43 @@ def analyze(
     settings = load_settings(settings_source)
     observed = pd.Timestamp(observation_date or date.today()).normalize()
     paths = create_run_paths(output_base, stage, run_id)
-    aggregate = paths.working / "aggregate_staging"
+    try:
+        return _analyze_created_run(
+            stage=stage,
+            judgments_path=judgments_path,
+            companies_house_path=companies_house_path,
+            settings_source=settings_source,
+            settings=settings,
+            observed=observed,
+            paths=paths,
+            _match_validator=_match_validator,
+        )
+    except BaseException as exc:
+        try:
+            if paths.root.exists():
+                shutil.rmtree(paths.root)
+        except OSError as cleanup_error:
+            raise RunFailure(
+                f"the run failed and its incomplete files could not be removed: "
+                f"{cleanup_error}"
+            ) from exc
+        raise
+
+
+def _analyze_created_run(
+    *,
+    stage: str,
+    judgments_path: str | Path,
+    companies_house_path: str | Path,
+    settings_source: Path,
+    settings: Settings,
+    observed: pd.Timestamp,
+    paths: RunPaths,
+    _match_validator: Callable[[pd.DataFrame], None] | None,
+) -> RunPaths:
+    """Write one already-created run, leaving no folder behind on failure."""
+
+    aggregate = paths.root / ".aggregate_staging"
     aggregate.mkdir()
     recorder = RunRecorder()
     judgments_file = Path(judgments_path)
@@ -96,14 +132,10 @@ def analyze(
 
     with recorder.stage("E2_match") as record:
         matches = match_judgments(judgments, ch_index, settings)
+        if _match_validator is not None:
+            _match_validator(matches)
         diagnostics = match_diagnostics(judgments, matches)
         record["judgments_matched"] = int(matches["tier"].ne("unmatched").sum())
-        matches.to_csv(
-            paths.working / MATCH_FILENAME,
-            index=False,
-            compression="gzip",
-            encoding="utf-8",
-        )
 
     with recorder.stage("matching_pair_sample") as record:
         seed = settings.diagnostic_seed if stage == "diagnostic" else settings.locked_seed
@@ -119,13 +151,6 @@ def analyze(
         with recorder.stage("E3_prepare_cohort") as record:
             cohort = prepare_model_cohort(judgments, matches, observed, settings)
             record["model_rows"] = len(cohort.frame)
-            cohort.frame[
-                ["ID", "matched_company_number", "JudgmentDate", "label", "split"]
-            ].to_csv(
-                paths.working / SPLIT_FILENAME,
-                index=False,
-                encoding="utf-8-sig",
-            )
 
         with recorder.stage("E3_fit_four_models"):
             evaluation = fit_evaluate_models(cohort, settings)
@@ -241,6 +266,9 @@ def analyze(
         or set(disclosure.staged_files) != set(allowlist)
     ):
         raise RunFailure("final disclosure copy differed from its checked preview")
+    shutil.rmtree(aggregate)
+    if stage == "diagnostic":
+        paths.models.rmdir()
     return paths
 
 
@@ -296,6 +324,9 @@ def _diagnostic_summary_context(
             "matching_decisions": denominator,
             "missing_company_name": audit.missing_company_name_rows,
             "missing_postcode": audit.missing_postcode_rows,
+            "date_inserted_before_judgment": (
+                audit.date_inserted_before_judgment_rows
+            ),
         },
         "match": {
             "denominator": denominator,
@@ -436,8 +467,6 @@ def _run_manifest(
             "reports": sorted(allowlist),
             "working_files": [
                 PAIR_FILENAME,
-                MATCH_FILENAME,
-                *([SPLIT_FILENAME] if stage == "locked" else []),
                 *sorted(
                     f"models/{Path(value).name}"
                     for value in model_artifacts.values()

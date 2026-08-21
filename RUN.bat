@@ -94,8 +94,6 @@ if defined OBSERVATION goto arguments_ready
 set /p "OBSERVATION=RT extract date YYYY-MM-DD (blank = today): "
 
 :arguments_ready
-set "OBSERVATION=%OBSERVATION:"=%"
-set "OUTPUT_BASE=%OUTPUT_BASE:"=%"
 if not defined OUTPUT_BASE set "OUTPUT_BASE=outputs"
 
 echo.

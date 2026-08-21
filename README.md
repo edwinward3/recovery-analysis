@@ -31,6 +31,7 @@ Dates as DD/MM/YYYY. `Amount`, `Defendant Trading Name` and `Defendant Address` 
 Every file has a short line at the top saying what it does, and the code is commented throughout.
 The analysis itself never uses the internet. On the first run, `RUN.bat` may use it to install
 the required Python packages; neither data file is uploaded.
+It does not save a full copy of the matching data, and a failed run removes its new files.
 
 To watch it run on fake data, with no real file: `python -m recovery.selftest`.
 

@@ -90,6 +90,8 @@ class DataAudit:
     registration_lag_days_min: int
     registration_lag_days_median: float
     registration_lag_days_max: int
+    date_inserted_before_judgment_rows: int
+    date_inserted_after_observation_rows: int
     age_at_observation_months_min: float
     age_at_observation_months_median: float
     age_at_observation_months_max: float
@@ -209,7 +211,17 @@ def _normalise_coded_columns(frame: pd.DataFrame) -> None:
 
 
 def _parse_required_date(frame: pd.DataFrame, column: str) -> pd.Series:
-    parsed = pd.to_datetime(frame[column], format="mixed", dayfirst=True, errors="coerce")
+    raw = frame[column].astype("string").fillna("").str.strip()
+    iso = raw.str.fullmatch(r"\d{4}-\d{2}-\d{2}(?:[ T].*)?", na=False)
+    parsed = pd.Series(pd.NaT, index=frame.index, dtype="datetime64[ns]")
+    if iso.any():
+        parsed.loc[iso] = pd.to_datetime(
+            raw.loc[iso], format="ISO8601", errors="coerce"
+        ).astype("datetime64[ns]")
+    if (~iso).any():
+        parsed.loc[~iso] = pd.to_datetime(
+            raw.loc[~iso], format="mixed", dayfirst=True, errors="coerce"
+        ).astype("datetime64[ns]")
     invalid = parsed.isna()
     if invalid.any():
         raise ValueError(f"{column} has {int(invalid.sum())} missing or unparseable row(s)")
@@ -273,16 +285,12 @@ def read_rt_extract(
     frame["JudgmentDate"] = _parse_required_date(frame, "JudgmentDate")
 
     insertion_before_judgment = frame["Date Inserted"] < frame["JudgmentDate"]
-    if insertion_before_judgment.any():
+    judgment_after_observation = frame["JudgmentDate"] > observed
+    insertion_after_observation = frame["Date Inserted"] > observed
+    if judgment_after_observation.any():
         raise ValueError(
-            "Date Inserted precedes JudgmentDate for "
-            f"{int(insertion_before_judgment.sum())} row(s)"
-        )
-    after_observation = (frame["JudgmentDate"] > observed) | (frame["Date Inserted"] > observed)
-    if after_observation.any():
-        raise ValueError(
-            f"{int(after_observation.sum())} row(s) occur after observation date "
-            f"{observed.date().isoformat()}"
+            f"JudgmentDate is after the RT extract date for "
+            f"{int(judgment_after_observation.sum())} row(s)"
         )
 
     for column in (
@@ -312,6 +320,8 @@ def read_rt_extract(
         registration_lag_days_min=int(registration_lag.min()),
         registration_lag_days_median=float(registration_lag.median()),
         registration_lag_days_max=int(registration_lag.max()),
+        date_inserted_before_judgment_rows=int(insertion_before_judgment.sum()),
+        date_inserted_after_observation_rows=int(insertion_after_observation.sum()),
         age_at_observation_months_min=float(frame["age_at_observation_months"].min()),
         age_at_observation_months_median=float(frame["age_at_observation_months"].median()),
         age_at_observation_months_max=float(frame["age_at_observation_months"].max()),

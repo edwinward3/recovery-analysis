@@ -127,8 +127,15 @@ def build_data_audit_counts(
     )
     frame["registration_lag_band"] = pd.cut(
         lag,
-        bins=[-float("inf"), 1, 2, 6, 31, float("inf")],
-        labels=["same_day", "one_day", "2_to_5_days", "6_to_30_days", "31_plus_days"],
+        bins=[-float("inf"), 0, 1, 2, 6, 31, float("inf")],
+        labels=[
+            "before_judgment",
+            "same_day",
+            "one_day",
+            "2_to_5_days",
+            "6_to_30_days",
+            "31_plus_days",
+        ],
         right=False,
     ).astype("string").fillna("missing")
     age = pd.to_numeric(
@@ -216,6 +223,14 @@ def build_data_audit_counts(
             ("invalid_amount", getattr(audit, "invalid_amount_rows", 0)),
             ("missing_company_name", getattr(audit, "missing_company_name_rows", 0)),
             ("missing_postcode", getattr(audit, "missing_postcode_rows", 0)),
+            (
+                "date_inserted_before_judgment",
+                getattr(audit, "date_inserted_before_judgment_rows", 0),
+            ),
+            (
+                "date_inserted_after_observation_date",
+                getattr(audit, "date_inserted_after_observation_rows", 0),
+            ),
         ):
             rows.append(
                 {
@@ -630,6 +645,8 @@ def _write_matching_summary(path: str | Path, context: dict[str, Any]) -> None:
         "  Missing company name         "
         f"{_fmt_count(counts.get('missing_company_name'), min_cell_n)}",
         f"  Missing postcode             {_fmt_count(counts.get('missing_postcode'), min_cell_n)}",
+        "  Inserted before judgment     "
+        f"{_fmt_count(counts.get('date_inserted_before_judgment'), min_cell_n)}",
         "",
         "Matching coverage (coverage, not accuracy)",
         f"  Full-dataset denominator     {_fmt_count(match.get('denominator'), min_cell_n)}",

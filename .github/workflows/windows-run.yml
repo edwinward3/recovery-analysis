@@ -50,7 +50,7 @@ jobs:
         env:
           RECOVERY_NO_PAUSE: "1"
         run: |
-          & .\RUN.bat diagnostic "ci inputs !\synthetic judgments.xlsx" "ci inputs !\BasicCompanyDataAsOneFile-2026-06-01.zip" 2026-06-01 "ci outputs !"
+          & .\RUN.bat diagnostic "ci inputs !\synthetic judgments.xlsx" "ci inputs !\BasicCompanyDataAsOneFile-2026-06-01.zip" "" "ci outputs !"
           if ($LASTEXITCODE -ne 0) { throw "diagnostic RUN.bat failed with exit code $LASTEXITCODE" }
           & .\RUN.bat locked "ci inputs !\synthetic judgments.xlsx" "ci inputs !\BasicCompanyDataAsOneFile-2026-06-01.zip" 2026-06-01 "ci outputs !"
           if ($LASTEXITCODE -ne 0) { throw "locked RUN.bat failed with exit code $LASTEXITCODE" }
@@ -92,10 +92,22 @@ jobs:
           foreach ($name in $modelExpected) {
             if (Test-Path (Join-Path $diagnostic.FullName "results\$name")) { throw "diagnostic unexpectedly wrote model output: $name" }
           }
-          $diagnosticModels = @(Get-ChildItem (Join-Path $diagnostic.FullName "working_files\models") -File)
-          if ($diagnosticModels.Count) { throw "diagnostic unexpectedly wrote internal model files" }
+          if (Test-Path (Join-Path $diagnostic.FullName "working_files\models")) {
+            throw "diagnostic unexpectedly retained an internal model folder"
+          }
           if (Test-Path (Join-Path $diagnostic.FullName "working_files\model_rows.csv")) {
             throw "diagnostic unexpectedly wrote model split membership"
+          }
+          foreach ($run in @($diagnostic, $locked)) {
+            if (Test-Path (Join-Path $run.FullName "working_files\matching_table.csv.gz")) {
+              throw "$($run.Name) retained the full row-level match table"
+            }
+            if (Test-Path (Join-Path $run.FullName ".aggregate_staging")) {
+              throw "$($run.Name) retained aggregate staging files"
+            }
+          }
+          if (Test-Path (Join-Path $locked.FullName "working_files\model_rows.csv")) {
+            throw "locked run retained identifiable model split membership"
           }
           $diagnosticManifest = Get-Content (Join-Path $diagnostic.FullName "results\E5_run_manifest.json") -Raw | ConvertFrom-Json
           if ($null -ne $diagnosticManifest.model_only_acceptance) {
@@ -200,7 +212,7 @@ jobs:
             $run = Get-ChildItem "scale outputs !" -Directory -Filter "$stage`_*" | Sort-Object Name | Select-Object -Last 1
             if (-not $run) { throw "$stage scale run did not produce an output directory" }
             $env:SCALE_RUN_ROOT = $run.FullName
-            python -c "import os; from pathlib import Path; from recovery.selftest import _assert_match_truth; _assert_match_truth(Path(os.environ['SCALE_RUN_ROOT']), Path('scale inputs !/synthetic_ground_truth.csv'))"
+            python -c "import os; from pathlib import Path; from recovery.selftest import _assert_pair_truth; _assert_pair_truth(Path(os.environ['SCALE_RUN_ROOT']), Path('scale inputs !/synthetic_ground_truth.csv'))"
             $log = Import-Csv (Join-Path $run.FullName "results\E5_run_log.csv")
             $manifest = Get-Content (Join-Path $run.FullName "results\E5_run_manifest.json") -Raw | ConvertFrom-Json
             $peaks = @($log | ForEach-Object {
@@ -228,7 +240,7 @@ jobs:
             "EXACT_WINDOWS_SCALE_GATE=PASS",
             "PYTHON=$(& python -c 'import platform; print(platform.python_version())')",
             "JUDGMENT_ROWS=500000",
-            "PLANTED_MATCH_TRUTH=PASS",
+            "PLANTED_PAIR_TRUTH=PASS",
             "DIAGNOSTIC_ELAPSED_SECONDS=$($diagnostic.ElapsedSeconds)",
             "DIAGNOSTIC_PEAK_PROCESS_MEMORY_MB=$($diagnostic.PeakMemoryMb)",
             "DIAGNOSTIC_DISCLOSURE_GATE=$($diagnostic.Manifest.disclosure.status)",

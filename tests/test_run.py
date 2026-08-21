@@ -11,7 +11,7 @@ from unittest.mock import patch
 import pandas as pd
 
 from recovery.disclosure import DisclosureViolation
-from recovery.run import MATCH_FILENAME, PAIR_FILENAME, RunFailure, analyze
+from recovery.run import PAIR_FILENAME, RunFailure, analyze
 from recovery.reporting import write_e5 as real_write_e5
 from recovery.synthetic import make_synthetic_bundle, write_bundle
 
@@ -25,6 +25,7 @@ class RunTests(unittest.TestCase):
             root = Path(temporary)
             bundle = make_synthetic_bundle(1_600, include_prior_rows=False)
             judgments, companies, _ = write_bundle(bundle, root / "inputs", excel=False)
+            matched_rows: list[int] = []
             with (
                 patch(
                     "recovery.run.prepare_model_cohort",
@@ -43,14 +44,16 @@ class RunTests(unittest.TestCase):
                     settings_path=ROOT / "settings.toml",
                     output_base=root / "outputs",
                     run_id="matching_only",
+                    _match_validator=lambda frame: matched_rows.append(len(frame)),
                 )
 
-            matches = pd.read_csv(paths.working / MATCH_FILENAME)
             coverage = pd.read_csv(paths.results / "E2_match_coverage.csv")
-            self.assertEqual(len(matches), len(bundle.judgments))
+            self.assertEqual(matched_rows, [len(bundle.judgments)])
             self.assertEqual(int(coverage["rows"].sum()), len(bundle.judgments))
             self.assertFalse((paths.results / "E3_model_comparison.csv").exists())
             self.assertFalse((paths.working / "model_rows.csv").exists())
+            self.assertFalse((paths.working / "matching_table.csv.gz").exists())
+            self.assertFalse((paths.root / ".aggregate_staging").exists())
 
             pairs = pd.read_csv(paths.working / PAIR_FILENAME)
             self.assertEqual(len(pairs), 1_000)
@@ -58,6 +61,9 @@ class RunTests(unittest.TestCase):
             self.assertIn("matched_company_name", pairs)
             self.assertNotIn("review_decision", pairs)
             self.assertNotIn("review_notes", pairs)
+            self.assertEqual(
+                {path.name for path in paths.working.iterdir()}, {PAIR_FILENAME}
+            )
 
             summary = (paths.results / "SUMMARY.txt").read_text(encoding="utf-8")
             self.assertIn("RUN 1 MATCHING SUMMARY", summary)
@@ -120,8 +126,7 @@ class RunTests(unittest.TestCase):
                     output_base=root / "outputs",
                     run_id="unsafe",
                 )
-            reports = root / "outputs" / "diagnostic_unsafe" / "results"
-            self.assertEqual(list(reports.iterdir()), [])
+            self.assertFalse((root / "outputs" / "diagnostic_unsafe").exists())
 
 
 if __name__ == "__main__":

@@ -110,6 +110,48 @@ def test_rt_dates_distinguish_registration_lag_from_observation_age(tmp_path: Pa
     assert frame.loc[0, "Amount"] == pytest.approx(1250.5)
 
 
+def test_real_excel_dates_are_not_swapped_when_day_and_month_are_ambiguous(
+    tmp_path: Path,
+) -> None:
+    pytest.importorskip("openpyxl")
+    row = _rt_row("J-1", "Example Limited", "SW1A 1AA")
+    row["JudgmentDate"] = pd.Timestamp("2025-05-01")
+    row["Date Inserted"] = pd.Timestamp("2025-05-02")
+    path = tmp_path / "real-excel-dates.xlsx"
+    pd.DataFrame([row]).to_excel(path, index=False)
+
+    frame, audit = read_rt_extract(path, "2025-07-03")
+
+    assert frame.loc[0, "JudgmentDate"] == pd.Timestamp("2025-05-01")
+    assert frame.loc[0, "Date Inserted"] == pd.Timestamp("2025-05-02")
+    assert frame.loc[0, "registration_lag_days"] == 1
+    assert audit.date_inserted_before_judgment_rows == 0
+
+
+def test_registration_date_anomalies_are_audited_without_blocking_matching(
+    tmp_path: Path,
+) -> None:
+    row = _rt_row("J-1", "Example Limited", "SW1A 1AA", "02/05/2025")
+    row["Date Inserted"] = "01/05/2025"
+    path = tmp_path / "registration-anomaly.csv"
+    pd.DataFrame([row]).to_csv(path, index=False)
+
+    frame, audit = read_rt_extract(path, "03/07/2025")
+
+    assert frame.loc[0, "registration_lag_days"] == -1
+    assert audit.date_inserted_before_judgment_rows == 1
+
+
+def test_judgment_after_extract_date_still_stops_the_run(tmp_path: Path) -> None:
+    row = _rt_row("J-1", "Example Limited", "SW1A 1AA", "04/07/2025")
+    row["Date Inserted"] = "05/07/2025"
+    path = tmp_path / "future-judgment.csv"
+    pd.DataFrame([row]).to_csv(path, index=False)
+
+    with pytest.raises(ValueError, match="JudgmentDate is after the RT extract date"):
+        read_rt_extract(path, "03/07/2025")
+
+
 def test_rt_csv_and_xlsx_validation_reject_duplicate_ids(tmp_path: Path) -> None:
     rows = [
         _rt_row("DUPLICATE", "One Limited", "AA1 1AA"),

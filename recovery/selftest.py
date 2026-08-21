@@ -16,7 +16,7 @@ import sys
 import pandas as pd
 
 from .disclosure import validate_egress
-from .run import MATCH_FILENAME, PAIR_FILENAME, analyze
+from .run import PAIR_FILENAME, analyze
 from .synthetic import make_synthetic_bundle, write_bundle
 
 
@@ -97,11 +97,9 @@ def _write_inputs(args: object) -> int:
 
 # Check the known matches and output files
 
-def _assert_match_truth(run_root: Path, truth_path: Path) -> None:
-    matches = pd.read_csv(
-        run_root / "working_files" / MATCH_FILENAME,
-        dtype={"ID": "string", "matched_company_number": "string"},
-    )
+def _assert_match_truth(matches: pd.DataFrame, truth_path: Path) -> None:
+    """Check every planted target while the match table is still in memory."""
+
     truth = pd.read_csv(
         truth_path,
         dtype={"ID": "string", "expected_company_number": "string"},
@@ -130,7 +128,26 @@ def _assert_match_truth(run_root: Path, truth_path: Path) -> None:
         )
 
 
-def _assert_outputs(run_root: Path, truth_path: Path, *, stage: str) -> None:
+def _assert_pair_truth(run_root: Path, truth_path: Path) -> None:
+    """Check the identities in the retained 1,000-pair scale-test sample."""
+
+    pairs = pd.read_csv(
+        run_root / "working_files" / PAIR_FILENAME,
+        dtype={"ID": "string", "matched_company_number": "string"},
+    )
+    truth = pd.read_csv(
+        truth_path,
+        dtype={"ID": "string", "expected_company_number": "string"},
+    )
+    checked = pairs.merge(truth, on="ID", how="left", validate="one_to_one")
+    if checked["expected_company_number"].isna().any():
+        raise AssertionError("one or more sampled IDs are absent from synthetic truth")
+    wrong = checked["matched_company_number"].ne(checked["expected_company_number"])
+    if wrong.any():
+        raise AssertionError(f"{int(wrong.sum())} sampled matches have the wrong identity")
+
+
+def _assert_outputs(run_root: Path, *, stage: str) -> None:
     results = run_root / "results"
     actual = {path.name for path in results.iterdir() if path.is_file()}
     expected = _MATCHING_EGRESS | (_MODEL_EGRESS if stage == "locked" else set())
@@ -147,9 +164,21 @@ def _assert_outputs(run_root: Path, truth_path: Path, *, stage: str) -> None:
     manifest = json.loads(
         (results / "E5_run_manifest.json").read_text(encoding="utf-8")
     )
-    for relative in manifest["artifact_manifest"]["working_files"]:
+    expected_working = set(manifest["artifact_manifest"]["working_files"])
+    for relative in expected_working:
         if not (run_root / "working_files" / relative).is_file():
             raise AssertionError(f"manifest lists a missing working file: {relative}")
+    actual_working = {
+        path.relative_to(run_root / "working_files").as_posix()
+        for path in (run_root / "working_files").rglob("*")
+        if path.is_file()
+    }
+    if actual_working != expected_working:
+        raise AssertionError(
+            f"working files differ from the retained manifest: {actual_working!r}"
+        )
+    if (run_root / ".aggregate_staging").exists():
+        raise AssertionError("aggregate staging was retained after a successful run")
 
     pairs = pd.read_csv(run_root / "working_files" / PAIR_FILENAME)
     if len(pairs) != 1_000:
@@ -159,9 +188,13 @@ def _assert_outputs(run_root: Path, truth_path: Path, *, stage: str) -> None:
     if allocation != expected_allocation:
         raise AssertionError(f"pair allocation differs: {allocation!r}")
 
-    matches = pd.read_csv(run_root / "working_files" / MATCH_FILENAME)
     coverage = pd.read_csv(results / "E2_match_coverage.csv")
-    if int(coverage["rows"].sum()) != len(matches):
+    funnel = pd.read_csv(results / "E1_data_funnel.csv").set_index("stage")
+    total_stage = (
+        "matching_decisions" if "matching_decisions" in funnel.index else "judgments_read"
+    )
+    matching_rows = int(funnel.loc[total_stage, "rows"])
+    if int(coverage["rows"].sum()) != matching_rows:
         raise AssertionError("E2 coverage does not account for every matching decision")
 
     if stage == "locked":
@@ -185,9 +218,6 @@ def _assert_outputs(run_root: Path, truth_path: Path, *, stage: str) -> None:
         summary = (results / "SUMMARY.txt").read_text(encoding="utf-8")
         if "No satisfaction model was trained or assessed" not in summary:
             raise AssertionError("diagnostic summary does not state that modelling was skipped")
-
-    _assert_match_truth(run_root, truth_path)
-
 
 # Run both stages
 
@@ -213,8 +243,9 @@ def _run_full(args: object) -> int:
             settings_path=args.settings,
             output_base=root / "outputs !",
             run_id="selftest_diagnostic",
+            _match_validator=lambda matches: _assert_match_truth(matches, truth),
         )
-        _assert_outputs(diagnostic.root, truth, stage="diagnostic")
+        _assert_outputs(diagnostic.root, stage="diagnostic")
         locked = analyze(
             stage="locked",
             judgments_path=judgments,
@@ -223,8 +254,9 @@ def _run_full(args: object) -> int:
             settings_path=args.settings,
             output_base=root / "outputs !",
             run_id="selftest_locked",
+            _match_validator=lambda matches: _assert_match_truth(matches, truth),
         )
-        _assert_outputs(locked.root, truth, stage="locked")
+        _assert_outputs(locked.root, stage="locked")
     print(
         "SELF-TEST: PASS. Matching-only Run 1, locked Run 2, planted match "
         "identities, four model fits and the disclosure boundary all passed."
