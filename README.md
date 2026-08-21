@@ -17,10 +17,6 @@ https://download.companieshouse.gov.uk/. Leave it zipped.
 
 It also creates a separate file containing 1,000 matching pairs.
 
-A match is made only where the normalised company or trading name identifies one
-date-valid Companies House company. Postcode is reported but never chooses a match,
-and only these unique exact-name matches can enter the model.
-
 ## Your judgment file
 
 A .csv or .xlsx with these columns (upper/lower case and order don't matter):
