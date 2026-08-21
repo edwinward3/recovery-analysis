@@ -1,5 +1,4 @@
-@rem Sets up Python, runs the fake-data self-test, then runs the selected stage.
-@rem Double-clicking runs the exact-name matching check; Run 2 is kept for later.
+@rem Sets up Python, runs the fake-data self-test, then runs matching or the model.
 @echo off
 setlocal DisableDelayedExpansion
 cd /d "%~dp0"
@@ -62,8 +61,10 @@ set "INTERACTIVE="
 
 if defined STAGE goto have_stage
 set "INTERACTIVE=1"
-set "STAGE=diagnostic"
-echo Run 1 selected: unique exact-name matching only.
+echo Choose what to run:
+echo   1. Full-data exact-name matching
+echo   2. Satisfaction model
+set /p "STAGE=Enter 1 or 2: "
 
 :have_stage
 set "STAGE=%STAGE:"=%"
@@ -91,7 +92,8 @@ if not exist "%COMPANIES%" goto missing_companies
 
 if not defined INTERACTIVE goto arguments_ready
 if defined OBSERVATION goto arguments_ready
-set /p "OBSERVATION=RT extract date YYYY-MM-DD (blank = today): "
+if /i "%STAGE%"=="locked" set /p "OBSERVATION=RT extract date YYYY-MM-DD (required): "
+if /i "%STAGE%"=="diagnostic" set /p "OBSERVATION=RT extract date YYYY-MM-DD (blank = today): "
 
 :arguments_ready
 if /i "%STAGE%"=="locked" if not defined OBSERVATION goto missing_observation
@@ -99,7 +101,7 @@ if not defined OUTPUT_BASE set "OUTPUT_BASE=outputs"
 
 echo.
 if /i "%STAGE%"=="diagnostic" echo Running Run 1: full-data matching only. No satisfaction model will be trained.
-if /i "%STAGE%"=="locked" echo Running Run 2: locked matching plus the agreed satisfaction models.
+if /i "%STAGE%"=="locked" echo Running Run 2: exact-name matching plus the satisfaction model.
 if defined OBSERVATION goto run_with_date
 ".venv\Scripts\python.exe" -m recovery.run analyze --stage "%STAGE%" --judgments "%JUDGMENTS%" --companies-house "%COMPANIES%" --settings "settings.toml" --output-base "%OUTPUT_BASE%"
 if errorlevel 1 goto run_failed
@@ -134,7 +136,7 @@ goto stop
 
 :bad_stage
 echo.
-echo STOP: Choose 1 for full-data matching or 2 for the agreed satisfaction/model run.
+echo STOP: Choose 1 for full-data matching or 2 for the satisfaction model.
 goto stop
 
 :missing_judgments

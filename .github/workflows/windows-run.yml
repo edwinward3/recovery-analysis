@@ -51,13 +51,20 @@ jobs:
           RECOVERY_NO_PAUSE: "1"
         run: |
           @(
+            "1",
             '"ci inputs !\synthetic judgments.xlsx"',
             '"ci inputs !\BasicCompanyDataAsOneFile-2026-06-01.zip"',
             ""
           ) | Set-Content "ci inputs !\launcher answers.txt" -Encoding ascii
           cmd.exe /d /c 'RUN.bat < "ci inputs !\launcher answers.txt"'
           if ($LASTEXITCODE -ne 0) { throw "diagnostic RUN.bat failed with exit code $LASTEXITCODE" }
-          & .\RUN.bat locked "ci inputs !\synthetic judgments.xlsx" "ci inputs !\BasicCompanyDataAsOneFile-2026-06-01.zip" 2026-06-01
+          @(
+            "2",
+            '"ci inputs !\synthetic judgments.xlsx"',
+            '"ci inputs !\BasicCompanyDataAsOneFile-2026-06-01.zip"',
+            "2026-06-01"
+          ) | Set-Content "ci inputs !\model launcher answers.txt" -Encoding ascii
+          cmd.exe /d /c 'RUN.bat < "ci inputs !\model launcher answers.txt"'
           if ($LASTEXITCODE -ne 0) { throw "locked RUN.bat failed with exit code $LASTEXITCODE" }
 
       - name: Assert matching-only Run 1 and model Run 2 outputs
