@@ -1,4 +1,4 @@
-"""Shared code that runs the matching and later payment model."""
+"""Shared code that runs the matching and later satisfaction model."""
 
 from __future__ import annotations
 
@@ -131,7 +131,7 @@ def _analyze_created_run(
         record["ch_rows_retained"] = ch_index.stats.get("ch_rows_retained")
 
     with recorder.stage("E2_match") as record:
-        matches = match_judgments(judgments, ch_index, settings)
+        matches = match_judgments(judgments, ch_index)
         if _match_validator is not None:
             _match_validator(matches)
         diagnostics = match_diagnostics(judgments, matches)
@@ -286,11 +286,9 @@ def _matching_funnel(
         [
             {"stage": "judgments_read", "rows": int(len(judgments))},
             {"stage": "matching_decisions", "rows": int(len(matches))},
-            {"stage": "auto", "rows": int(tiers.get("auto", 0))},
-            {"stage": "review", "rows": int(tiers.get("review", 0))},
             {
-                "stage": "fallback_review",
-                "rows": int(tiers.get("fallback_review", 0)),
+                "stage": "unique_exact_name",
+                "rows": int(tiers.get("exact_unique", 0)),
             },
             {"stage": "unmatched", "rows": int(tiers.get("unmatched", 0))},
             {"stage": "matching_pair_examples", "rows": int(sample_rows)},
@@ -308,11 +306,7 @@ def _diagnostic_summary_context(
 
     tiers = matches["tier"].value_counts()
     denominator = int(len(matches))
-    postcode_proposed = int(tiers.get("auto", 0) + tiers.get("review", 0))
-    proposed = int(postcode_proposed + tiers.get("fallback_review", 0))
-    auto = int(tiers.get("auto", 0))
-    review = int(tiers.get("review", 0))
-    fallback = int(tiers.get("fallback_review", 0))
+    exact_unique = int(tiers.get("exact_unique", 0))
     return {
         "scope": "matching_only",
         "stage": "diagnostic",
@@ -330,22 +324,12 @@ def _diagnostic_summary_context(
         },
         "match": {
             "denominator": denominator,
-            "auto": auto,
-            "review": review,
-            "fallback_review": fallback,
+            "exact_unique": exact_unique,
             "unmatched": int(tiers.get("unmatched", 0)),
-            "postcode_proposed": postcode_proposed,
-            "postcode_coverage": _safe_coverage(
-                postcode_proposed,
-                denominator,
-                (auto, review),
-                settings.min_cell_n,
-            ),
-            "proposed": proposed,
             "coverage": _safe_coverage(
-                proposed,
+                exact_unique,
                 denominator,
-                (auto, review, fallback),
+                (exact_unique,),
                 settings.min_cell_n,
             ),
         },
@@ -391,16 +375,16 @@ def _locked_summary_context(
             "primary_age_eligible": cohort.funnel.get(
                 "seasoned_12_36_corporate_ew_labelled"
             ),
-            "auto_matched_eligible": cohort.funnel.get("auto_matched_eligible"),
+            "exact_unique_matched_eligible": cohort.funnel.get(
+                "exact_unique_matched_eligible"
+            ),
             "model_rows": len(cohort.frame),
             "satisfied": int(cohort.frame["label"].sum()),
             "unsatisfied": int(len(cohort.frame) - cohort.frame["label"].sum()),
         },
         "match": {
             "denominator": int(corporate.sum()),
-            "auto": int(tiers.get("auto", 0)),
-            "review": int(tiers.get("review", 0)),
-            "fallback_review": int(tiers.get("fallback_review", 0)),
+            "exact_unique": int(tiers.get("exact_unique", 0)),
             "unmatched": int(tiers.get("unmatched", 0)),
         },
         "splits": cohort.split_counts,
@@ -442,7 +426,7 @@ def _run_manifest(
     companies_suffix: str,
 ) -> dict[str, Any]:
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "status": "RT INTERNAL - NOT AUTHORISED FOR EXTERNAL USE",
         "run_id": paths.root.name,
         "stage": stage,
@@ -458,6 +442,7 @@ def _run_manifest(
             "settings_file": settings_fingerprint,
         },
         "settings": settings.as_dict(),
+        "matching_rule": "unique_date_valid_exact_normalized_name_v1",
         "sample_seed": seed,
         "model_artifact_sha256": model_artifact_fingerprints,
         "ch_index_stats": dict(ch_index.stats),
@@ -523,7 +508,7 @@ def _limitations_text(stage: str) -> str:
             "Current Companies House fields are retrospective and exploratory.",
             "The free Companies House bulk file omits dissolved defendants.",
             "E4 population sensitivities are descriptive and are not extra fitted models.",
-            "Review and fallback matches do not enter the headline model.",
+            "Only unique exact normalized-name matches enter the headline model.",
         ]
     )
 
@@ -575,7 +560,6 @@ def _package_versions() -> dict[str, str]:
         "scikit-learn",
         "lightgbm",
         "openpyxl",
-        "rapidfuzz",
         "narwhals",
         "tzdata",
     )
@@ -623,9 +607,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"OPEN THIS SUMMARY: {paths.results / 'SUMMARY.txt'}")
         print(f"MATCHING PAIRS: {paths.working / PAIR_FILENAME}")
         if args.stage == "diagnostic":
-            print("No payment model was run.")
+            print("No satisfaction model was run.")
         else:
-            print("The payment models were also run.")
+            print("The satisfaction models were also run.")
         return 0
     except Exception as exc:
         print(f"STOP: {type(exc).__name__}: {exc}", file=sys.stderr)

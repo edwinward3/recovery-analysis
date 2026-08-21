@@ -1,4 +1,5 @@
 @rem Sets up Python, runs the fake-data self-test, then runs the selected stage.
+@rem Double-clicking runs the exact-name matching check; Run 2 is kept for later.
 @echo off
 setlocal DisableDelayedExpansion
 cd /d "%~dp0"
@@ -61,10 +62,8 @@ set "INTERACTIVE="
 
 if defined STAGE goto have_stage
 set "INTERACTIVE=1"
-echo Choose what to run:
-echo   1. Full-data matching
-echo   2. Satisfaction model
-set /p "STAGE=Enter 1 or 2: "
+set "STAGE=diagnostic"
+echo Run 1 selected: unique exact-name matching only.
 
 :have_stage
 set "STAGE=%STAGE:"=%"

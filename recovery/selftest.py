@@ -45,13 +45,13 @@ _MODEL_EGRESS = {
 }
 
 _EXPECTED_TIERS = {
-    "clean": "auto",
-    "punctuation": "auto",
-    "review_name": "review",
-    "trading": "auto",
-    "former": "auto",
-    "postcode_drift": "fallback_review",
-    "ambiguous": "review",
+    "clean": "exact_unique",
+    "punctuation": "exact_unique",
+    "same_postcode_wrong_name": "unmatched",
+    "trading": "exact_unique",
+    "former": "exact_unique",
+    "postcode_drift": "exact_unique",
+    "same_postcode_ambiguous": "unmatched",
     "unmatched": "unmatched",
 }
 
@@ -108,13 +108,13 @@ def _assert_match_truth(matches: pd.DataFrame, truth_path: Path) -> None:
     if checked["tier"].isna().any():
         raise AssertionError("one or more planted target judgments were not matched")
 
-    proposed = checked["tier"].ne("unmatched")
+    matched = checked["tier"].eq("exact_unique")
     wrong = checked.loc[
-        proposed
+        matched
         & checked["matched_company_number"].ne(checked["expected_company_number"])
     ]
     if not wrong.empty:
-        raise AssertionError(f"{len(wrong)} proposed matches have the wrong identity")
+        raise AssertionError(f"{len(wrong)} exact matches have the wrong identity")
 
     observed = (
         checked.groupby("corruption_class", observed=True)["tier"]
@@ -183,10 +183,8 @@ def _assert_outputs(run_root: Path, *, stage: str) -> None:
     pairs = pd.read_csv(run_root / "working_files" / PAIR_FILENAME)
     if len(pairs) != 1_000:
         raise AssertionError(f"match-example file has {len(pairs)} rows, expected 1,000")
-    allocation = pairs["tier"].value_counts().to_dict()
-    expected_allocation = {"auto": 500, "review": 300, "fallback_review": 200}
-    if allocation != expected_allocation:
-        raise AssertionError(f"pair allocation differs: {allocation!r}")
+    if set(pairs["tier"]) != {"exact_unique"}:
+        raise AssertionError("pair file contains a non-exact match")
 
     coverage = pd.read_csv(results / "E2_match_coverage.csv")
     funnel = pd.read_csv(results / "E1_data_funnel.csv").set_index("stage")

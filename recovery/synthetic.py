@@ -25,7 +25,7 @@ def make_synthetic_bundle(
     *,
     include_prior_rows: bool = True,
 ) -> SyntheticBundle:
-    """Return fake inputs with clean, noisy, fallback and unmatched cases."""
+    """Return fake inputs with exact, postcode-change and non-match cases."""
 
     if n_companies < 100:
         raise ValueError("n_companies must be at least 100")
@@ -48,7 +48,16 @@ def make_synthetic_bundle(
 
     corruption = np.array(
         [
-            ("clean", "punctuation", "review_name", "trading", "former", "postcode_drift", "ambiguous", "unmatched")[i % 8]
+            (
+                "clean",
+                "punctuation",
+                "same_postcode_wrong_name",
+                "trading",
+                "former",
+                "postcode_drift",
+                "same_postcode_ambiguous",
+                "unmatched",
+            )[i % 8]
             for i in company_ids
         ],
         dtype=object,
@@ -64,7 +73,7 @@ def make_synthetic_bundle(
         stem = f"ALPHA {i:06d} SERVICES"
         if cls == "punctuation":
             source_names[i] = f"ALPHA-{i:06d} SERVICES LTD."
-        elif cls == "review_name":
+        elif cls == "same_postcode_wrong_name":
             source_names[i] = f"ALFA {i:06d} SERVICE GROUP"
         elif cls == "trading":
             source_names[i] = f"TRADING STYLE {i:06d}"
@@ -76,7 +85,7 @@ def make_synthetic_bundle(
             current_names[i] = f"NEW ALPHA {i:06d} LIMITED"
         elif cls == "postcode_drift":
             source_postcodes[i] = _old_postcode(i)
-        elif cls == "ambiguous":
+        elif cls == "same_postcode_ambiguous":
             source_names[i] = f"ALPHA {i:06d} SERVICE"
         elif cls == "unmatched":
             source_names[i] = f"UNRELATED DEFENDANT {i:06d}"
@@ -110,7 +119,7 @@ def make_synthetic_bundle(
     )
 
     # Add a near-identical company at the same postcode for the ambiguity class.
-    amb_idx = np.flatnonzero(corruption == "ambiguous")
+    amb_idx = np.flatnonzero(corruption == "same_postcode_ambiguous")
     if len(amb_idx):
         extra = ch.iloc[amb_idx].copy()
         extra["CompanyNumber"] = [f"{i + 80_000_000:08d}" for i in amb_idx]

@@ -12,18 +12,13 @@ import tomllib
 
 @dataclass(frozen=True, slots=True)
 class Settings:
-    auto_threshold: float = 0.85
-    review_threshold: float = 0.70
-    auto_margin: float = 0.05
     primary_min_months: int = 12
     primary_max_months: int = 36
     prior_history_months: int = 24
     min_cell_n: int = 10
     diagnostic_seed: int = 20260618
     locked_seed: int = 20260619
-    sample_auto: int = 500
-    sample_review: int = 300
-    sample_fallback: int = 200
+    sample_size: int = 1_000
     min_test_rows: int = 1_000
     min_test_each_class: int = 100
     min_calibration_each_class: int = 50
@@ -38,7 +33,7 @@ class Settings:
         return asdict(self)
 
 
-_SECTIONS = {"matching", "cohort", "pair_sample", "acceptance", "runtime"}
+_SECTIONS = {"cohort", "pair_sample", "acceptance", "runtime"}
 
 
 # Read and check settings.toml
@@ -68,18 +63,12 @@ def load_settings(path: str | Path) -> Settings:
 
 
 def _validate(settings: Settings) -> None:
-    if not 0 <= settings.review_threshold < settings.auto_threshold <= 1:
-        raise ValueError("matching thresholds must satisfy 0 <= review < auto <= 1")
-    if not 0 <= settings.auto_margin <= 1:
-        raise ValueError("auto_margin must be between 0 and 1")
     if not 0 < settings.primary_min_months < settings.primary_max_months:
         raise ValueError("primary cohort months must satisfy 0 < min < max")
     if settings.prior_history_months <= 0:
         raise ValueError("prior_history_months must be positive")
-    if min(settings.sample_auto, settings.sample_review, settings.sample_fallback) < 0:
-        raise ValueError("pair sample sizes cannot be negative")
-    if sum((settings.sample_auto, settings.sample_review, settings.sample_fallback)) != 1_000:
-        raise ValueError("pair sample allocations must total 1,000")
+    if settings.sample_size != 1_000:
+        raise ValueError("pair sample size must be 1,000")
     if settings.diagnostic_seed == settings.locked_seed:
         raise ValueError("diagnostic_seed and locked_seed must differ")
     if settings.bootstrap_replicates < 100:

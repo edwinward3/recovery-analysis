@@ -28,8 +28,7 @@ from recovery.selftest import main as selftest_main
 
 def test_repository_settings_are_valid() -> None:
     settings = load_settings(Path(__file__).parents[1] / "settings.toml")
-    assert settings.auto_threshold == 0.85
-    assert settings.sample_auto + settings.sample_review + settings.sample_fallback == 1_000
+    assert settings.sample_size == 1_000
 
 
 def test_peak_memory_measurement_is_positive() -> None:
@@ -40,8 +39,8 @@ def test_peak_memory_measurement_is_positive() -> None:
 
 def test_settings_reject_unknown_or_bad_values(tmp_path: Path) -> None:
     bad = tmp_path / "bad.toml"
-    bad.write_text("[matching]\nauto_threshold=0.5\nreview_threshold=0.7\n", encoding="utf-8")
-    with pytest.raises(ValueError, match="thresholds"):
+    bad.write_text("[pair_sample]\nsample_size=500\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="sample size"):
         load_settings(bad)
     same_seed = tmp_path / "same-seed.toml"
     same_seed.write_text(
@@ -81,7 +80,7 @@ def test_summary_is_short_and_explicit(tmp_path: Path) -> None:
             "status": "PROVISIONAL",
             "observation_date": "2026-06-01",
             "counts": {"rows_read": 10, "model_rows": 4},
-            "match": {"denominator": 8, "auto": 4, "unmatched": 4},
+            "match": {"denominator": 8, "exact_unique": 4, "unmatched": 4},
             "primary": {"champion": "logistic", "roc_auc": 0.71},
             "exploratory": {"roc_auc": 0.80},
             "gates": {"primary_model": "PROVISIONAL"},
@@ -91,6 +90,7 @@ def test_summary_is_short_and_explicit(tmp_path: Path) -> None:
     text = path.read_text(encoding="utf-8")
     assert "Date Inserted measures registration delay" in text
     assert "CURRENT-SNAPSHOT FEATURES" in text
+    assert "Unique exact-name matches" in text
     assert "<10" in text
     assert len(text.splitlines()) < 60
 
@@ -177,16 +177,16 @@ def test_population_sensitivities_expose_repeated_and_long_window_counts() -> No
     matches = pd.DataFrame(
         {
             "ID": ["J1", "J2", "J3"],
-            "tier": ["auto"] * 3,
+            "tier": ["exact_unique"] * 3,
             "matched_company_number": ["C1", "C1", "C2"],
         }
     )
     table = build_population_sensitivities(
         judgments, matches, "2026-06-01", Settings()
     ).set_index("stratum")
-    assert table.loc["primary_12_36_auto_with_repeats", "rows"] == 2
-    assert table.loc["primary_12_36_auto_unique_earliest", "rows"] == 1
-    assert table.loc["aged_12_plus_auto_unique_earliest", "rows"] == 2
+    assert table.loc["primary_12_36_exact_unique_with_repeats", "rows"] == 2
+    assert table.loc["primary_12_36_exact_unique_earliest", "rows"] == 1
+    assert table.loc["aged_12_plus_exact_unique_earliest", "rows"] == 2
 
 
 def test_synthetic_dates_reproduce_rt_semantics(tmp_path: Path) -> None:

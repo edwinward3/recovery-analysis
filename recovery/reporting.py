@@ -267,7 +267,7 @@ def build_model_tables(
     evaluation: Any,
     sensitivities: pd.DataFrame | None = None,
 ) -> dict[str, pd.DataFrame]:
-    """Flatten the four aggregate model results into reviewable E3/E4 tables."""
+    """Flatten the four aggregate model results into E3/E4 tables."""
 
     comparison: list[dict[str, Any]] = []
     calibration: list[dict[str, Any]] = []
@@ -403,8 +403,7 @@ def build_population_sensitivities(
     scotland = frame["Jurisdiction"].eq("Scotland")
     labelled = frame["JudgmentStatus"].isin(("Satisfied", "Unsatisfied"))
     cancelled = frame["JudgmentStatus"].eq("Cancelled")
-    auto = frame["tier"].eq("auto")
-    auto_review = frame["tier"].isin(("auto", "review"))
+    exact_unique = frame["tier"].eq("exact_unique")
 
     rows: list[dict[str, Any]] = []
 
@@ -441,11 +440,26 @@ def build_population_sensitivities(
         )
 
     base = corporate & ew & labelled
-    add("primary_12_36_auto_unique_earliest", base & primary_age & auto, earliest=True)
-    add("primary_12_36_auto_with_repeats", base & primary_age & auto, earliest=False)
-    add("aged_12_plus_auto_unique_earliest", base & aged_12_plus & auto, earliest=True)
-    add("aged_12_plus_auto_with_repeats", base & aged_12_plus & auto, earliest=False)
-    add("primary_12_36_auto_plus_review", base & primary_age & auto_review, earliest=True)
+    add(
+        "primary_12_36_exact_unique_earliest",
+        base & primary_age & exact_unique,
+        earliest=True,
+    )
+    add(
+        "primary_12_36_exact_unique_with_repeats",
+        base & primary_age & exact_unique,
+        earliest=False,
+    )
+    add(
+        "aged_12_plus_exact_unique_earliest",
+        base & aged_12_plus & exact_unique,
+        earliest=True,
+    )
+    add(
+        "aged_12_plus_exact_unique_with_repeats",
+        base & aged_12_plus & exact_unique,
+        earliest=False,
+    )
     add(
         "noncorporate_12_36_kept_separate",
         noncorporate & ew & labelled & primary_age,
@@ -466,17 +480,17 @@ def build_population_sensitivities(
     for tier, selected in eligible.groupby("tier", dropna=False, sort=True):
         add(f"match_tier_{tier}", frame.index.isin(selected.index), earliest=False)
 
-    auto_primary = frame.loc[base & primary_age & auto].copy()
-    auto_primary["judgment_year"] = auto_primary["JudgmentDate"].dt.year.astype("Int64")
+    exact_primary = frame.loc[base & primary_age & exact_unique].copy()
+    exact_primary["judgment_year"] = exact_primary["JudgmentDate"].dt.year.astype("Int64")
     amount_bands = pd.cut(
-        auto_primary["Amount"],
+        exact_primary["Amount"],
         bins=[-float("inf"), 500, 1_000, 5_000, 25_000, float("inf")],
         labels=["under_500", "500_999", "1000_4999", "5000_24999", "25000_plus"],
         right=False,
     ).astype("string").fillna("amount_missing")
-    auto_primary["amount_band"] = amount_bands
+    exact_primary["amount_band"] = amount_bands
     for dimension in ("judgment_year", "amount_band"):
-        for value, selected in auto_primary.groupby(dimension, dropna=False, sort=True):
+        for value, selected in exact_primary.groupby(dimension, dropna=False, sort=True):
             positive = int(selected["JudgmentStatus"].eq("Satisfied").sum())
             negative = int(selected["JudgmentStatus"].eq("Unsatisfied").sum())
             rows.append(
@@ -573,18 +587,17 @@ def write_summary(path: str | Path, context: dict[str, Any]) -> None:
         f"{_fmt_count(counts.get('corporate_ew_labelled'), min_cell_n)}",
         "  Aged 12–36 months            "
         f"{_fmt_count(counts.get('primary_age_eligible'), min_cell_n)}",
-        "  Auto-matched eligible        "
-        f"{_fmt_count(counts.get('auto_matched_eligible'), min_cell_n)}",
+        "  Unique exact-name eligible   "
+        f"{_fmt_count(counts.get('exact_unique_matched_eligible'), min_cell_n)}",
         f"  Unique companies/model rows  {_fmt_count(counts.get('model_rows'), min_cell_n)}",
         "  Satisfied / Unsatisfied      "
         f"{_fmt_count(counts.get('satisfied'), min_cell_n)} / "
         f"{_fmt_count(counts.get('unsatisfied'), min_cell_n)}",
         "",
-        "Matching coverage (coverage, not accuracy)",
+        "Exact-name matching coverage",
         f"  Corporate denominator        {_fmt_count(match.get('denominator'), min_cell_n)}",
-        f"  Auto                          {_fmt_count(match.get('auto'), min_cell_n)}",
-        f"  Review                        {_fmt_count(match.get('review'), min_cell_n)}",
-        f"  Fallback review               {_fmt_count(match.get('fallback_review'), min_cell_n)}",
+        "  Unique exact-name matches     "
+        f"{_fmt_count(match.get('exact_unique'), min_cell_n)}",
         f"  Unmatched                     {_fmt_count(match.get('unmatched'), min_cell_n)}",
         "",
         "Primary judgment-time model",
@@ -610,7 +623,7 @@ def write_summary(path: str | Path, context: dict[str, Any]) -> None:
         "  - Date Inserted measures registration delay; it is not used for seasoning.",
         "  - Satisfied/Unsatisfied is register status when this fresh extract was run.",
         "  - Companies House bulk contains live companies and cannot match every defendant.",
-        "  - Review and fallback matches do not enter the headline model.",
+        "  - Only unique exact normalized-name matches enter the model.",
         "  - Current-snapshot features may post-date the judgment and are exploratory only.",
         "  - RT permission is required before any result or model artefact leaves.",
         "",
@@ -648,14 +661,12 @@ def _write_matching_summary(path: str | Path, context: dict[str, Any]) -> None:
         "  Inserted before judgment     "
         f"{_fmt_count(counts.get('date_inserted_before_judgment'), min_cell_n)}",
         "",
-        "Matching coverage (coverage, not accuracy)",
+        "Exact-name matching",
         f"  Full-dataset denominator     {_fmt_count(match.get('denominator'), min_cell_n)}",
-        f"  Auto                          {_fmt_count(match.get('auto'), min_cell_n)}",
-        f"  Review                        {_fmt_count(match.get('review'), min_cell_n)}",
-        f"  Fallback review               {_fmt_count(match.get('fallback_review'), min_cell_n)}",
+        "  Unique exact-name matches     "
+        f"{_fmt_count(match.get('exact_unique'), min_cell_n)}",
         f"  Unmatched                     {_fmt_count(match.get('unmatched'), min_cell_n)}",
-        f"  Same-postcode coverage        {_fmt_percent(match.get('postcode_coverage'))}",
-        f"  Coverage incl. fallback       {_fmt_percent(match.get('coverage'))}",
+        f"  Exact-name coverage           {_fmt_percent(match.get('coverage'))}",
         "",
         "What this run did",
         "  - Every valid row was sent through matching, with no age, status,",
@@ -664,7 +675,8 @@ def _write_matching_summary(path: str | Path, context: dict[str, Any]) -> None:
         "  - It created a separate file containing 1,000 matching pairs.",
         "",
         "Important limits",
-        "  - A high match rate does not prove that the proposed matches are correct.",
+        "  - A match requires one unique, date-valid exact normalized name.",
+        "  - Postcode is reported but never creates or chooses a match.",
         "  - The free Companies House file contains a present-day live-company snapshot.",
         "  - Address changes, dissolved companies and non-company defendants can remain unmatched.",
         "  - RT permission is required before any result leaves.",

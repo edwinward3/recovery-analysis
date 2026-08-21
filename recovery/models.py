@@ -276,7 +276,7 @@ class ModelEvaluation:
 
     def to_public_dict(self) -> dict[str, Any]:
         return {
-            "schema_version": 1,
+            "schema_version": 2,
             "cohort": self.cohort.to_public_dict(),
             "training_prevalence": self.training_prevalence,
             "champions": dict(self.champions),
@@ -305,8 +305,7 @@ def prepare_model_cohort(
         ``Jurisdiction``; ``Amount`` is optional.
     matches:
         One row per ID with ``matched_company_number``, matcher-native ``tier``
-        (or the supported ``match_tier`` alias), and any Companies House/
-        incorporation/snapshot feature columns.
+        and any Companies House/incorporation/snapshot feature columns.
     observation_date:
         One RT-confirmed extract-level status date. It is never inferred from
         per-row insertion dates.
@@ -319,6 +318,29 @@ def prepare_model_cohort(
     model_matches = _select_model_matches(matches)
     _require_columns(model_matches, _REQUIRED_MATCH_COLUMNS, "matches")
     _require_unique(model_matches, "ID", "matches")
+    raw_tiers = model_matches["tier"].astype("string").str.strip().str.casefold()
+    if raw_tiers.isna().any() or raw_tiers.eq("").any():
+        raise ModelDataError("matches.tier contains missing values")
+    tiers = set(raw_tiers)
+    unsupported_tiers = tiers - {"exact_unique", "unmatched"}
+    if unsupported_tiers:
+        raise ModelDataError(
+            f"matches contain unsupported legacy tier(s): {sorted(unsupported_tiers)}"
+        )
+    exact_rows = raw_tiers.eq("exact_unique")
+    company_numbers = model_matches["matched_company_number"].astype("string").str.strip()
+    if (exact_rows & (company_numbers.isna() | company_numbers.eq(""))).any():
+        raise ModelDataError("exact_unique matches require a company number")
+    match_incorporation_col = _first_present(
+        model_matches.columns, _INCORPORATION_ALIASES
+    )
+    if match_incorporation_col is None:
+        raise ModelDataError("exact_unique matches require an incorporation date column")
+    match_incorporation = pd.to_datetime(
+        model_matches[match_incorporation_col], errors="coerce", dayfirst=True
+    )
+    if (exact_rows & match_incorporation.isna()).any():
+        raise ModelDataError("exact_unique matches require a valid incorporation date")
 
     obs = _as_timestamp(observation_date, "observation_date")
     judgment_columns = [
@@ -346,7 +368,9 @@ def prepare_model_cohort(
         == "england and wales"
     )
     labelled = merged["JudgmentStatus"].isin(("Satisfied", "Unsatisfied"))
-    auto = merged["tier"].astype(str).str.strip().str.casefold() == "auto"
+    exact_unique = (
+        merged["tier"].astype(str).str.strip().str.casefold() == "exact_unique"
+    )
     has_company = merged["matched_company_number"].notna() & (
         merged["matched_company_number"].astype(str).str.strip() != ""
     )
@@ -363,13 +387,22 @@ def prepare_model_cohort(
             "seasoned_12_36_corporate_ew_labelled": int(
                 (corporate & ew & labelled & seasoned).sum()
             ),
-            "auto_matched_eligible": int(
-                (corporate & ew & labelled & seasoned & auto & has_company).sum()
+            "exact_unique_matched_eligible": int(
+                (
+                    corporate
+                    & ew
+                    & labelled
+                    & seasoned
+                    & exact_unique
+                    & has_company
+                ).sum()
             ),
         }
     )
 
-    eligible = merged.loc[corporate & ew & labelled & seasoned & auto & has_company].copy()
+    eligible = merged.loc[
+        corporate & ew & labelled & seasoned & exact_unique & has_company
+    ].copy()
     eligible["matched_company_number"] = (
         eligible["matched_company_number"].astype(str).str.strip()
     )
@@ -400,7 +433,13 @@ def prepare_model_cohort(
         eligible["_amount_numeric"].fillna(0.0).clip(lower=0.0)
     )
 
-    history_filter = corporate & ew & auto & has_company & merged["JudgmentDate"].notna()
+    history_filter = (
+        corporate
+        & ew
+        & exact_unique
+        & has_company
+        & merged["JudgmentDate"].notna()
+    )
     history = merged.loc[
         history_filter,
         ["matched_company_number", "JudgmentDate", "_amount_numeric"],
@@ -1127,20 +1166,16 @@ def _add_snapshot_features(targets: pd.DataFrame, observation_date: pd.Timestamp
 
 
 def _select_model_matches(matches: pd.DataFrame) -> pd.DataFrame:
-    """Keep only modelling fields and canonicalize the supported tier alias."""
+    """Keep only the current matcher fields needed by modelling."""
 
-    has_tier = "tier" in matches.columns
-    has_alias = "match_tier" in matches.columns
-    if has_tier and has_alias:
-        canonical = matches["tier"].astype(str).str.strip().str.casefold()
-        alias = matches["match_tier"].astype(str).str.strip().str.casefold()
-        if not canonical.equals(alias):
-            raise ModelDataError("matches.tier and matches.match_tier disagree")
-    tier_column = "tier" if has_tier else "match_tier"
+    if "match_tier" in matches.columns:
+        raise ModelDataError("legacy matches.match_tier is not supported")
+    if "tier" not in matches.columns:
+        raise ModelDataError("matches is missing required column: tier")
     wanted = [
         "ID",
         "matched_company_number",
-        tier_column,
+        "tier",
         *(
             column
             for column in _MODEL_MATCH_OPTIONAL_COLUMNS
@@ -1148,10 +1183,7 @@ def _select_model_matches(matches: pd.DataFrame) -> pd.DataFrame:
         ),
     ]
     present = list(dict.fromkeys(column for column in wanted if column in matches.columns))
-    result = matches.loc[:, present].copy()
-    if tier_column == "match_tier" and "match_tier" in result.columns:
-        result = result.rename(columns={"match_tier": "tier"})
-    return result
+    return matches.loc[:, present].copy()
 
 
 def _fit_logistic(

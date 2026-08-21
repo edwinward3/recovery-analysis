@@ -10,7 +10,6 @@ import re
 import unicodedata
 
 import pandas as pd
-from rapidfuzz import fuzz
 
 from .config import Settings
 from .data import iter_ch_chunks
@@ -35,7 +34,7 @@ CH_CURRENT_SNAPSHOT_COLUMNS: tuple[str, ...] = (
     "Mortgages.NumMortSatisfied",
 )
 
-MATCH_TIERS: tuple[str, ...] = ("auto", "review", "fallback_review", "unmatched")
+MATCH_TIERS: tuple[str, ...] = ("exact_unique", "unmatched")
 
 _LEGAL_SUFFIXES: tuple[tuple[str, ...], ...] = tuple(
     tuple(value.split())
@@ -116,10 +115,16 @@ class CompanyRecord:
     postcode: str
     incorporation_date: pd.Timestamp | None
     names: tuple[NamePeriod, ...]
+    all_normalized_names: frozenset[str]
+    name_history_complete: bool
     current_snapshot: Mapping[str, str]
 
     def valid_names(self, when: pd.Timestamp) -> tuple[NamePeriod, ...]:
-        if self.incorporation_date is not None and when < self.incorporation_date:
+        if (
+            self.incorporation_date is None
+            or not self.name_history_complete
+            or when < self.incorporation_date
+        ):
             return ()
         return tuple(name for name in self.names if name.valid_on(when))
 
@@ -127,7 +132,6 @@ class CompanyRecord:
 @dataclass(frozen=True, slots=True)
 class CHIndex:
     companies: Mapping[str, CompanyRecord]
-    by_postcode: Mapping[str, tuple[str, ...]]
     by_exact_name: Mapping[str, tuple[str, ...]]
     stats: Mapping[str, object]
 
@@ -169,12 +173,18 @@ def _standardise_ch_headers(frame: pd.DataFrame) -> pd.DataFrame:
 
 
 def _parse_dates(series: pd.Series) -> pd.Series:
-    return pd.to_datetime(
-        series.astype("string").str.strip(),
-        format="mixed",
-        dayfirst=True,
-        errors="coerce",
-    ).dt.normalize()
+    raw = series.astype("string").fillna("").str.strip()
+    iso = raw.str.fullmatch(r"\d{4}-\d{2}-\d{2}(?:[ T].*)?", na=False)
+    parsed = pd.Series(pd.NaT, index=series.index, dtype="datetime64[ns]")
+    if iso.any():
+        parsed.loc[iso] = pd.to_datetime(
+            raw.loc[iso], format="ISO8601", errors="coerce"
+        ).astype("datetime64[ns]")
+    if (~iso).any():
+        parsed.loc[~iso] = pd.to_datetime(
+            raw.loc[~iso], format="mixed", dayfirst=True, errors="coerce"
+        ).astype("datetime64[ns]")
+    return parsed.dt.normalize()
 
 
 def _name_periods(
@@ -215,8 +225,8 @@ def _name_periods(
     return tuple(names), undated, invalid_dates
 
 
-def _relevant_values(judgments: pd.DataFrame) -> tuple[set[str], set[str]]:
-    required = {"Defendant Company Name", "Defendant_Postcode"}
+def _relevant_names(judgments: pd.DataFrame) -> set[str]:
+    required = {"Defendant Company Name"}
     missing = required - set(judgments.columns)
     if missing:
         raise ValueError(f"judgment data missing matching column(s): {sorted(missing)}")
@@ -228,12 +238,7 @@ def _relevant_values(judgments: pd.DataFrame) -> tuple[set[str], set[str]]:
                 for normalized in judgments[column].map(normalize_name).unique().tolist()
                 if normalized
             )
-    postcodes = {
-        normalized
-        for normalized in judgments["Defendant_Postcode"].map(normalize_postcode).unique().tolist()
-        if normalized
-    }
-    return names, postcodes
+    return names
 
 
 def build_relevant_ch_index(
@@ -242,9 +247,9 @@ def build_relevant_ch_index(
     *,
     chunksize: int = 100_000,
 ) -> CHIndex:
-    """Stream CH once, retaining only exact-name or exact-postcode candidates."""
+    """Stream CH once, retaining only exact normalized-name candidates."""
 
-    relevant_names, relevant_postcodes = _relevant_values(judgments)
+    relevant_names = _relevant_names(judgments)
     companies: dict[str, CompanyRecord] = {}
     rows_read = 0
     rows_retained = 0
@@ -276,8 +281,7 @@ def build_relevant_ch_index(
         rows_read += len(chunk)
 
         current_norm = chunk["CompanyName"].map(normalize_name)
-        postcode_norm = chunk["RegAddress.PostCode"].map(normalize_postcode)
-        retain = current_norm.isin(relevant_names) | postcode_norm.isin(relevant_postcodes)
+        retain = current_norm.isin(relevant_names)
         former_name_columns = sorted(
             column
             for column in chunk.columns
@@ -295,7 +299,7 @@ def build_relevant_ch_index(
 
         kept = chunk.loc[retain].copy()
         rows_retained += len(kept)
-        kept["__postcode"] = postcode_norm.loc[retain].values
+        kept["__postcode"] = kept["RegAddress.PostCode"].map(normalize_postcode)
         kept["__incorporation"] = _parse_dates(kept["IncorporationDate"])
         previous_numbers = sorted(
             {
@@ -342,6 +346,15 @@ def build_relevant_ch_index(
                 postcode=str(arrays["__postcode"][position]),
                 incorporation_date=incorporation,
                 names=names,
+                all_normalized_names=frozenset(
+                    normalized
+                    for normalized in (
+                        normalize_name(arrays["CompanyName"][position]),
+                        *(normalize_name(raw_name) for raw_name, _ in former),
+                    )
+                    if normalized
+                ),
+                name_history_complete=undated == 0 and invalid == 0,
                 current_snapshot=current_snapshot,
             )
             if company_number in companies:
@@ -356,17 +369,11 @@ def build_relevant_ch_index(
     if first_chunk:
         raise ValueError("Companies House file contains no readable rows")
 
-    postcode_index: dict[str, list[str]] = {}
     exact_name_index: dict[str, list[str]] = {}
     for company_number, record in companies.items():
-        if record.postcode:
-            postcode_index.setdefault(record.postcode, []).append(company_number)
-        for normalized in {name.normalized_name for name in record.names if name.normalized_name}:
+        for normalized in record.all_normalized_names:
             exact_name_index.setdefault(normalized, []).append(company_number)
 
-    by_postcode = {
-        key: tuple(sorted(set(values))) for key, values in postcode_index.items()
-    }
     by_exact_name = {
         key: tuple(sorted(set(values))) for key, values in exact_name_index.items()
     }
@@ -375,13 +382,12 @@ def build_relevant_ch_index(
         "ch_rows_retained": int(rows_retained),
         "companies_retained": int(len(companies)),
         "duplicate_company_rows": int(duplicate_company_rows),
-        "undated_former_names_ignored": int(undated_former_names),
-        "invalid_former_dates_ignored": int(invalid_former_dates),
-        "relevant_postcodes": int(len(relevant_postcodes)),
+        "undated_former_names": int(undated_former_names),
+        "invalid_former_dates": int(invalid_former_dates),
         "relevant_names": int(len(relevant_names)),
         "analysis_fingerprint": analysis_digest.hexdigest(),
     }
-    return CHIndex(companies, by_postcode, by_exact_name, stats)
+    return CHIndex(companies, by_exact_name, stats)
 
 
 # Match each RT row
@@ -389,51 +395,36 @@ def build_relevant_ch_index(
 @dataclass(frozen=True, slots=True)
 class _Candidate:
     record: CompanyRecord
-    score: float
     source_field: str
-    source_name: str
     matched_period: NamePeriod
-
-
-def _best_candidate(
-    record: CompanyRecord,
-    source_names: Sequence[tuple[str, str, str]],
-    judgment_date: pd.Timestamp,
-) -> _Candidate | None:
-    valid_names = record.valid_names(judgment_date)
-    if not valid_names:
-        return None
-    best: tuple[float, str, str, NamePeriod] | None = None
-    for source_field, raw_source, normalized_source in source_names:
-        for period in valid_names:
-            score = float(fuzz.WRatio(normalized_source, period.normalized_name)) / 100.0
-            option = (score, source_field, raw_source, period)
-            if best is None or score > best[0] or (
-                score == best[0]
-                and (source_field, period.kind, period.normalized_name)
-                < (best[1], best[3].kind, best[3].normalized_name)
-            ):
-                best = option
-    if best is None:
-        return None
-    return _Candidate(record, best[0], best[1], best[2], best[3])
 
 
 def _unique_exact_candidate(
     index: CHIndex,
     source_names: Sequence[tuple[str, str, str]],
     judgment_date: pd.Timestamp,
-) -> tuple[_Candidate | None, int]:
+) -> tuple[_Candidate | None, int, int, int, int]:
     exact: dict[str, _Candidate] = {}
-    for source_field, raw_source, normalized_source in source_names:
+    rejected_post_incorporation: set[str] = set()
+    missing_incorporation: set[str] = set()
+    incomplete_name_history: set[str] = set()
+    for source_field, _raw_source, normalized_source in source_names:
         for company_number in index.by_exact_name.get(normalized_source, ()):
             record = index.companies[company_number]
-            # Without an incorporation date, the company may not yet have existed.
-            if record.incorporation_date is None or judgment_date < record.incorporation_date:
+            if record.incorporation_date is None:
+                missing_incorporation.add(company_number)
+                continue
+            if not record.name_history_complete:
+                incomplete_name_history.add(company_number)
+                continue
+            if (
+                judgment_date < record.incorporation_date
+            ):
+                rejected_post_incorporation.add(company_number)
                 continue
             for period in record.valid_names(judgment_date):
                 if period.normalized_name == normalized_source:
-                    candidate = _Candidate(record, 1.0, source_field, raw_source, period)
+                    candidate = _Candidate(record, source_field, period)
                     existing = exact.get(company_number)
                     if existing is None or (source_field, period.kind) < (
                         existing.source_field,
@@ -441,15 +432,28 @@ def _unique_exact_candidate(
                     ):
                         exact[company_number] = candidate
                     break
-    if len(exact) != 1:
-        return None, len(exact)
-    return next(iter(exact.values())), 1
+    unresolved = missing_incorporation | incomplete_name_history
+    candidate_count = len(exact) + len(unresolved)
+    if len(exact) != 1 or unresolved:
+        return (
+            None,
+            candidate_count,
+            len(rejected_post_incorporation),
+            len(missing_incorporation),
+            len(incomplete_name_history),
+        )
+    return (
+        next(iter(exact.values())),
+        1,
+        len(rejected_post_incorporation),
+        0,
+        0,
+    )
 
 
 def match_judgments(
     judgments: pd.DataFrame,
     index: CHIndex,
-    settings: Settings,
 ) -> pd.DataFrame:
     """Return one deterministic match decision per RT judgment."""
 
@@ -502,60 +506,37 @@ def match_judgments(
         )
         judgment_date = pd.Timestamp(row_map["_judgment_date"])
         postcode = str(row_map["_postcode"])
-        same_postcode_numbers = index.by_postcode.get(postcode, ()) if postcode else ()
-        candidates: list[_Candidate] = []
-        rejected_post_incorporation = 0
-        for company_number in same_postcode_numbers:
-            record = index.companies[company_number]
-            if record.incorporation_date is not None and judgment_date < record.incorporation_date:
-                rejected_post_incorporation += 1
-                continue
-            candidate = _best_candidate(record, source_names, judgment_date)
-            if candidate is not None:
-                candidates.append(candidate)
-        candidates.sort(key=lambda value: (-value.score, value.record.company_number))
-        top = candidates[0] if candidates else None
-        runner_up = candidates[1].score if len(candidates) > 1 else 0.0
-        margin = top.score - runner_up if top is not None else 0.0
-
-        exact, exact_count = _unique_exact_candidate(index, source_names, judgment_date)
+        (
+            exact,
+            exact_count,
+            rejected_post_incorporation,
+            missing_incorporation,
+            incomplete_name_history,
+        ) = _unique_exact_candidate(index, source_names, judgment_date)
         tier = "unmatched"
         selected: _Candidate | None = None
         reason: str
-        if (
-            top is not None
-            and top.score >= settings.auto_threshold
-            and margin >= settings.auto_margin
-            and top.record.incorporation_date is not None
-        ):
-            tier = "auto"
-            selected = top
-            reason = "postcode_score_and_margin"
-        elif exact is not None and exact.record.postcode != postcode:
-            tier = "fallback_review"
+        if exact is not None:
+            tier = "exact_unique"
             selected = exact
-            reason = "unique_date_valid_exact_name"
-        elif top is not None and top.score >= settings.review_threshold:
-            tier = "review"
-            selected = top
-            if top.record.incorporation_date is None:
-                reason = "incorporation_date_missing"
-            elif margin < settings.auto_margin:
-                reason = "ambiguous_postcode_candidates"
+            if not postcode:
+                reason = "unique_exact_name_postcode_missing"
+            elif exact.record.postcode == postcode:
+                reason = "unique_exact_name_postcode_agrees"
             else:
-                reason = "score_below_auto"
+                reason = "unique_exact_name_postcode_differs"
         elif not source_names:
             reason = "missing_name"
-        elif not postcode:
-            reason = "missing_postcode_no_unique_exact_name"
-        elif not same_postcode_numbers:
-            reason = "no_postcode_candidate_no_unique_exact_name"
-        elif rejected_post_incorporation and not candidates:
-            reason = "all_postcode_candidates_post_incorporation"
         elif exact_count > 1:
-            reason = "ambiguous_exact_name_and_below_review"
+            reason = "exact_name_not_uniquely_verifiable"
+        elif rejected_post_incorporation:
+            reason = "exact_name_post_incorporation"
+        elif missing_incorporation:
+            reason = "exact_name_missing_incorporation_date"
+        elif incomplete_name_history:
+            reason = "exact_name_incomplete_name_history"
         else:
-            reason = "best_postcode_score_below_review"
+            reason = "no_date_valid_unique_exact_name"
 
         base = {
             "ID": str(row_map["ID"]),
@@ -567,16 +548,11 @@ def match_judgments(
             "matched_name": selected.matched_period.raw_name if selected else "",
             "matched_name_kind": selected.matched_period.kind if selected else "",
             "matched_on": selected.source_field if selected else "",
-            "score": round(float(selected.score if selected else (top.score if top else 0.0)), 6),
-            "runner_up_score": round(float(runner_up), 6),
-            "margin": round(float(margin), 6),
             "postcode_agrees": bool(selected and postcode and selected.record.postcode == postcode),
-            "postcode_candidate_count": int(len(candidates)),
             "exact_name_candidate_count": int(exact_count),
             "rejected_post_incorporation": int(rejected_post_incorporation),
-            "incorporation_date_missing": bool(
-                selected is not None and selected.record.incorporation_date is None
-            ),
+            "incorporation_date_missing": bool(missing_incorporation),
+            "name_history_incomplete": bool(incomplete_name_history),
             "source_company_name": row_map["Defendant Company Name"],
             "source_trading_name": row_map["Defendant Trading Name"],
             "source_postcode": row_map["Defendant_Postcode"],
@@ -703,6 +679,15 @@ def match_diagnostics(
                     ).sum()
                 ),
             },
+            {
+                "guard": "judgments_blocked_by_incomplete_name_history",
+                "rows": int(
+                    joined.get(
+                        "name_history_incomplete",
+                        pd.Series(False, index=joined.index),
+                    ).fillna(False).astype(bool).sum()
+                ),
+            },
         ]
     )
     return {
@@ -732,7 +717,7 @@ def _equal_probability_systematic_sample(
     """Take an equal-probability sample spread across ordered match strata.
 
     Sorting by the composite stratum before a random-start systematic draw
-    gives the requested spread across score, name source, vintage and method.
+    gives the requested spread across name source, vintage and method.
     Every row within the tier has the same inclusion probability, so unweighted
     precision is unbiased. Wilson is the declared approximation because the
     systematic selections are not independent.
@@ -759,13 +744,8 @@ def pair_sample(
     *,
     seed: int | None = None,
 ) -> pd.DataFrame:
-    """Select 1,000 proposed matches, spread across the three matching tiers."""
+    """Select 1,000 exact-name matches across name, date and postcode groups."""
 
-    desired = {
-        "auto": settings.sample_auto,
-        "review": settings.sample_review,
-        "fallback_review": settings.sample_fallback,
-    }
     sampling_columns = [
         "ID",
         "tier",
@@ -773,7 +753,7 @@ def pair_sample(
         "matched_company_number",
         "matched_name_kind",
         "matched_on",
-        "score",
+        "postcode_agrees",
     ]
     canonical_source_columns = (
         "source_company_name",
@@ -784,44 +764,26 @@ def pair_sample(
     if missing:
         raise ValueError(f"matches missing pair-sample column(s): {sorted(missing)}")
 
-    accepted_mask = matches["tier"].isin(desired)
+    accepted_mask = matches["tier"].eq("exact_unique")
     accepted = matches.loc[accepted_mask, sampling_columns].copy()
     accepted["__match_position"] = accepted_mask.to_numpy().nonzero()[0]
     if accepted["ID"].astype(str).duplicated().any():
         raise ValueError("matches contain duplicate ID values")
-    available = {tier: int(accepted["tier"].eq(tier).sum()) for tier in desired}
-    target = min(sum(desired.values()), sum(available.values()))
-    allocation = {tier: min(desired[tier], available[tier]) for tier in desired}
-    deficit = target - sum(allocation.values())
-    tier_order = {tier: position for position, tier in enumerate(desired)}
-    while deficit:
-        choices = [tier for tier in desired if available[tier] > allocation[tier]]
-        if not choices:
-            break
-        tier = max(choices, key=lambda value: (
-            available[value] - allocation[value], -tier_order[value]
-        ))
-        take = min(deficit, available[tier] - allocation[tier])
-        allocation[tier] += take
-        deficit -= take
-
+    if len(accepted) < settings.sample_size:
+        raise ValueError(
+            f"only {len(accepted):,} unique exact-name matches are available; "
+            f"{settings.sample_size:,} are required for the example file"
+        )
     actual_seed = settings.locked_seed if seed is None else int(seed)
     dates = judgments[["ID", "JudgmentDate"]].copy()
     dates["JudgmentDate"] = pd.to_datetime(
         dates["JudgmentDate"], format="mixed", dayfirst=True, errors="coerce"
     )
     accepted = accepted.merge(dates, on="ID", how="left", validate="one_to_one")
-    accepted["__score_band"] = pd.cut(
-        pd.to_numeric(accepted["score"], errors="coerce"),
-        bins=[-0.001, settings.review_threshold, settings.auto_threshold, 0.95, 1.001],
-        labels=["below_review", "review", "strong", "exact"],
-        include_lowest=True,
-        right=False,
-    ).astype("string").fillna("missing")
     accepted["__vintage"] = accepted["JudgmentDate"].dt.year.astype("Int64").astype("string")
     accepted["__stratum"] = (
         accepted[
-            ["__score_band", "matched_on", "matched_name_kind", "reason", "__vintage"]
+            ["matched_on", "matched_name_kind", "reason", "postcode_agrees", "__vintage"]
         ]
         .astype("string")
         .fillna("missing")
@@ -833,16 +795,12 @@ def pair_sample(
             accepted["tier"], accepted["ID"], accepted["matched_company_number"]
         )
     ]
-    pieces: list[pd.DataFrame] = []
-    for tier in desired:
-        piece = _equal_probability_systematic_sample(
-            accepted[accepted["tier"].eq(tier)].copy(),
-            allocation[tier],
-            seed=actual_seed,
-            tier=tier,
-        )
-        pieces.append(piece)
-    selected = pd.concat(pieces, ignore_index=True) if pieces else accepted.head(0)
+    selected = _equal_probability_systematic_sample(
+        accepted,
+        settings.sample_size,
+        seed=actual_seed,
+        tier="exact_unique",
+    )
     selected_positions = selected["__match_position"].astype(int).to_numpy()
     sampled = matches.iloc[selected_positions].copy().reset_index(drop=True)
     sampled["JudgmentDate"] = selected["JudgmentDate"].to_numpy()
@@ -856,7 +814,6 @@ def pair_sample(
         columns=[
             *canonical_source_columns,
             "__rank",
-            "__score_band",
             "__vintage",
             "__stratum",
         ],
@@ -864,10 +821,7 @@ def pair_sample(
     )
     for column in output_source_columns:
         sampled[column] = source[column].to_numpy()
-    sampled["__tier_order"] = sampled["tier"].map(tier_order)
-    sampled = sampled.sort_values(["__tier_order", "ID"], kind="stable").drop(
-        columns="__tier_order"
-    ).reset_index(drop=True)
+    sampled = sampled.sort_values("ID", kind="stable").reset_index(drop=True)
     sampled["match_method"] = sampled["reason"]
     columns = [
         "ID",
@@ -880,12 +834,10 @@ def pair_sample(
         "matched_company_number",
         "matched_company_postcode",
         "IncorporationDate",
-        "score",
-        "runner_up_score",
-        "margin",
         "tier",
         "match_method",
         "matched_on",
+        "postcode_agrees",
         "JudgmentDate",
     ]
     return sampled.loc[:, [column for column in columns if column in sampled]].copy()

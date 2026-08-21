@@ -41,11 +41,11 @@ from recovery.models import (
 )
 
 
-def _match_row(identifier: str, company: str, tier: str = "auto") -> dict:
+def _match_row(identifier: str, company: str, tier: str = "exact_unique") -> dict:
     return {
         "ID": identifier,
         "matched_company_number": company,
-        "match_tier": tier,
+        "tier": tier,
         "incorporation_date": "01/01/2010",
         "any_charges": 0,
         "n_charges": 0,
@@ -67,7 +67,7 @@ class CohortTests(TestCase):
             # target is the earliest eligible judgment for company A.
             ("A-same-day", "01/01/2025", "Cancelled", "Corporate", "England and Wales", 30),
             ("A-later", "01/02/2025", "Unsatisfied", "Corporate", "England and Wales", 200),
-            ("B-review", "01/01/2025", "Satisfied", "Corporate", "England and Wales", 100),
+            ("B-unmatched", "01/01/2025", "Satisfied", "Corporate", "England and Wales", 100),
             ("C-noncorp", "01/01/2025", "Satisfied", "Non-Corporate", "England and Wales", 100),
             ("D-scotland", "01/01/2025", "Satisfied", "Corporate", "Scotland", 100),
             ("E-recent", "01/01/2026", "Satisfied", "Corporate", "England and Wales", 100),
@@ -89,7 +89,7 @@ class CohortTests(TestCase):
                 _match_row(
                     identifier,
                     "A" if identifier.startswith("A-") else identifier,
-                    "review" if identifier == "B-review" else "auto",
+                    "unmatched" if identifier == "B-unmatched" else "exact_unique",
                 )
                 for identifier in judgments["ID"]
             ]
@@ -126,7 +126,7 @@ class CohortTests(TestCase):
                 {
                     "ID": "J1",
                     "matched_company_number": "00000001",
-                    "tier": "auto",
+                    "tier": "exact_unique",
                     "IncorporationDate": "01/01/2010",
                     "Mortgages.NumMortCharges": "4",
                     "Mortgages.NumMortSatisfied": "1",
@@ -143,12 +143,12 @@ class CohortTests(TestCase):
         self.assertEqual(float(row["snapshot_accounts_overdue"]), 1.0)
         self.assertEqual(float(row["snapshot_company_status_active"]), 1.0)
 
-    def test_model_match_selection_is_narrow_and_preserves_tier_alias(self) -> None:
+    def test_model_match_selection_is_narrow(self) -> None:
         matches = pd.DataFrame(
             {
                 "ID": ["J1"],
                 "matched_company_number": ["00000001"],
-                "match_tier": [" auto "],
+                "tier": [" exact_unique "],
                 "IncorporationDate": ["01/01/2010"],
                 "Mortgages.NumMortCharges": ["2"],
                 "source_company_name": ["MUST NOT ENTER MODEL MERGE"],
@@ -168,19 +168,50 @@ class CohortTests(TestCase):
                 "Mortgages.NumMortCharges",
             ],
         )
-        self.assertEqual(selected.loc[0, "tier"], " auto ")
+        self.assertEqual(selected.loc[0, "tier"], " exact_unique ")
 
-    def test_disagreeing_tier_aliases_are_rejected(self) -> None:
+    def test_legacy_tier_alias_is_rejected(self) -> None:
         matches = pd.DataFrame(
             {
                 "ID": ["J1"],
                 "matched_company_number": ["00000001"],
-                "tier": ["auto"],
-                "match_tier": ["review"],
+                "match_tier": ["auto"],
             }
         )
-        with self.assertRaisesRegex(ModelDataError, "disagree"):
+        with self.assertRaisesRegex(ModelDataError, "legacy"):
             _select_model_matches(matches)
+
+    def test_model_rejects_legacy_or_incomplete_exact_matches(self) -> None:
+        judgments = pd.DataFrame(
+            [
+                {
+                    "ID": "J1",
+                    "JudgmentDate": "01/01/2025",
+                    "JudgmentStatus": "Satisfied",
+                    "DefendantType": "Corporate",
+                    "Jurisdiction": "England and Wales",
+                    "Amount": 100,
+                }
+            ]
+        )
+        cases = [
+            ({**_match_row("J1", "C1"), "tier": "auto"}, "legacy tier"),
+            ({**_match_row("J1", "C1"), "tier": ""}, "missing values"),
+            (_match_row("J1", ""), "company number"),
+            (
+                {**_match_row("J1", "C1"), "incorporation_date": ""},
+                "valid incorporation date",
+            ),
+        ]
+        for match, message in cases:
+            with self.subTest(message=message):
+                with self.assertRaisesRegex(ModelDataError, message):
+                    prepare_model_cohort(
+                        judgments,
+                        pd.DataFrame([match]),
+                        "2026-06-01",
+                        Settings(),
+                    )
 
     def test_chronological_split_is_common_and_company_unique(self) -> None:
         dates = pd.date_range("2020-01-01", periods=20, freq="D")
@@ -517,7 +548,7 @@ class EndToEndTests(TestCase):
             second_json = Path(second["evaluation"]).read_text(encoding="utf-8")
             self.assertEqual(first_json, second_json)
             payload = json.loads(first_json)
-            self.assertEqual(payload["schema_version"], 1)
+            self.assertEqual(payload["schema_version"], 2)
             self.assertNotIn("match_audit", payload)
             self.assertFalse(hasattr(evaluation, "match_precision"))
             self.assertFalse(hasattr(evaluation, "match_precision_lower_ci"))

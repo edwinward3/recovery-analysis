@@ -43,7 +43,7 @@ jobs:
 
       - name: Write XLSX and ZIP inputs with awkward paths
         shell: pwsh
-        run: python -m recovery.selftest --write-inputs "ci inputs !" --n-companies 1600
+        run: python -m recovery.selftest --write-inputs "ci inputs !" --n-companies 2400 --no-prior-rows
 
       - name: Run both analysis stages through RUN.bat
         shell: pwsh
@@ -51,20 +51,13 @@ jobs:
           RECOVERY_NO_PAUSE: "1"
         run: |
           @(
-            "1",
             '"ci inputs !\synthetic judgments.xlsx"',
             '"ci inputs !\BasicCompanyDataAsOneFile-2026-06-01.zip"',
             ""
           ) | Set-Content "ci inputs !\launcher answers.txt" -Encoding ascii
           cmd.exe /d /c 'RUN.bat < "ci inputs !\launcher answers.txt"'
           if ($LASTEXITCODE -ne 0) { throw "diagnostic RUN.bat failed with exit code $LASTEXITCODE" }
-          @(
-            "2",
-            '"ci inputs !\synthetic judgments.xlsx"',
-            '"ci inputs !\BasicCompanyDataAsOneFile-2026-06-01.zip"',
-            "2026-06-01"
-          ) | Set-Content "ci inputs !\model launcher answers.txt" -Encoding ascii
-          cmd.exe /d /c 'RUN.bat < "ci inputs !\model launcher answers.txt"'
+          & .\RUN.bat locked "ci inputs !\synthetic judgments.xlsx" "ci inputs !\BasicCompanyDataAsOneFile-2026-06-01.zip" 2026-06-01
           if ($LASTEXITCODE -ne 0) { throw "locked RUN.bat failed with exit code $LASTEXITCODE" }
 
       - name: Assert matching-only Run 1 and model Run 2 outputs
@@ -94,6 +87,8 @@ jobs:
             if (-not (Test-Path $pair)) { throw "$($run.Name) pair-example file missing" }
             $pairs = Import-Csv $pair
             if ($pairs.Count -ne 1000) { throw "$($run.Name) pair file has $($pairs.Count) rows, expected 1000" }
+            $pairTiers = @($pairs.tier | Sort-Object -Unique)
+            if ($pairTiers.Count -ne 1 -or $pairTiers[0] -ne "exact_unique") { throw "$($run.Name) pair file contains a non-exact match" }
             if (-not ($pairs | Where-Object { $_.source_company_name -match "ALPHA" } | Select-Object -First 1)) { throw "$($run.Name) planted names missing" }
             $env:CI_RESULTS = $results
             python -c "import os; from recovery.disclosure import validate_egress; validate_egress(os.environ['CI_RESULTS'])"
@@ -137,6 +132,12 @@ jobs:
           if (($diagnosticPairs.ID -join ',') -eq ($lockedPairs.ID -join ',')) { throw "Run 2 pair examples did not change" }
           $truth = Import-Csv "ci inputs !\synthetic_ground_truth.csv"
           if (($truth.corruption_class | Sort-Object -Unique).Count -ne 8) { throw "synthetic corruption classes missing" }
+          $coverage = Import-Csv (Join-Path $diagnostic.FullName "results\E2_match_coverage.csv")
+          $exactRows = [int](($coverage | Where-Object tier -eq "exact_unique").rows)
+          $unmatchedRows = [int](($coverage | Where-Object tier -eq "unmatched").rows)
+          if ($exactRows -ne 1500 -or $unmatchedRows -ne 900) {
+            throw "exact-only matching counts are wrong: exact=$exactRows unmatched=$unmatchedRows"
+          }
 
       - name: Prove setup is cached
         shell: pwsh
@@ -227,6 +228,12 @@ jobs:
             python -c "import os; from pathlib import Path; from recovery.selftest import _assert_pair_truth; _assert_pair_truth(Path(os.environ['SCALE_RUN_ROOT']), Path('scale inputs !/synthetic_ground_truth.csv'))"
             $log = Import-Csv (Join-Path $run.FullName "results\E5_run_log.csv")
             $manifest = Get-Content (Join-Path $run.FullName "results\E5_run_manifest.json") -Raw | ConvertFrom-Json
+            $coverage = Import-Csv (Join-Path $run.FullName "results\E2_match_coverage.csv")
+            $exactRows = [int](($coverage | Where-Object tier -eq "exact_unique").rows)
+            $unmatchedRows = [int](($coverage | Where-Object tier -eq "unmatched").rows)
+            if ($exactRows -ne 312500 -or $unmatchedRows -ne 187500) {
+              throw "$stage exact-only counts are wrong: exact=$exactRows unmatched=$unmatchedRows"
+            }
             $peaks = @($log | ForEach-Object {
               ConvertTo-ValidPeak $_.peak_memory_mb "$stage E5 stage '$($_.stage)'"
             })

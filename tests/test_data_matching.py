@@ -206,49 +206,88 @@ def test_missing_and_malformed_amounts_are_audited_not_silently_zeroed(
     assert audit.invalid_amount_rows == 1
 
 
-def test_exact_ground_truth_ambiguity_and_unique_fallback(tmp_path: Path) -> None:
+def test_only_unique_exact_names_match_and_postcode_never_selects(tmp_path: Path) -> None:
     judgment_rows = [
-        _rt_row("J-AUTO", "Alpha Ltd.", "AA1 1AA"),
-        _rt_row("J-AMBIG", "Beta Limited", "BB1 1BB"),
-        _rt_row("J-FALLBACK", "Gamma Ltd", "ZZ1 1ZZ"),
+        _rt_row("J-EXACT", "Alpha Ltd.", "AA1 1AA"),
+        _rt_row("J-POSTCODE-TRAP", "Omega Trading Ltd", "BB1 1BB"),
+        _rt_row("J-DIFFERENT-POSTCODE", "Gamma Ltd", "ZZ1 1ZZ"),
         _rt_row("J-NOT-UNIQUE", "Delta Limited", "YY1 1YY"),
         _rt_row("J-TRADING", "Unrelated Style", "TT1 1TT", trading_name="Trader Ltd"),
+        _rt_row("J-MISSING-POSTCODE", "Epsilon Limited", ""),
+        _rt_row("J-CONFLICTING-SOURCES", "Alpha Ltd", "AA1 1AA", trading_name="Gamma Ltd"),
+        _rt_row("J-MISSING-INC-COMPETITOR", "Blocker Limited", "BL1 1BL"),
+        _rt_row("J-INCOMPLETE-COMPETITOR", "History Blocker Limited", "HB1 1HB"),
     ]
     company_rows = [
         _ch_row("00000001", "ALPHA LIMITED", "AA1 1AA"),
-        _ch_row("00000002", "BETA LTD", "BB1 1BB"),
-        _ch_row("00000003", "BETA LIMITED", "BB1 1BB"),
+        _ch_row("00000002", "OMEGA TRADING SERVICES LIMITED", "BB1 1BB"),
         _ch_row("00000004", "GAMMA LIMITED", "GG1 1GG"),
-        _ch_row("00000005", "DELTA LTD", "DD1 1DD"),
+        _ch_row("00000005", "DELTA LTD", "YY1 1YY"),
         _ch_row("00000006", "DELTA LIMITED", "DE1 1DE"),
         _ch_row("00000007", "TRADER LIMITED", "TT1 1TT"),
+        _ch_row("00000008", "EPSILON LIMITED", "EE1 1EE"),
+        _ch_row("00000009", "BLOCKER LIMITED", "BL1 1BL"),
+        _ch_row("00000010", "BLOCKER LTD", "BX1 1BX", ""),
+        _ch_row("00000011", "HISTORY BLOCKER LIMITED", "HB1 1HB"),
+        _ch_row(
+            "00000012",
+            "HISTORY BLOCKER LTD",
+            "HX1 1HX",
+            former_name="OLDER HISTORY BLOCKER LIMITED",
+            former_change="",
+        ),
     ]
     judgments, ch_path = _write_inputs(tmp_path, judgment_rows, company_rows)
     index = build_relevant_ch_index(judgments, ch_path, chunksize=2)
-    matched = match_judgments(judgments, index, Settings()).set_index("ID")
+    matched = match_judgments(judgments, index).set_index("ID")
 
     assert index.stats["ch_rows_read"] == len(company_rows)
-    assert matched.loc["J-AUTO", "matched_company_number"] == "00000001"
-    assert matched.loc["J-AUTO", "tier"] == "auto"
-    assert matched.loc["J-AMBIG", "matched_company_number"] == "00000002"
-    assert matched.loc["J-AMBIG", "tier"] == "review"
-    assert matched.loc["J-AMBIG", "margin"] == 0
-    assert matched.loc["J-FALLBACK", "matched_company_number"] == "00000004"
-    assert matched.loc["J-FALLBACK", "tier"] == "fallback_review"
-    assert not matched.loc["J-FALLBACK", "postcode_agrees"]
+    assert matched.loc["J-EXACT", "matched_company_number"] == "00000001"
+    assert matched.loc["J-EXACT", "tier"] == "exact_unique"
+    assert matched.loc["J-POSTCODE-TRAP", "tier"] == "unmatched"
+    assert matched.loc["J-DIFFERENT-POSTCODE", "matched_company_number"] == "00000004"
+    assert matched.loc["J-DIFFERENT-POSTCODE", "tier"] == "exact_unique"
+    assert not matched.loc["J-DIFFERENT-POSTCODE", "postcode_agrees"]
     assert matched.loc["J-NOT-UNIQUE", "tier"] == "unmatched"
     assert matched.loc["J-NOT-UNIQUE", "exact_name_candidate_count"] == 2
     assert matched.loc["J-TRADING", "matched_company_number"] == "00000007"
     assert matched.loc["J-TRADING", "matched_on"] == "trading_name"
+    assert matched.loc["J-MISSING-POSTCODE", "tier"] == "exact_unique"
+    assert matched.loc["J-MISSING-POSTCODE", "reason"] == "unique_exact_name_postcode_missing"
+    assert matched.loc["J-CONFLICTING-SOURCES", "tier"] == "unmatched"
+    assert matched.loc["J-CONFLICTING-SOURCES", "exact_name_candidate_count"] == 2
+    assert matched.loc["J-MISSING-INC-COMPETITOR", "tier"] == "unmatched"
+    assert matched.loc["J-MISSING-INC-COMPETITOR", "incorporation_date_missing"]
+    assert matched.loc["J-INCOMPLETE-COMPETITOR", "tier"] == "unmatched"
+    assert matched.loc["J-INCOMPLETE-COMPETITOR", "name_history_incomplete"]
+
+
+def test_companies_house_iso_dates_are_not_read_day_first(tmp_path: Path) -> None:
+    judgments = pd.DataFrame(
+        [_rt_row("J-ISO", "ISO Example Limited", "IS1 1IS", "03/01/2024")]
+    )
+    companies = pd.DataFrame(
+        [_ch_row("00000100", "ISO EXAMPLE LIMITED", "IS1 1IS", "2024-01-02")]
+    )
+    ch_path = tmp_path / "companies.csv"
+    companies.to_csv(ch_path, index=False)
+
+    index = build_relevant_ch_index(judgments, ch_path)
+    matched = match_judgments(judgments, index).set_index("ID")
+
+    assert index.companies["00000100"].incorporation_date == pd.Timestamp("2024-01-02")
+    assert matched.loc["J-ISO", "tier"] == "exact_unique"
 
 
 def test_date_valid_former_names_and_incorporation_guard(tmp_path: Path) -> None:
     judgment_rows = [
         _rt_row("J-FORMER", "Old Echo Limited", "EE1 1EE", "01/06/2020"),
         _rt_row("J-CURRENT", "New Echo Limited", "EE1 1EE", "01/06/2022"),
+        _rt_row("J-CURRENT-EARLY", "New Echo Limited", "EE1 1EE", "01/06/2020"),
         _rt_row("J-WRONG-DATE", "Old Echo Limited", "EE1 1EE", "01/06/2022"),
         _rt_row("J-PRE-INC", "Future Limited", "FF1 1FF", "01/01/2010"),
         _rt_row("J-NO-INC", "No Date Limited", "NN1 1NN", "01/01/2024"),
+        _rt_row("J-INCOMPLETE-HISTORY", "Incomplete New Limited", "II1 1II", "01/01/2024"),
     ]
     company_rows = [
         _ch_row(
@@ -261,30 +300,39 @@ def test_date_valid_former_names_and_incorporation_guard(tmp_path: Path) -> None
         ),
         _ch_row("10000002", "FUTURE LIMITED", "FF1 1FF", "01/01/2011"),
         _ch_row("10000003", "NO DATE LIMITED", "NN1 1NN", ""),
+        _ch_row(
+            "10000004",
+            "INCOMPLETE NEW LIMITED",
+            "II1 1II",
+            "01/01/2010",
+            former_name="INCOMPLETE OLD LIMITED",
+            former_change="",
+        ),
     ]
     judgments, ch_path = _write_inputs(tmp_path, judgment_rows, company_rows, zipped=False)
     matched = match_judgments(
         judgments,
         build_relevant_ch_index(judgments, ch_path, chunksize=2),
-        Settings(),
     ).set_index("ID")
 
     assert matched.loc["J-FORMER", "matched_company_number"] == "10000001"
     assert matched.loc["J-FORMER", "matched_name_kind"] == "former"
-    assert matched.loc["J-FORMER", "tier"] == "auto"
+    assert matched.loc["J-FORMER", "tier"] == "exact_unique"
     assert matched.loc["J-CURRENT", "matched_name_kind"] == "current"
-    assert matched.loc["J-CURRENT", "tier"] == "auto"
+    assert matched.loc["J-CURRENT", "tier"] == "exact_unique"
+    assert matched.loc["J-CURRENT-EARLY", "tier"] == "unmatched"
     assert matched.loc["J-WRONG-DATE", "tier"] == "unmatched"
     assert matched.loc["J-PRE-INC", "tier"] == "unmatched"
     assert matched.loc["J-PRE-INC", "rejected_post_incorporation"] == 1
-    assert matched.loc["J-NO-INC", "tier"] == "review"
-    assert matched.loc["J-NO-INC", "reason"] == "incorporation_date_missing"
+    assert matched.loc["J-NO-INC", "tier"] == "unmatched"
+    assert matched.loc["J-NO-INC", "reason"] == "exact_name_missing_incorporation_date"
     assert matched.loc["J-NO-INC", "incorporation_date_missing"]
+    assert matched.loc["J-INCOMPLETE-HISTORY", "tier"] == "unmatched"
 
 
-def test_diagnostics_are_aggregate_and_sample_is_deterministic_with_redistribution() -> None:
+def test_diagnostics_are_aggregate_and_sample_is_deterministic() -> None:
     settings = Settings()
-    tiers = ["auto"] * 600 + ["review"] * 400 + ["fallback_review"] * 50
+    tiers = ["exact_unique"] * 1_050
     ids = [f"J-{position:04d}" for position in range(len(tiers))]
     judgments = pd.DataFrame(
         {
@@ -307,7 +355,7 @@ def test_diagnostics_are_aggregate_and_sample_is_deterministic_with_redistributi
             "matched_name": [f"MATCH {position} LIMITED" for position in range(len(tiers))],
             "matched_name_kind": "current",
             "matched_on": "company_name",
-            "score": 1.0,
+            "postcode_agrees": True,
             "source_company_name": [
                 f"CANONICAL SOURCE {position} LIMITED"
                 for position in range(len(tiers))
@@ -324,13 +372,7 @@ def test_diagnostics_are_aggregate_and_sample_is_deterministic_with_redistributi
 
     pd.testing.assert_frame_equal(first, second)
     assert len(first) == 1_000
-    assert first["tier"].value_counts().to_dict() == {
-        "auto": 600,
-        "review": 350,
-        "fallback_review": 50,
-    }
-    assert "review_decision" not in first
-    assert "review_notes" not in first
+    assert first["tier"].value_counts().to_dict() == {"exact_unique": 1_000}
     assert "sampling_weight" not in first
     expected_sources = matches.set_index("ID")[[
         "source_company_name",

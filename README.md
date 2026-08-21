@@ -1,21 +1,23 @@
 # Recovery analysis
 
-Matches a court judgment file to Companies House data. Run 1 reports the matching
-coverage; Run 2 fits the satisfaction model.
+Matches a court judgment file to Companies House data and reports the matching coverage.
+The normal Run 1 does not fit the satisfaction model.
 
 ## Run it
 
 1. Check that Python 3.13 or 3.14 is installed and added to PATH.
 2. Double-click `RUN.bat`.
-3. Choose Run 1 for matching or Run 2 for the satisfaction model.
-4. Drag in your judgment file, then the Companies House file, when prompted.
-5. Enter the date of the RT extract (required for Run 2).
-6. Open `SUMMARY.txt` from the location shown when it finishes.
+3. Drag in your judgment file, then the Companies House file, when prompted.
+4. Enter the date of the RT extract.
+5. Open `SUMMARY.txt` from the location shown when it finishes.
 
 The Companies House file is the free "BasicCompanyDataAsOneFile" download from
 https://download.companieshouse.gov.uk/. Leave it zipped.
 
 It also creates a separate file containing 1,000 matching pairs.
+
+A match is made only where the normalised company or trading name identifies one
+date-valid Companies House company. Postcode is reported but never chooses a match.
 
 ## Your judgment file
 
@@ -42,8 +44,8 @@ Everything is in `recovery/`:
 
 - `config.py` holds the fixed numbers used by the matching and model.
 - `data.py` reads the two files and checks their columns and dates.
-- `matching.py` matches the judgments and makes the 1,000-pair example file.
-- `models.py` contains the later payment-model code. It is not used in the first run.
+- `matching.py` matches unique exact names and makes the 1,000-pair example file.
+- `models.py` contains the later satisfaction-model code. It is not used in the first run.
 - `reporting.py` writes the summary and detail files; `disclosure.py` runs the final check.
 - `run.py` holds the shared code the steps call.
 - `selftest.py` runs the whole thing on fake data made by `synthetic.py`.

@@ -18,9 +18,6 @@ pandas==3.0.3 \
     --hash=sha256:a82d532a3351d435432cd913edbccaf8b8e01d4dd0e5ced5a8d2e8ecd94c7e44
 python-dateutil==2.9.0.post0 \
     --hash=sha256:a8b2bc7bffae282281c8140a97d3aa9c14da0b136dfe83f850eea9a5f7470427
-rapidfuzz==3.14.5 \
-    --hash=sha256:11bfc2ed8fbe4ab86bd516fadefab126f90e6dcadffa761739fcb304707dfd35 \
-    --hash=sha256:5dfa89d78f22cd773054caff44827b846161a29f2dcf7e78b8f90d086621e502
 scikit-learn==1.9.0 \
     --hash=sha256:5808d98f15c6bf6d9d96d2348c1997392a5888ce7097e664105f930c4bca1277 \
     --hash=sha256:64fa347efc1c839c487433e40c5144d38c336e8a2b59c81aa8660373945c2673

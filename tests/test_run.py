@@ -59,8 +59,9 @@ class RunTests(unittest.TestCase):
             self.assertEqual(len(pairs), 1_000)
             self.assertIn("source_company_name", pairs)
             self.assertIn("matched_company_name", pairs)
-            self.assertNotIn("review_decision", pairs)
-            self.assertNotIn("review_notes", pairs)
+            self.assertEqual(set(pairs["tier"]), {"exact_unique"})
+            self.assertNotIn("score", pairs)
+            self.assertNotIn("margin", pairs)
             self.assertEqual(
                 {path.name for path in paths.working.iterdir()}, {PAIR_FILENAME}
             )
@@ -72,7 +73,11 @@ class RunTests(unittest.TestCase):
                 (paths.results / "E5_run_manifest.json").read_text(encoding="utf-8")
             )
             self.assertIsNone(manifest["model_only_acceptance"])
-            self.assertNotIn("review_binding", manifest)
+            self.assertEqual(manifest["schema_version"], 2)
+            self.assertEqual(
+                manifest["matching_rule"],
+                "unique_date_valid_exact_normalized_name_v1",
+            )
 
     def test_short_names_are_not_used_as_disclosure_needles(self) -> None:
         from recovery.run import _bounded_known_identifiers
