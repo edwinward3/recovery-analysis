@@ -1,5 +1,4 @@
 @rem Sets up Python, runs the fake-data self-test, then runs the selected stage.
-@rem Run 2 is kept for later and is not offered when RUN.bat is double-clicked.
 @echo off
 setlocal DisableDelayedExpansion
 cd /d "%~dp0"
@@ -62,8 +61,10 @@ set "INTERACTIVE="
 
 if defined STAGE goto have_stage
 set "INTERACTIVE=1"
-set "STAGE=diagnostic"
-echo Run 1 selected: full-data matching only.
+echo Choose what to run:
+echo   1. Full-data matching
+echo   2. Satisfaction model
+set /p "STAGE=Enter 1 or 2: "
 
 :have_stage
 set "STAGE=%STAGE:"=%"
@@ -94,6 +95,7 @@ if defined OBSERVATION goto arguments_ready
 set /p "OBSERVATION=RT extract date YYYY-MM-DD (blank = today): "
 
 :arguments_ready
+if /i "%STAGE%"=="locked" if not defined OBSERVATION goto missing_observation
 if not defined OUTPUT_BASE set "OUTPUT_BASE=outputs"
 
 echo.
@@ -144,6 +146,11 @@ goto stop
 :missing_companies
 echo.
 echo STOP: Cannot find the Companies House file: "%COMPANIES%"
+goto stop
+
+:missing_observation
+echo.
+echo STOP: Run 2 needs the RT extract date in YYYY-MM-DD format.
 goto stop
 
 :run_failed

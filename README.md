@@ -1,15 +1,16 @@
 # Recovery analysis
 
-Matches a court judgment file to Companies House data and reports the matching coverage.
-The normal Run 1 does not fit the payment model.
+Matches a court judgment file to Companies House data. Run 1 reports the matching
+coverage; Run 2 fits the satisfaction model.
 
 ## Run it
 
 1. Check that Python 3.13 or 3.14 is installed and added to PATH.
 2. Double-click `RUN.bat`.
-3. Drag in your judgment file, then the Companies House file, when prompted.
-4. Wait about 45 minutes.
-5. Open `SUMMARY.txt` from the location shown when it finishes.
+3. Choose Run 1 for matching or Run 2 for the satisfaction model.
+4. Drag in your judgment file, then the Companies House file, when prompted.
+5. Enter the date of the RT extract (required for Run 2).
+6. Open `SUMMARY.txt` from the location shown when it finishes.
 
 The Companies House file is the free "BasicCompanyDataAsOneFile" download from
 https://download.companieshouse.gov.uk/. Leave it zipped.
