@@ -1,49 +1,49 @@
 # Recovery analysis
 
-Matches a court judgment file to Companies House data. Run 1 reports the matching
-coverage; Run 2 fits the satisfaction model.
+Offline linkage and research code for Registry Trust judgment records and the
+Companies House live-company bulk snapshot.
 
-## Run it
+## Diagnostic run
 
-1. Check that Python 3.13 or 3.14 is installed and added to PATH.
-2. Double-click `RUN.bat`.
-3. Choose Run 1 for matching or Run 2 for the satisfaction model.
-4. Drag in your judgment file, then the Companies House file, when prompted.
-5. Enter the date of the RT extract (required for Run 2).
-6. Open `SUMMARY.txt` from the location shown when it finishes.
+1. Install 64-bit Python 3.13 or 3.14 and add it to PATH.
+2. Double-click `RUN.bat` and choose Run 1.
+3. Supply the RT file, Companies House file, RT extract date, and Companies House
+   snapshot date when prompted.
 
-The Companies House file is the free "BasicCompanyDataAsOneFile" download from
-https://download.companieshouse.gov.uk/. Leave it zipped.
+The diagnostic produces aggregate audit reports plus two outcome-blind review
+files: 1,000 accepted exact links and a probability sample of up to 1,000
+unmatched records. Both must be independently double-reviewed before development.
 
-It also creates a separate file containing 1,000 matching pairs.
+Run 2 stays unavailable in the double-click launcher. Development and the
+single-use locked release require the supervised procedure in `STUDY_DESIGN.md`.
+No key is needed for setup, diagnostic matching, or development; the release
+custodian keeps the later approval key outside this repository.
 
-## Your judgment file
+## RT input
 
-A .csv or .xlsx with these columns (upper/lower case and order don't matter):
+A CSV or XLSX containing:
 
-`ID`, `Date Inserted`, `JudgmentDate`, `JudgmentStatus`, `DefendantType`, `Jurisdiction`,
-`Defendant Company Name`, `Defendant_Postcode`.
+`ID`, `Date Inserted`, `JudgmentDate`, `JudgmentStatus`, `DefendantType`,
+`Jurisdiction`, `Defendant Company Name`, `Defendant_Postcode`.
 
-Dates as DD/MM/YYYY. `Amount`, `Defendant Trading Name` and `Defendant Address` are optional.
-`Date Inserted` is the date RT put the judgment on the register.
+`Amount`, `Defendant Trading Name`, and `Defendant Address` are optional. Known
+satisfaction, cancellation, status-effective, and snapshot dates are preserved.
+Unrecognised outcome/history fields stop the run instead of being discarded.
 
-## Reading it before you run it
+The Companies House input is the dated, zipped Basic Company Data snapshot from
+https://download.companieshouse.gov.uk/. It contains live companies only.
 
-Every file has a short line at the top saying what it does, and the code is commented throughout.
-The analysis itself never uses the internet. On the first run, `RUN.bat` may use it to install
-the required Python packages; neither data file is uploaded.
-It does not save a full copy of the matching data, and a failed run removes its new files.
+## Safeguards
 
-To watch it run on fake data, with no real file: `python -m recovery.selftest`.
+- The supplied no-event-date schema is analysed only as status at extract date.
+- If event dates or historical snapshots appear, modelling stops for redesign.
+- Development masks test outcomes and test class counts.
+- The locked test requires a manifest-bound, one-use approval.
+- Public reports are aggregate and disclosure checked; fitted weights remain local.
+- The AUC 0.70 rule is internal, not a publication criterion.
 
-## The files
+Run the fake-data check with `python -m recovery.selftest`.
 
-Everything is in `recovery/`:
-
-- `config.py` holds the fixed numbers used by the matching and model.
-- `data.py` reads the two files and checks their columns and dates.
-- `matching.py` matches unique exact names and makes the 1,000-pair example file.
-- `models.py` contains the satisfaction-model code. It is used only in Run 2.
-- `reporting.py` writes the summary and detail files; `disclosure.py` runs the final check.
-- `run.py` holds the shared code the steps call.
-- `selftest.py` runs the whole thing on fake data made by `synthetic.py`.
+The full population, estimand, linkage protocol, model protocol, interpretation
+rules, and release protocol are in `STUDY_DESIGN.md`. Claim and reviewer registers
+are in `CLAIM_EVIDENCE_REGISTER.md` and `REVIEWER_OBJECTIONS.md`.

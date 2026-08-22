@@ -1,8 +1,9 @@
-"""Run 2 only. Builds the company facts, fits the four models and checks the results."""
+"""Cross-sectional status-at-extract cohort construction and model evaluation."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import hashlib
 from importlib import import_module
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
@@ -32,17 +33,36 @@ from .config import Settings
 
 SPLIT_ORDER: tuple[str, ...] = ("train", "validation", "calibration", "test")
 SPLIT_FRACTIONS: tuple[float, ...] = (0.60, 0.15, 0.10, 0.15)
+CAPACITY_FRACTIONS: tuple[float, ...] = (0.01, 0.02, 0.05, 0.10, 0.20)
 
-PROSPECTIVE_FEATURES: tuple[str, ...] = (
+OBSERVATION_AGE_FEATURES: tuple[str, ...] = (
+    "observation_age_months",
+    "observation_age_scaled_squared",
+    "observation_age_scaled_cubed",
+    "observation_age_hinge_12m_cubed",
+    "observation_age_hinge_24m_cubed",
+    "observation_age_hinge_36m_cubed",
+)
+
+ADMINISTRATIVE_FEATURES: tuple[str, ...] = (
     "company_age_at_judgment_years",
     "company_age_at_judgment_missing",
     "log1p_judgment_amount",
     "judgment_amount_missing",
-    "prior_judgment_count_24m",
-    "prior_judgment_value_24m",
-    "days_since_prior_judgment_24m",
-    "no_prior_judgment_24m",
+    "observable_retained_prior_judgment_count_24m",
+    "observable_retained_prior_judgment_value_24m",
+    "days_since_observable_retained_prior_judgment_24m",
+    "no_observable_retained_prior_judgment_24m",
+    "observable_retained_history_calendar_coverage_24m",
 )
+
+CROSS_SECTIONAL_FEATURES: tuple[str, ...] = (
+    OBSERVATION_AGE_FEATURES + ADMINISTRATIVE_FEATURES
+)
+
+# Backwards-compatible import name.  The fallback analysis is cross-sectional,
+# so new code and all public output use ``CROSS_SECTIONAL_FEATURES`` instead.
+PROSPECTIVE_FEATURES: tuple[str, ...] = CROSS_SECTIONAL_FEATURES
 
 SNAPSHOT_ADDITIONAL_FEATURES: tuple[str, ...] = (
     "snapshot_any_charges",
@@ -53,8 +73,9 @@ SNAPSHOT_ADDITIONAL_FEATURES: tuple[str, ...] = (
 )
 
 FEATURE_FAMILIES: dict[str, tuple[str, ...]] = {
-    "prospective": PROSPECTIVE_FEATURES,
-    "snapshot_exploratory": PROSPECTIVE_FEATURES + SNAPSHOT_ADDITIONAL_FEATURES,
+    "age_only": OBSERVATION_AGE_FEATURES,
+    "cross_sectional_primary": CROSS_SECTIONAL_FEATURES,
+    "snapshot_exploratory": CROSS_SECTIONAL_FEATURES + SNAPSHOT_ADDITIONAL_FEATURES,
 }
 
 _REQUIRED_JUDGMENT_COLUMNS = (
@@ -251,6 +272,7 @@ class ModelRun:
     feature_effects: list[dict[str, Any]]
     calibration: CalibrationResult
     model: FittedNumericModel = field(repr=False)
+    comparison_to_age_only: dict[str, Any] = field(default_factory=dict)
 
     def to_public_dict(self) -> dict[str, Any]:
         return {
@@ -263,6 +285,7 @@ class ModelRun:
             "reliability_bins": self.reliability_bins,
             "feature_effects": self.feature_effects,
             "calibration": self.calibration.to_public_dict(),
+            "comparison_to_age_only": self.comparison_to_age_only,
         }
 
 
@@ -273,21 +296,51 @@ class ModelEvaluation:
     champions: dict[str, str]
     primary_acceptance: dict[str, Any]
     training_prevalence: float
+    prevalence_baseline: dict[str, Any] = field(default_factory=dict)
 
     def to_public_dict(self) -> dict[str, Any]:
         return {
-            "schema_version": 2,
+            "schema_version": 3,
             "cohort": self.cohort.to_public_dict(),
             "training_prevalence": self.training_prevalence,
             "champions": dict(self.champions),
             "primary_acceptance": self.primary_acceptance,
+            "prevalence_baseline": self.prevalence_baseline,
             "runs": {
                 name: run.to_public_dict() for name, run in sorted(self.runs.items())
             },
         }
 
 
-# Build the Run 2 sample and date splits
+@dataclass(slots=True)
+class ModelDevelopment:
+    """Outcome-blind-to-test development result and frozen evaluation recipe."""
+
+    cohort: PreparedCohort
+    validation_metrics: dict[str, dict[str, Any]]
+    champions: dict[str, str]
+    training_prevalence: float
+    frozen_evaluation_keys: tuple[str, ...]
+    specification_hash: str
+    models: dict[str, FittedNumericModel] = field(repr=False)
+    calibrations: dict[str, CalibrationResult] = field(repr=False)
+
+    def to_public_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": 1,
+            "cohort": self.cohort.to_public_dict(),
+            "validation_metrics": {
+                key: value for key, value in sorted(self.validation_metrics.items())
+            },
+            "champions": dict(self.champions),
+            "training_prevalence": self.training_prevalence,
+            "frozen_evaluation_keys": list(self.frozen_evaluation_keys),
+            "specification_hash": self.specification_hash,
+            "test_outcomes_accessed": False,
+        }
+
+
+# Build the cross-sectional modelling cohort and label-blind group splits
 
 def prepare_model_cohort(
     judgments: pd.DataFrame,
@@ -295,7 +348,7 @@ def prepare_model_cohort(
     observation_date: str | pd.Timestamp,
     settings: Settings,
 ) -> PreparedCohort:
-    """Construct the locked primary cohort and common chronological split.
+    """Construct the primary status-at-extract cohort.
 
     Parameters
     ----------
@@ -377,22 +430,29 @@ def prepare_model_cohort(
 
     lower_date = obs - pd.DateOffset(months=settings.primary_max_months)
     upper_date = obs - pd.DateOffset(months=settings.primary_min_months)
-    seasoned = merged["JudgmentDate"].between(lower_date, upper_date, inclusive="both")
+    # The lower landmark is strict: judgments exactly one calendar month old
+    # are not part of the post-one-month registered cohort.  The maximum age is
+    # inclusive and future judgment dates are necessarily excluded.
+    in_age_window = (
+        merged["JudgmentDate"].notna()
+        & merged["JudgmentDate"].ge(lower_date)
+        & merged["JudgmentDate"].lt(upper_date)
+    )
 
     funnel.update(
         {
             "corporate": int(corporate.sum()),
             "england_and_wales_corporate": int((corporate & ew).sum()),
             "satisfied_or_unsatisfied_corporate_ew": int((corporate & ew & labelled).sum()),
-            "seasoned_12_36_corporate_ew_labelled": int(
-                (corporate & ew & labelled & seasoned).sum()
+            "primary_age_window_corporate_ew_labelled": int(
+                (corporate & ew & labelled & in_age_window).sum()
             ),
-            "exact_unique_matched_eligible": int(
+            "exact_unique_matched_eligible_judgments": int(
                 (
                     corporate
                     & ew
                     & labelled
-                    & seasoned
+                    & in_age_window
                     & exact_unique
                     & has_company
                 ).sum()
@@ -401,19 +461,20 @@ def prepare_model_cohort(
     )
 
     eligible = merged.loc[
-        corporate & ew & labelled & seasoned & exact_unique & has_company
+        corporate & ew & labelled & in_age_window & exact_unique & has_company
     ].copy()
     eligible["matched_company_number"] = (
         eligible["matched_company_number"].astype(str).str.strip()
     )
-    eligible["label"] = (eligible["JudgmentStatus"] == "Satisfied").astype(int)
-    eligible = eligible.sort_values(
-        ["JudgmentDate", "matched_company_number", "ID"], kind="mergesort"
-    )
-    eligible = eligible.drop_duplicates("matched_company_number", keep="first").copy()
-    funnel["earliest_eligible_unique_companies"] = int(len(eligible))
     if eligible.empty:
         raise ModelDataError("no rows remain in the primary modelling cohort")
+    funnel["eligible_judgments"] = int(len(eligible))
+    funnel["eligible_unique_companies"] = int(
+        eligible["matched_company_number"].nunique()
+    )
+    funnel["eligible_repeat_judgments"] = int(
+        len(eligible) - funnel["eligible_unique_companies"]
+    )
 
     incorporation_col = _first_present(merged.columns, _INCORPORATION_ALIASES)
     if incorporation_col is None:
@@ -432,6 +493,7 @@ def prepare_model_cohort(
     eligible["log1p_judgment_amount"] = np.log1p(
         eligible["_amount_numeric"].fillna(0.0).clip(lower=0.0)
     )
+    _add_observation_age_features(eligible, obs)
 
     history_filter = (
         corporate
@@ -444,10 +506,23 @@ def prepare_model_cohort(
         history_filter,
         ["matched_company_number", "JudgmentDate", "_amount_numeric"],
     ]
-    _add_prior_judgment_features(eligible, history, settings.prior_history_months)
+    observable_start = history["JudgmentDate"].min() if not history.empty else pd.NaT
+    _add_observable_retained_prior_judgment_features(
+        eligible,
+        history,
+        settings.prior_history_months,
+        observable_start_date=observable_start,
+    )
     _add_snapshot_features(eligible, obs)
 
-    eligible = assign_chronological_splits(eligible)
+    eligible = assign_company_group_splits(eligible, settings.locked_seed)
+    # Test labels are deliberately absent from the development object.  They
+    # are attached from the source table only after the external release gate.
+    eligible["label"] = pd.Series(pd.NA, index=eligible.index, dtype="Int64")
+    development_rows = eligible["split"].ne("test")
+    eligible.loc[development_rows, "label"] = (
+        eligible.loc[development_rows, "JudgmentStatus"].eq("Satisfied").astype(int)
+    )
     split_counts = _split_counts(eligible)
     _guard_splits(eligible)
 
@@ -461,6 +536,13 @@ def prepare_model_cohort(
     ]
     if missing_snapshot:
         warnings.append("snapshot features entirely missing: " + ", ".join(missing_snapshot))
+    warnings.append(
+        "prior-history variables count only observable retained, exact-linked records; "
+        "calendar coverage does not establish complete company history"
+    )
+    warnings.append(
+        "Companies House snapshot variables are retrospective/exploratory only"
+    )
 
     # Keep only the IDs, dates, labels, splits and model features used below.
     keep = [
@@ -469,7 +551,7 @@ def prepare_model_cohort(
         "JudgmentDate",
         "label",
         "split",
-        *dict.fromkeys(PROSPECTIVE_FEATURES + SNAPSHOT_ADDITIONAL_FEATURES),
+        *dict.fromkeys(CROSS_SECTIONAL_FEATURES + SNAPSHOT_ADDITIONAL_FEATURES),
     ]
     return PreparedCohort(
         frame=eligible.loc[:, keep].reset_index(drop=True),
@@ -479,6 +561,84 @@ def prepare_model_cohort(
         split_counts=split_counts,
         warnings=warnings,
     )
+
+
+def assign_company_group_splits(
+    frame: pd.DataFrame,
+    seed: int,
+    *,
+    age_column: str = "observation_age_months",
+) -> pd.DataFrame:
+    """Assign stable, label-blind, age-stratified company partitions.
+
+    Every judgment for a company receives the same split.  Companies are
+    stratified by their median observation age (1--12, 12--24, 24--36 and
+    36--48 months) and ordered within a stratum by a seeded SHA-256 digest.
+    Neither ``JudgmentStatus`` nor ``label`` is inspected.
+    """
+
+    _require_columns(frame, ("ID", "matched_company_number", age_column), "cohort")
+    if frame["matched_company_number"].isna().any():
+        raise ModelDataError("cohort.matched_company_number contains missing values")
+    ages = pd.to_numeric(frame[age_column], errors="coerce")
+    if ages.isna().any():
+        raise ModelDataError(f"cohort.{age_column} contains missing values")
+
+    company = pd.DataFrame(
+        {
+            "matched_company_number": frame["matched_company_number"].astype(str),
+            "_age": ages,
+        }
+    ).groupby("matched_company_number", as_index=False, sort=True)["_age"].median()
+    company["_age_stratum"] = pd.cut(
+        company["_age"],
+        bins=[-np.inf, 12.0, 24.0, 36.0, np.inf],
+        labels=False,
+        right=True,
+    ).astype(int)
+    company["_digest"] = company["matched_company_number"].map(
+        lambda value: hashlib.sha256(
+            f"{int(seed)}\0{value}".encode("utf-8")
+        ).hexdigest()
+    )
+
+    assignments: dict[str, str] = {}
+    for _, stratum in company.groupby("_age_stratum", sort=True):
+        ordered = stratum.sort_values(
+            ["_digest", "matched_company_number"], kind="mergesort"
+        )
+        counts = _fractional_group_counts(len(ordered))
+        position = 0
+        for split, count in zip(SPLIT_ORDER, counts):
+            values = ordered.iloc[position : position + count][
+                "matched_company_number"
+            ]
+            assignments.update({value: split for value in values})
+            position += count
+
+    out = frame.copy()
+    out["matched_company_number"] = out["matched_company_number"].astype(str)
+    out["split"] = out["matched_company_number"].map(assignments)
+    if out["split"].isna().any():  # pragma: no cover - defensive invariant
+        raise RuntimeError("one or more companies were not assigned to a split")
+    sort_columns = [
+        column
+        for column in ("JudgmentDate", "matched_company_number", "ID")
+        if column in out.columns
+    ]
+    return out.sort_values(sort_columns, kind="mergesort").copy()
+
+
+def _fractional_group_counts(size: int) -> tuple[int, ...]:
+    """Allocate a stratum by largest remainder with stable tie-breaking."""
+
+    raw = np.asarray(SPLIT_FRACTIONS, dtype=float) * int(size)
+    counts = np.floor(raw).astype(int)
+    remainder = int(size) - int(counts.sum())
+    if remainder:
+        order = np.argsort(-(raw - counts), kind="mergesort")
+        counts[order[:remainder]] += 1
+    return tuple(int(value) for value in counts)
 
 
 def assign_chronological_splits(frame: pd.DataFrame) -> pd.DataFrame:
@@ -533,130 +693,277 @@ def assign_chronological_splits(frame: pd.DataFrame) -> pd.DataFrame:
     return ordered
 
 
-# Fit and test the four models
+# Develop first; evaluate a separately released test outcome table once
 
-def fit_evaluate_models(
+def develop_models(
     cohort: PreparedCohort,
     settings: Settings,
-) -> ModelEvaluation:
-    """Fit logistic and LightGBM for both sets of company facts.
+) -> ModelDevelopment:
+    """Select, refit and calibrate models without accessing test outcomes."""
 
-    Validation chooses the preferred model before the test rows are opened.
-    Both models are then refitted, calibrated and measured on those same rows.
-    """
-
-    lgb_module = _require_lightgbm()
     data = cohort.frame
     _guard_splits(data)
     parts = {name: data.loc[data["split"] == name].copy() for name in SPLIT_ORDER}
     if any(part.empty for part in parts.values()):
         empty = [name for name, part in parts.items() if part.empty]
         raise ModelDataError(f"empty modelling split(s): {empty}")
+    if parts["test"]["label"].notna().any():
+        raise ModelDataError(
+            "development cohort contains test outcomes; rebuild it with locked labels masked"
+        )
+    for name in ("train", "validation", "calibration"):
+        if parts[name]["label"].isna().any():
+            raise ModelDataError(f"{name} split contains missing development outcomes")
     y_train = parts["train"]["label"].astype(int).to_numpy()
     if np.unique(y_train).size < 2:
         raise ModelDataError("training split contains only one outcome class")
-    training_prevalence = float(y_train.mean())
 
-    runs: dict[str, ModelRun] = {}
-    champions: dict[str, str] = {}
+    lgb_module = _require_lightgbm()
+    validation_models: dict[str, FittedNumericModel] = {}
+    validation_metrics: dict[str, dict[str, Any]] = {}
+    champions: dict[str, str] = {"age_only": "logistic"}
+
     for family, features in cohort.feature_families.items():
-        validation_candidates: dict[str, tuple[FittedNumericModel, dict[str, Any]]] = {}
-        logistic_initial = _fit_logistic(
-            family,
-            features,
-            parts["train"],
-            settings.locked_seed,
+        algorithms = ("logistic",) if family == "age_only" else (
+            "logistic",
+            "lightgbm",
         )
-        validation_candidates["logistic"] = (
-            logistic_initial,
-            evaluate_predictions(
-                parts["validation"]["label"],
-                logistic_initial.predict_proba(parts["validation"]),
-            ),
-        )
-        lgb_initial = _fit_lightgbm(
-            family,
-            features,
-            parts["train"],
-            settings.locked_seed,
-            lgb_module,
-            validation=parts["validation"],
-        )
-        validation_candidates["lightgbm"] = (
-            lgb_initial,
-            evaluate_predictions(
-                parts["validation"]["label"],
-                lgb_initial.predict_proba(parts["validation"]),
-            ),
-        )
-        champion = choose_champion(
-            validation_candidates["logistic"][1],
-            validation_candidates["lightgbm"][1],
-        )
-        champions[family] = champion
+        for algorithm in algorithms:
+            if algorithm == "logistic":
+                fitted = _fit_logistic(
+                    family, features, parts["train"], settings.locked_seed
+                )
+            else:
+                fitted = _fit_lightgbm(
+                    family,
+                    features,
+                    parts["train"],
+                    settings.locked_seed,
+                    lgb_module,
+                    validation=parts["validation"],
+                )
+            key = f"{family}.{algorithm}"
+            validation_models[key] = fitted
+            validation_metrics[key] = evaluate_predictions(
+                parts["validation"]["label"].astype(int),
+                fitted.predict_proba(parts["validation"]),
+            )
+        if family != "age_only":
+            champions[family] = choose_champion(
+                validation_metrics[f"{family}.logistic"],
+                validation_metrics[f"{family}.lightgbm"],
+            )
 
-        refit_rows = pd.concat([parts["train"], parts["validation"]], ignore_index=True)
-        fitted = {
-            "logistic": _fit_logistic(family, features, refit_rows, settings.locked_seed),
-            "lightgbm": _fit_lightgbm(
+    if "cross_sectional_primary" not in champions:
+        raise ModelDataError("cross_sectional_primary feature family is required")
+    primary_key = (
+        "cross_sectional_primary."
+        + champions["cross_sectional_primary"]
+    )
+    frozen_keys = ("age_only.logistic", primary_key)
+    refit_rows = pd.concat([parts["train"], parts["validation"]], ignore_index=True)
+    training_prevalence = float(refit_rows["label"].astype(int).mean())
+    models: dict[str, FittedNumericModel] = {}
+    calibrations: dict[str, CalibrationResult] = {}
+    for key in frozen_keys:
+        family, algorithm = key.split(".", maxsplit=1)
+        features = cohort.feature_families[family]
+        if algorithm == "logistic":
+            model = _fit_logistic(
+                family, features, refit_rows, settings.locked_seed
+            )
+        else:
+            initial = validation_models[key]
+            model = _fit_lightgbm(
                 family,
                 features,
                 refit_rows,
                 settings.locked_seed,
                 lgb_module,
-                fixed_iterations=lgb_initial.best_iteration,
+                fixed_iterations=initial.best_iteration,
+            )
+        calibration_raw = model.predict_proba(parts["calibration"])
+        calibration = fit_calibrator(
+            parts["calibration"]["label"].astype(int).to_numpy(),
+            calibration_raw,
+            settings,
+            seed=settings.locked_seed,
+        )
+        models[key] = model
+        calibrations[key] = calibration
+
+    specification_hash = _development_specification_hash(
+        cohort, frozen_keys, champions, settings.locked_seed
+    )
+    return ModelDevelopment(
+        cohort=cohort,
+        validation_metrics=validation_metrics,
+        champions=champions,
+        training_prevalence=training_prevalence,
+        frozen_evaluation_keys=frozen_keys,
+        specification_hash=specification_hash,
+        models=models,
+        calibrations=calibrations,
+    )
+
+
+def materialize_locked_test_outcomes(
+    judgments: pd.DataFrame,
+    cohort: PreparedCohort,
+) -> pd.DataFrame:
+    """Materialize the frozen test outcomes after an external release gate.
+
+    Calling this function is the single point at which test statuses are read.
+    ``run.py`` must protect it with the signed/keyed design-release mechanism.
+    """
+
+    _require_columns(judgments, ("ID", "JudgmentStatus"), "judgments")
+    _require_unique(judgments, "ID", "judgments")
+    test_ids = cohort.frame.loc[cohort.frame["split"].eq("test"), ["ID"]]
+    source = judgments.loc[:, ["ID", "JudgmentStatus"]]
+    locked = test_ids.merge(source, on="ID", how="left", validate="one_to_one")
+    valid = locked["JudgmentStatus"].isin(("Satisfied", "Unsatisfied"))
+    if not valid.all():
+        raise ModelDataError("locked test outcomes are missing or outside the binary status definition")
+    locked["label"] = locked["JudgmentStatus"].eq("Satisfied").astype(int)
+    return locked.loc[:, ["ID", "label"]]
+
+
+def evaluate_locked_models(
+    development: ModelDevelopment,
+    locked_outcomes: pd.DataFrame,
+    settings: Settings,
+) -> ModelEvaluation:
+    """Evaluate only the prespecified age baseline and primary champion once."""
+
+    expected_hash = _development_specification_hash(
+        development.cohort,
+        development.frozen_evaluation_keys,
+        development.champions,
+        settings.locked_seed,
+    )
+    if expected_hash != development.specification_hash:
+        raise ModelDataError("frozen development specification no longer matches the cohort")
+    test = development.cohort.frame.loc[
+        development.cohort.frame["split"].eq("test")
+    ].copy()
+    if test["label"].notna().any():
+        raise ModelDataError("test outcomes must enter only through locked_outcomes")
+    _require_columns(locked_outcomes, ("ID", "label"), "locked_outcomes")
+    _require_unique(locked_outcomes, "ID", "locked_outcomes")
+    if set(locked_outcomes["ID"]) != set(test["ID"]):
+        raise ModelDataError("locked outcome IDs do not exactly match the frozen test partition")
+    labels = pd.to_numeric(locked_outcomes["label"], errors="coerce")
+    if labels.isna().any() or not labels.isin((0, 1)).all():
+        raise ModelDataError("locked_outcomes.label must contain only 0 and 1")
+    test = test.drop(columns="label").merge(
+        locked_outcomes.loc[:, ["ID", "label"]],
+        on="ID",
+        how="left",
+        validate="one_to_one",
+    )
+    y_test = test["label"].astype(int).to_numpy()
+    clusters = test["matched_company_number"].astype(str).to_numpy()
+    prevalence_probabilities = np.full(
+        len(test), development.training_prevalence, dtype=float
+    )
+    prevalence_baseline = {
+        "metrics": evaluate_predictions(
+            y_test, prevalence_probabilities, development.training_prevalence
+        ),
+        "bootstrap_intervals": bootstrap_metrics(
+            y_test,
+            prevalence_probabilities,
+            settings.bootstrap_replicates,
+            settings.locked_seed,
+            training_prevalence=development.training_prevalence,
+            clusters=clusters,
+        ),
+    }
+
+    predictions: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+    for key in development.frozen_evaluation_keys:
+        model = development.models[key]
+        raw = model.predict_proba(test)
+        predictions[key] = (raw, development.calibrations[key].predict(raw))
+
+    age_probabilities = predictions["age_only.logistic"][1]
+    runs: dict[str, ModelRun] = {}
+    for key in development.frozen_evaluation_keys:
+        model = development.models[key]
+        raw, calibrated = predictions[key]
+        comparison: dict[str, Any] = {}
+        if key != "age_only.logistic":
+            comparison = {
+                "point_estimates": compare_predictions(
+                    y_test, calibrated, age_probabilities
+                ),
+                "paired_company_clustered_intervals": paired_cluster_bootstrap_metrics(
+                    y_test,
+                    calibrated,
+                    age_probabilities,
+                    clusters,
+                    settings.bootstrap_replicates,
+                    settings.locked_seed,
+                ),
+            }
+        runs[key] = ModelRun(
+            family=model.family,
+            algorithm=model.algorithm,
+            validation_metrics=development.validation_metrics[key],
+            test_metrics_raw=evaluate_predictions(
+                y_test, raw, development.training_prevalence
             ),
-        }
-        for algorithm, model in fitted.items():
-            calibration_raw = model.predict_proba(parts["calibration"])
-            calibration = fit_calibrator(
-                parts["calibration"]["label"].astype(int).to_numpy(),
-                calibration_raw,
-                settings,
-                seed=settings.locked_seed,
-            )
-            raw_test = model.predict_proba(parts["test"])
-            calibrated_test = calibration.predict(raw_test)
-            y_test = parts["test"]["label"].astype(int).to_numpy()
-            raw_metrics = evaluate_predictions(y_test, raw_test, training_prevalence)
-            calibrated_metrics = evaluate_predictions(
-                y_test, calibrated_test, training_prevalence
-            )
-            intervals = bootstrap_metrics(
+            test_metrics_calibrated=evaluate_predictions(
+                y_test, calibrated, development.training_prevalence
+            ),
+            bootstrap_intervals=bootstrap_metrics(
                 y_test,
-                calibrated_test,
+                calibrated,
                 settings.bootstrap_replicates,
                 settings.locked_seed,
-                training_prevalence=training_prevalence,
-            )
-            key = f"{family}.{algorithm}"
-            runs[key] = ModelRun(
-                family=family,
-                algorithm=algorithm,
-                validation_metrics=validation_candidates[algorithm][1],
-                test_metrics_raw=raw_metrics,
-                test_metrics_calibrated=calibrated_metrics,
-                bootstrap_intervals=intervals,
-                reliability_bins=reliability_table(y_test, calibrated_test),
-                feature_effects=_feature_effects(model),
-                calibration=calibration,
-                model=model,
-            )
+                training_prevalence=development.training_prevalence,
+                clusters=clusters,
+            ),
+            reliability_bins=reliability_table(y_test, calibrated),
+            feature_effects=_feature_effects(model),
+            calibration=development.calibrations[key],
+            model=model,
+            comparison_to_age_only=comparison,
+        )
 
-    primary_key = f"prospective.{champions['prospective']}"
+    primary_key = development.frozen_evaluation_keys[-1]
     acceptance = assess_acceptance(
         runs[primary_key],
-        cohort,
+        development.cohort,
         settings,
-        training_prevalence=training_prevalence,
+        training_prevalence=development.training_prevalence,
     )
     return ModelEvaluation(
-        cohort=cohort,
+        cohort=development.cohort,
         runs=runs,
-        champions=champions,
+        champions=development.champions,
         primary_acceptance=acceptance,
-        training_prevalence=training_prevalence,
+        training_prevalence=development.training_prevalence,
+        prevalence_baseline=prevalence_baseline,
     )
+
+
+def fit_evaluate_models(
+    cohort: PreparedCohort,
+    settings: Settings,
+    *,
+    locked_outcomes: pd.DataFrame | None = None,
+) -> ModelEvaluation:
+    """Compatibility entry point requiring an explicit locked outcome table."""
+
+    if locked_outcomes is None:
+        raise ModelDataError(
+            "implicit test evaluation is disabled; run develop_models, release the "
+            "frozen outcomes, then call evaluate_locked_models"
+        )
+    development = develop_models(cohort, settings)
+    return evaluate_locked_models(development, locked_outcomes, settings)
 
 
 def choose_champion(
@@ -719,7 +1026,7 @@ def evaluate_predictions(
     probabilities: Sequence[float],
     training_prevalence: float | None = None,
 ) -> dict[str, Any]:
-    """Compute aggregate discrimination, probability, and top-band metrics."""
+    """Compute discrimination, probability, calibration and capacity metrics."""
 
     y = np.asarray(labels, dtype=int)
     p = _clip_probabilities(np.asarray(probabilities, dtype=float))
@@ -736,7 +1043,10 @@ def evaluate_predictions(
     brier = float(brier_score_loss(y, p))
     ll = float(log_loss(y, p, labels=[0, 1]))
     intercept, slope = _calibration_intercept_slope(y, p)
-    top = _top_fraction_metrics(y, p, 0.10)
+    capacities = {
+        _capacity_key(fraction): _top_fraction_metrics(y, p, fraction)
+        for fraction in CAPACITY_FRACTIONS
+    }
     result: dict[str, Any] = {
         "n": int(len(y)),
         "n_positive": positive,
@@ -750,7 +1060,9 @@ def evaluate_predictions(
         "calibration_gap": abs(float(p.mean()) - prevalence),
         "calibration_intercept": intercept,
         "calibration_slope": slope,
-        "top_decile": top,
+        "capacity_metrics": capacities,
+        # Compatibility alias for the former single-capacity output.
+        "top_decile": capacities["10pct"],
     }
     if training_prevalence is not None:
         q = float(np.clip(training_prevalence, 1e-6, 1 - 1e-6))
@@ -776,13 +1088,19 @@ def bootstrap_metrics(
     seed: int,
     *,
     training_prevalence: float | None = None,
+    clusters: Sequence[str] | None = None,
 ) -> dict[str, dict[str, float | None]]:
-    """Return outcome-stratified row-bootstrap percentile intervals."""
+    """Return percentile intervals, resampling whole companies when supplied."""
 
     y = np.asarray(labels, dtype=int)
     p = _clip_probabilities(np.asarray(probabilities, dtype=float))
-    pos = np.flatnonzero(y == 1)
-    neg = np.flatnonzero(y == 0)
+    if len(y) != len(p):
+        raise ValueError("labels and probabilities differ in length")
+    capacity_names = tuple(
+        f"capacity_{_capacity_key(fraction)}_{metric}"
+        for fraction in CAPACITY_FRACTIONS
+        for metric in ("positive_rate", "lift", "recall")
+    )
     names = (
         "roc_auc",
         "average_precision",
@@ -791,23 +1109,50 @@ def bootstrap_metrics(
         "brier_improvement_vs_null",
         "calibration_gap",
         "top_decile_lift",
+        *capacity_names,
     )
-    if len(pos) == 0 or len(neg) == 0:
+    if len(np.unique(y)) < 2:
         return {name: {"lower": None, "upper": None} for name in names}
     rng = np.random.default_rng(seed)
     samples: dict[str, list[float]] = {name: [] for name in names}
+    cluster_values: np.ndarray | None = None
+    unique_clusters: np.ndarray | None = None
+    if clusters is not None:
+        cluster_values = np.asarray(clusters).astype(str)
+        if len(cluster_values) != len(y):
+            raise ValueError("clusters and labels differ in length")
+        unique_clusters = np.unique(cluster_values)
+        if len(unique_clusters) < 2:
+            return {name: {"lower": None, "upper": None} for name in names}
+    pos = np.flatnonzero(y == 1)
+    neg = np.flatnonzero(y == 0)
     for _ in range(int(replicates)):
-        idx = np.concatenate(
-            (
-                rng.choice(pos, size=len(pos), replace=True),
-                rng.choice(neg, size=len(neg), replace=True),
+        if unique_clusters is None:
+            idx = np.concatenate(
+                (
+                    rng.choice(pos, size=len(pos), replace=True),
+                    rng.choice(neg, size=len(neg), replace=True),
+                )
             )
-        )
-        rng.shuffle(idx)
+            rng.shuffle(idx)
+        else:
+            sampled = rng.choice(
+                unique_clusters, size=len(unique_clusters), replace=True
+            )
+            idx = np.concatenate(
+                [np.flatnonzero(cluster_values == value) for value in sampled]
+            )
         sample_y = y[idx]
         sample_p = p[idx]
+        if len(np.unique(sample_y)) < 2:
+            continue
         sample_base = float(sample_y.mean())
-        top = _top_fraction_metrics(sample_y, sample_p, 0.10)
+        capacities = {
+            _capacity_key(fraction): _top_fraction_metrics(
+                sample_y, sample_p, fraction
+            )
+            for fraction in CAPACITY_FRACTIONS
+        }
         brier = float(brier_score_loss(sample_y, sample_p))
         if training_prevalence is None:
             brier_lift = None
@@ -824,8 +1169,11 @@ def bootstrap_metrics(
             "log_loss": float(log_loss(sample_y, sample_p, labels=[0, 1])),
             "brier_improvement_vs_null": brier_lift,
             "calibration_gap": abs(float(sample_p.mean()) - sample_base),
-            "top_decile_lift": top["lift"],
+            "top_decile_lift": capacities["10pct"]["lift"],
         }
+        for capacity_key, metrics in capacities.items():
+            for metric in ("positive_rate", "lift", "recall"):
+                values[f"capacity_{capacity_key}_{metric}"] = metrics[metric]
         for name, value in values.items():
             if value is not None and np.isfinite(value):
                 samples[name].append(float(value))
@@ -838,6 +1186,113 @@ def bootstrap_metrics(
         else:
             out[name] = {"lower": None, "upper": None}
     return out
+
+
+def compare_predictions(
+    labels: Sequence[int],
+    candidate_probabilities: Sequence[float],
+    age_only_probabilities: Sequence[float],
+) -> dict[str, float | None]:
+    """Return paired point differences; positive values favour the candidate."""
+
+    y = np.asarray(labels, dtype=int)
+    candidate = _clip_probabilities(np.asarray(candidate_probabilities, dtype=float))
+    age_only = _clip_probabilities(np.asarray(age_only_probabilities, dtype=float))
+    if len(y) != len(candidate) or len(y) != len(age_only):
+        raise ValueError("paired labels and probabilities differ in length")
+    return _paired_metric_values(y, candidate, age_only)
+
+
+def paired_cluster_bootstrap_metrics(
+    labels: Sequence[int],
+    candidate_probabilities: Sequence[float],
+    age_only_probabilities: Sequence[float],
+    clusters: Sequence[str],
+    replicates: int,
+    seed: int,
+) -> dict[str, dict[str, float | None]]:
+    """Paired company-cluster bootstrap intervals for incremental performance."""
+
+    y = np.asarray(labels, dtype=int)
+    candidate = _clip_probabilities(np.asarray(candidate_probabilities, dtype=float))
+    age_only = _clip_probabilities(np.asarray(age_only_probabilities, dtype=float))
+    cluster_values = np.asarray(clusters).astype(str)
+    if not (len(y) == len(candidate) == len(age_only) == len(cluster_values)):
+        raise ValueError("paired labels, predictions and clusters differ in length")
+    names = tuple(_paired_metric_values(y, candidate, age_only))
+    unique_clusters = np.unique(cluster_values)
+    if len(unique_clusters) < 2 or len(np.unique(y)) < 2:
+        return {name: {"lower": None, "upper": None} for name in names}
+    rng = np.random.default_rng(seed)
+    samples: dict[str, list[float]] = {name: [] for name in names}
+    for _ in range(int(replicates)):
+        sampled = rng.choice(unique_clusters, size=len(unique_clusters), replace=True)
+        indices = np.concatenate(
+            [np.flatnonzero(cluster_values == value) for value in sampled]
+        )
+        sample_y = y[indices]
+        if len(np.unique(sample_y)) < 2:
+            continue
+        values = _paired_metric_values(
+            sample_y, candidate[indices], age_only[indices]
+        )
+        for name, value in values.items():
+            if value is not None and np.isfinite(value):
+                samples[name].append(float(value))
+    return {
+        name: (
+            {
+                "lower": float(np.quantile(values, 0.025)),
+                "upper": float(np.quantile(values, 0.975)),
+            }
+            if values
+            else {"lower": None, "upper": None}
+        )
+        for name, values in samples.items()
+    }
+
+
+def _paired_metric_values(
+    y: np.ndarray,
+    candidate: np.ndarray,
+    age_only: np.ndarray,
+) -> dict[str, float | None]:
+    two_classes = len(np.unique(y)) == 2
+    values: dict[str, float | None] = {
+        "delta_roc_auc": (
+            float(roc_auc_score(y, candidate) - roc_auc_score(y, age_only))
+            if two_classes
+            else None
+        ),
+        "delta_average_precision": (
+            float(
+                average_precision_score(y, candidate)
+                - average_precision_score(y, age_only)
+            )
+            if y.sum() > 0
+            else None
+        ),
+        "brier_improvement_vs_age_only": float(
+            brier_score_loss(y, age_only) - brier_score_loss(y, candidate)
+        ),
+        "log_loss_improvement_vs_age_only": float(
+            log_loss(y, age_only, labels=[0, 1])
+            - log_loss(y, candidate, labels=[0, 1])
+        ),
+    }
+    for fraction in CAPACITY_FRACTIONS:
+        key = _capacity_key(fraction)
+        candidate_capacity = _top_fraction_metrics(y, candidate, fraction)
+        age_capacity = _top_fraction_metrics(y, age_only, fraction)
+        for metric in ("positive_rate", "lift", "recall"):
+            first = candidate_capacity[metric]
+            second = age_capacity[metric]
+            values[f"delta_capacity_{key}_{metric}"] = (
+                float(first - second)
+                if first is not None and second is not None
+                else None
+            )
+    return values
 
 
 def reliability_table(
@@ -884,11 +1339,11 @@ def assess_acceptance(
     *,
     training_prevalence: float,
 ) -> dict[str, Any]:
-    """Apply the locked primary acceptance guards to the prospective champion."""
+    """Apply internal operational guards to the cross-sectional champion."""
 
     metrics = run.test_metrics_calibrated
     reasons: list[str] = []
-    if run.family != "prospective":
+    if run.family not in {"cross_sectional_primary", "prospective"}:
         reasons.append("snapshot_exploratory_only")
     test_rows = _finite_or_none(metrics.get("n"))
     positive = _finite_or_none(metrics.get("n_positive"))
@@ -987,7 +1442,9 @@ def write_model_artifacts(
         model_payload = run.model.to_model_dict()
         model_payload["calibration"] = run.calibration.to_public_dict()
         model_payload["role"] = (
-            "primary_candidate" if run.family == "prospective" else "exploratory_only"
+            "primary_champion"
+            if run.family == "cross_sectional_primary"
+            else "age_only_baseline"
         )
         _write_stable_json(model_path, model_payload)
         written[f"model_{safe_key}"] = str(model_path)
@@ -995,27 +1452,27 @@ def write_model_artifacts(
     summary_path = destination / "MODEL_SUMMARY.txt"
     acceptance = evaluation.primary_acceptance
     lines = [
-        "RT TWO-MODEL EVALUATION",
-        "=======================",
+        "RT CROSS-SECTIONAL LOCKED EVALUATION",
+        "====================================",
         f"Observation date: {evaluation.cohort.observation_date.date().isoformat()}",
-        f"Primary champion: {evaluation.champions.get('prospective', 'n/a')}",
-        f"Exploratory snapshot champion: {evaluation.champions.get('snapshot_exploratory', 'n/a')}",
+        f"Primary champion: {evaluation.champions.get('cross_sectional_primary', 'n/a')}",
         f"Primary acceptance: {acceptance['status'].upper()}",
         "Acceptance reasons: "
         + (", ".join(acceptance["reasons"]) if acceptance["reasons"] else "none"),
         "",
-        "Split counts (rows / satisfied / unsatisfied):",
+        "Frozen split counts (rows / unique companies; outcome-blind):",
     ]
     for split in SPLIT_ORDER:
         counts = evaluation.cohort.split_counts.get(split, {})
         lines.append(
             f"  {split:<11} {counts.get('rows', 0)} / "
-            f"{counts.get('positive', 0)} / {counts.get('negative', 0)}"
+            f"{counts.get('unique_companies', 0)}"
         )
     lines.extend(
         [
             "",
-            "The snapshot feature family is retrospective/exploratory and cannot pass acceptance.",
+            "Only the frozen age-only baseline and primary champion were evaluated.",
+            "Snapshot features are retrospective/exploratory and were not tested.",
             "No row-level identifiers or predictions are contained in these artefacts.",
         ]
     )
@@ -1026,12 +1483,36 @@ def write_model_artifacts(
 
 # Build the model inputs
 
-def _add_prior_judgment_features(
+def _add_observation_age_features(
+    targets: pd.DataFrame,
+    observation_date: pd.Timestamp,
+) -> None:
+    """Add a fixed nonlinear basis for age at the extract date.
+
+    The knots are fixed before seeing outcomes, so the age-only baseline is
+    reproducible and does not learn transformations from the locked split.
+    """
+
+    judgment_dates = pd.to_datetime(targets["JudgmentDate"], errors="coerce")
+    months = (observation_date - judgment_dates).dt.days / (365.25 / 12.0)
+    targets["observation_age_months"] = months
+    scaled = months / 48.0
+    targets["observation_age_scaled_squared"] = scaled**2
+    targets["observation_age_scaled_cubed"] = scaled**3
+    for knot in (12, 24, 36):
+        targets[f"observation_age_hinge_{knot}m_cubed"] = (
+            ((months - knot).clip(lower=0.0) / 48.0) ** 3
+        )
+
+
+def _add_observable_retained_prior_judgment_features(
     targets: pd.DataFrame,
     history: pd.DataFrame,
     months: int,
+    *,
+    observable_start_date: str | pd.Timestamp | None = None,
 ) -> None:
-    """Add strictly-prior event features without ever reading prior statuses."""
+    """Add strictly-prior retained-record features without reading statuses."""
 
     history_companies = (
         history["matched_company_number"]
@@ -1110,12 +1591,60 @@ def _add_prior_judgment_features(
                     / np.timedelta64(1, "D")
                 )
 
-    targets["prior_judgment_count_24m"] = counts
-    targets["prior_judgment_value_24m"] = values
-    targets["days_since_prior_judgment_24m"] = recencies
-    targets["no_prior_judgment_24m"] = (
-        targets["prior_judgment_count_24m"] == 0
+    targets["observable_retained_prior_judgment_count_24m"] = counts
+    targets["observable_retained_prior_judgment_value_24m"] = values
+    targets["days_since_observable_retained_prior_judgment_24m"] = recencies
+    targets["no_observable_retained_prior_judgment_24m"] = (
+        targets["observable_retained_prior_judgment_count_24m"] == 0
     ).astype(int)
+
+    target_dates = pd.to_datetime(targets["JudgmentDate"], errors="coerce")
+    required_starts = target_dates - pd.DateOffset(months=months)
+    if observable_start_date is None or pd.isna(observable_start_date):
+        coverage = pd.Series(0.0, index=targets.index)
+    else:
+        observable_start = _as_timestamp(
+            observable_start_date, "observable_start_date"
+        )
+        effective_starts = required_starts.where(
+            required_starts.ge(observable_start), observable_start
+        )
+        required_days = (target_dates - required_starts).dt.days.astype(float)
+        observed_days = (target_dates - effective_starts).dt.days.clip(lower=0).astype(float)
+        coverage = (observed_days / required_days).clip(lower=0.0, upper=1.0)
+    targets["observable_retained_history_calendar_coverage_24m"] = coverage
+
+
+def _add_prior_judgment_features(
+    targets: pd.DataFrame,
+    history: pd.DataFrame,
+    months: int,
+) -> None:
+    """Compatibility wrapper for the pre-redesign private helper.
+
+    New cohort output uses explicit ``observable_retained_*`` names.  The old
+    aliases are emitted only for callers that imported this private helper.
+    """
+
+    observable_start = history["JudgmentDate"].min() if not history.empty else None
+    _add_observable_retained_prior_judgment_features(
+        targets,
+        history,
+        months,
+        observable_start_date=observable_start,
+    )
+    targets["prior_judgment_count_24m"] = targets[
+        "observable_retained_prior_judgment_count_24m"
+    ]
+    targets["prior_judgment_value_24m"] = targets[
+        "observable_retained_prior_judgment_value_24m"
+    ]
+    targets["days_since_prior_judgment_24m"] = targets[
+        "days_since_observable_retained_prior_judgment_24m"
+    ]
+    targets["no_prior_judgment_24m"] = targets[
+        "no_observable_retained_prior_judgment_24m"
+    ]
 
 
 def _add_snapshot_features(targets: pd.DataFrame, observation_date: pd.Timestamp) -> None:
@@ -1319,12 +1848,13 @@ def _split_counts(frame: pd.DataFrame) -> dict[str, dict[str, int]]:
     out: dict[str, dict[str, int]] = {}
     for split in SPLIT_ORDER:
         part = frame.loc[frame["split"] == split]
-        positive = int(part["label"].sum())
+        ages = pd.to_numeric(part.get("observation_age_months"), errors="coerce")
         out[split] = {
             "rows": int(len(part)),
             "unique_companies": int(part["matched_company_number"].nunique()),
-            "positive": positive,
-            "negative": int(len(part) - positive),
+            "mean_observation_age_months": (
+                float(ages.mean()) if ages.notna().any() else None
+            ),
         }
     return out
 
@@ -1336,15 +1866,33 @@ def _guard_splits(frame: pd.DataFrame) -> None:
     memberships = frame.groupby("matched_company_number")["split"].nunique()
     if (memberships > 1).any():
         raise ModelDataError("one or more companies cross modelling splits")
-    ordered_max: pd.Timestamp | None = None
-    for split in SPLIT_ORDER:
-        dates = frame.loc[frame["split"] == split, "JudgmentDate"]
-        if dates.empty:
-            continue
-        current_min = dates.min()
-        if ordered_max is not None and current_min < ordered_max:
-            raise ModelDataError("modelling splits are not chronological")
-        ordered_max = dates.max()
+
+
+def _development_specification_hash(
+    cohort: PreparedCohort,
+    frozen_keys: Sequence[str],
+    champions: Mapping[str, str],
+    seed: int,
+) -> str:
+    membership = cohort.frame.loc[
+        :, ["ID", "matched_company_number", "split"]
+    ].astype(str).sort_values(["ID", "matched_company_number"], kind="mergesort")
+    payload = {
+        "observation_date": cohort.observation_date.date().isoformat(),
+        "seed": int(seed),
+        "frozen_evaluation_keys": list(frozen_keys),
+        "champions": dict(sorted(champions.items())),
+        "feature_families": {
+            name: list(features)
+            for name, features in sorted(cohort.feature_families.items())
+        },
+        "membership_hash": hashlib.sha256(
+            membership.to_csv(index=False, lineterminator="\n").encode("utf-8")
+        ).hexdigest(),
+    }
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
 
 
 def _top_fraction_metrics(y: np.ndarray, p: np.ndarray, fraction: float) -> dict[str, Any]:
@@ -1363,6 +1911,10 @@ def _top_fraction_metrics(y: np.ndarray, p: np.ndarray, fraction: float) -> dict
         "lift": lift,
         "recall": recall,
     }
+
+
+def _capacity_key(fraction: float) -> str:
+    return f"{int(round(float(fraction) * 100))}pct"
 
 
 def _calibration_intercept_slope(
@@ -1480,22 +2032,33 @@ def _json_safe(value: Any) -> Any:
 
 
 __all__ = [
+    "ADMINISTRATIVE_FEATURES",
+    "CAPACITY_FRACTIONS",
     "CalibrationResult",
+    "CROSS_SECTIONAL_FEATURES",
     "FEATURE_FAMILIES",
     "LightGBMUnavailableError",
     "ModelDataError",
     "ModelEvaluation",
+    "ModelDevelopment",
     "ModelRun",
     "PROSPECTIVE_FEATURES",
+    "OBSERVATION_AGE_FEATURES",
     "PreparedCohort",
     "SNAPSHOT_ADDITIONAL_FEATURES",
+    "assign_company_group_splits",
     "assign_chronological_splits",
     "assess_acceptance",
     "bootstrap_metrics",
     "choose_champion",
+    "compare_predictions",
+    "develop_models",
+    "evaluate_locked_models",
     "evaluate_predictions",
     "fit_calibrator",
     "fit_evaluate_models",
+    "materialize_locked_test_outcomes",
+    "paired_cluster_bootstrap_metrics",
     "reliability_table",
     "prepare_model_cohort",
     "write_model_artifacts",

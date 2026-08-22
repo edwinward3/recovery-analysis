@@ -11,7 +11,7 @@ from unittest.mock import patch
 import pandas as pd
 
 from recovery.disclosure import DisclosureViolation
-from recovery.run import PAIR_FILENAME, RunFailure, analyze
+from recovery.run import PAIR_FILENAME, UNMATCHED_FILENAME, RunFailure, analyze
 from recovery.reporting import write_e5 as real_write_e5
 from recovery.synthetic import make_synthetic_bundle, write_bundle
 
@@ -32,7 +32,7 @@ class RunTests(unittest.TestCase):
                     side_effect=AssertionError("Run 1 must not prepare a model cohort"),
                 ),
                 patch(
-                    "recovery.run.fit_evaluate_models",
+                    "recovery.run.develop_models",
                     side_effect=AssertionError("Run 1 must not fit a model"),
                 ),
             ):
@@ -41,6 +41,7 @@ class RunTests(unittest.TestCase):
                     judgments_path=judgments,
                     companies_house_path=companies,
                     observation_date=bundle.observation_date,
+                    companies_house_date=bundle.observation_date,
                     settings_path=ROOT / "settings.toml",
                     output_base=root / "outputs",
                     run_id="matching_only",
@@ -63,17 +64,21 @@ class RunTests(unittest.TestCase):
             self.assertNotIn("score", pairs)
             self.assertNotIn("margin", pairs)
             self.assertEqual(
-                {path.name for path in paths.working.iterdir()}, {PAIR_FILENAME}
+                {path.name for path in paths.working.iterdir()},
+                {PAIR_FILENAME, UNMATCHED_FILENAME},
             )
+            unmatched = pd.read_csv(paths.working / UNMATCHED_FILENAME)
+            self.assertGreater(len(unmatched), 0)
+            self.assertEqual(set(unmatched["tier"]), {"unmatched"})
 
             summary = (paths.results / "SUMMARY.txt").read_text(encoding="utf-8")
-            self.assertIn("RUN 1 MATCHING SUMMARY", summary)
-            self.assertIn("No satisfaction model was trained", summary)
+            self.assertIn("DIAGNOSTIC", summary)
+            self.assertIn("No model was trained", summary)
             manifest = json.loads(
                 (paths.results / "E5_run_manifest.json").read_text(encoding="utf-8")
             )
             self.assertIsNone(manifest["model_only_acceptance"])
-            self.assertEqual(manifest["schema_version"], 2)
+            self.assertEqual(manifest["schema_version"], 3)
             self.assertEqual(
                 manifest["matching_rule"],
                 "unique_date_valid_exact_normalized_name_v1",
@@ -93,16 +98,20 @@ class RunTests(unittest.TestCase):
         self.assertNotIn("A", identifiers)
         self.assertIn("DISTINCTIVE SYNTHETIC NAME LIMITED", identifiers)
 
-    def test_run_2_requires_an_explicit_extract_date(self) -> None:
-        with self.assertRaisesRegex(RunFailure, "explicit RT extract date"):
-            analyze(
-                stage="locked",
-                judgments_path="not opened.csv",
-                companies_house_path="not opened.zip",
-                observation_date=None,
-                settings_path=ROOT / "settings.toml",
-                output_base="not created",
-            )
+    def test_run_2_is_disabled_before_inputs_or_outputs_are_touched(self) -> None:
+        with TemporaryDirectory() as temporary:
+            output_base = Path(temporary) / "must_not_be_created"
+            with self.assertRaisesRegex(RunFailure, "completed two-arm linkage"):
+                analyze(
+                    stage="locked",
+                    judgments_path="not opened.csv",
+                    companies_house_path="not opened.zip",
+                    observation_date="2026-06-01",
+                    companies_house_date="2026-06-01",
+                    settings_path=ROOT / "settings.toml",
+                    output_base=output_base,
+                )
+            self.assertFalse(output_base.exists())
 
     def test_unsafe_final_report_is_not_copied(self) -> None:
         with TemporaryDirectory() as temporary:
@@ -127,6 +136,7 @@ class RunTests(unittest.TestCase):
                     judgments_path=judgments,
                     companies_house_path=companies,
                     observation_date=bundle.observation_date,
+                    companies_house_date=bundle.observation_date,
                     settings_path=ROOT / "settings.toml",
                     output_base=root / "outputs",
                     run_id="unsafe",

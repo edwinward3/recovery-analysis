@@ -76,20 +76,22 @@ def test_summary_is_short_and_explicit(tmp_path: Path) -> None:
     write_summary(
         path,
         {
+            "scope": "matching_only",
             "stage": "diagnostic",
             "status": "PROVISIONAL",
             "observation_date": "2026-06-01",
+            "companies_house_date": "2026-06-01",
+            "data_construct": "cross_sectional_status_only",
+            "min_cell_n": 10,
             "counts": {"rows_read": 10, "model_rows": 4},
             "match": {"denominator": 8, "exact_unique": 4, "unmatched": 4},
-            "primary": {"champion": "logistic", "roc_auc": 0.71},
-            "exploratory": {"roc_auc": 0.80},
-            "gates": {"primary_model": "PROVISIONAL"},
-            "pair_file": "match_pairs_1000.csv",
+            "accepted_file": "linkage_validation_accepted.csv",
+            "unmatched_file": "linkage_validation_unmatched.csv",
         },
     )
     text = path.read_text(encoding="utf-8")
-    assert "Date Inserted measures registration delay" in text
-    assert "CURRENT-SNAPSHOT FEATURES" in text
+    assert "No model was trained or assessed" in text
+    assert "live-company snapshot" in text
     assert "Unique exact-name matches" in text
     assert "<10" in text
     assert len(text.splitlines()) < 60
@@ -163,7 +165,7 @@ def test_extra_input_heading_is_not_copied_to_public_audit() -> None:
     assert "extra_column_1" in table["value"].astype(str).tolist()
 
 
-def test_population_sensitivities_expose_repeated_and_long_window_counts() -> None:
+def test_population_comparison_keeps_repeats_and_defined_age_window() -> None:
     judgments = pd.DataFrame(
         {
             "ID": ["J1", "J2", "J3"],
@@ -184,9 +186,10 @@ def test_population_sensitivities_expose_repeated_and_long_window_counts() -> No
     table = build_population_sensitivities(
         judgments, matches, "2026-06-01", Settings()
     ).set_index("stratum")
-    assert table.loc["primary_12_36_exact_unique_with_repeats", "rows"] == 2
-    assert table.loc["primary_12_36_exact_unique_earliest", "rows"] == 1
-    assert table.loc["aged_12_plus_exact_unique_earliest", "rows"] == 2
+    assert table.loc["post_one_to_48_month_binary_status", "rows"] == 2
+    assert table.loc["included_unique_exact_live_company", "rows"] == 2
+    assert table.loc["included_unique_exact_live_company", "unique_companies"] == 1
+    assert "excluded_unmatched_live_company_bulk" in table.index
 
 
 def test_synthetic_dates_reproduce_rt_semantics(tmp_path: Path) -> None:

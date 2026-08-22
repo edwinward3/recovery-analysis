@@ -1,8 +1,8 @@
 # Fixed settings used by the matching sample and model.
 
 [cohort]
-primary_min_months = 12
-primary_max_months = 36
+primary_min_months = 1
+primary_max_months = 48
 prior_history_months = 24
 
 [pair_sample]

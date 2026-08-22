@@ -6,10 +6,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Mapping, Sequence
 import hashlib
+import math
 import re
 import unicodedata
 
 import pandas as pd
+from scipy.stats import norm
 
 from .config import Settings
 from .data import iter_ch_chunks
@@ -35,6 +37,45 @@ CH_CURRENT_SNAPSHOT_COLUMNS: tuple[str, ...] = (
 )
 
 MATCH_TIERS: tuple[str, ...] = ("exact_unique", "unmatched")
+
+ACCEPTED_LINKAGE_VALIDATION_FILENAME = "linkage_validation_accepted.csv"
+UNMATCHED_LINKAGE_VALIDATION_FILENAME = "linkage_validation_unmatched.csv"
+
+LINKAGE_REVIEW_COLUMNS: tuple[str, ...] = (
+    "reviewer_1_label",
+    "reviewer_1_company_number",
+    "reviewer_2_label",
+    "reviewer_2_company_number",
+    "adjudicated_label",
+    "adjudicated_company_number",
+    "adjudication_notes",
+)
+
+_ARM_LABELS: dict[str, frozenset[str]] = {
+    "accepted": frozenset(("correct_match", "incorrect_match")),
+    "unmatched": frozenset(("missed_match", "true_unmatched")),
+}
+
+_POSITIVE_LABEL: dict[str, str] = {
+    "accepted": "correct_match",
+    "unmatched": "missed_match",
+}
+
+_FORBIDDEN_VALIDATION_COLUMNS: frozenset[str] = frozenset(
+    {
+        "judgmentstatus",
+        "satisfactiondate",
+        "cancellationdate",
+        "cancellationreason",
+        "companystatus",
+        "outcome",
+        "target",
+        "issatisfied",
+        "satisfied",
+        "unsatisfied",
+        "y",
+    }
+)
 
 _LEGAL_SUFFIXES: tuple[tuple[str, ...], ...] = tuple(
     tuple(value.split())
@@ -843,17 +884,718 @@ def pair_sample(
     return sampled.loc[:, [column for column in columns if column in sampled]].copy()
 
 
+# Make and analyse the independent linkage-validation samples
+
+def _assert_no_outcome_columns(frame: pd.DataFrame) -> None:
+    forbidden = {
+        str(column)
+        for column in frame.columns
+        if _canon_header(column) in _FORBIDDEN_VALIDATION_COLUMNS
+    }
+    if forbidden:
+        raise ValueError(
+            "linkage-validation files must not contain outcome/status column(s): "
+            f"{sorted(forbidden)}"
+        )
+
+
+def _sample_allocations(populations: pd.Series, target: int) -> pd.Series:
+    """Allocate a fixed target to every stratum, then approximately proportionally."""
+
+    populations = populations.astype(int).sort_index()
+    if populations.empty:
+        return populations.copy()
+    total = int(populations.sum())
+    target = min(int(target), total)
+    if target < len(populations):
+        raise ValueError(
+            "unmatched sample size is too small to give every reason/vintage "
+            f"stratum a positive inclusion probability: need at least {len(populations):,}"
+        )
+
+    allocation = pd.Series(1, index=populations.index, dtype="int64")
+    remaining = target - len(allocation)
+    capacity = populations - allocation
+    while remaining > 0 and int(capacity.sum()) > 0:
+        ideal = capacity.astype(float) * remaining / int(capacity.sum())
+        addition = ideal.map(math.floor).astype(int).clip(upper=capacity)
+        if int(addition.sum()) == 0:
+            order = sorted(
+                capacity.loc[capacity.gt(0)].index,
+                key=lambda key: (-(ideal.loc[key] % 1), str(key)),
+            )
+            for key in order[:remaining]:
+                addition.loc[key] += 1
+        allocation += addition
+        capacity -= addition
+        remaining = target - int(allocation.sum())
+    if int(allocation.sum()) != target:
+        raise RuntimeError("could not allocate the requested unmatched validation sample")
+    return allocation
+
+
+def unmatched_pair_sample(
+    judgments: pd.DataFrame,
+    matches: pd.DataFrame,
+    sample_size: int,
+    *,
+    seed: int,
+) -> pd.DataFrame:
+    """Draw a reproducible stratified probability sample of unmatched judgments.
+
+    Strata cross the algorithmic unmatched reason with judgment year. Within each
+    stratum, a seeded cryptographic rank acts as the random permutation. The
+    design samples every non-empty stratum and records its exact first-order
+    inclusion probability and inverse-probability weight.
+    """
+
+    if int(sample_size) <= 0:
+        raise ValueError("unmatched sample size must be positive")
+    required_matches = {
+        "ID",
+        "tier",
+        "reason",
+        "source_company_name",
+        "source_trading_name",
+        "source_postcode",
+    }
+    missing = required_matches - set(matches.columns)
+    if missing:
+        raise ValueError(
+            f"matches missing unmatched-sample column(s): {sorted(missing)}"
+        )
+    if "ID" not in judgments or "JudgmentDate" not in judgments:
+        raise ValueError("judgments must contain ID and JudgmentDate")
+    if matches["ID"].astype(str).duplicated().any():
+        raise ValueError("matches contain duplicate ID values")
+    if judgments["ID"].astype(str).duplicated().any():
+        raise ValueError("judgments contain duplicate ID values")
+
+    allowed_match_columns = [
+        "ID",
+        "tier",
+        "reason",
+        "source_company_name",
+        "source_trading_name",
+        "source_postcode",
+        "exact_name_candidate_count",
+        "rejected_post_incorporation",
+        "incorporation_date_missing",
+        "name_history_incomplete",
+    ]
+    unmatched = matches.loc[
+        matches["tier"].eq("unmatched"),
+        [column for column in allowed_match_columns if column in matches],
+    ].copy()
+    if unmatched.empty:
+        raise ValueError("no unmatched judgments are available for validation")
+
+    judgment_columns = ["ID", "JudgmentDate"]
+    if "Defendant Address" in judgments:
+        judgment_columns.append("Defendant Address")
+    dates = judgments.loc[:, judgment_columns].copy()
+    dates["ID"] = dates["ID"].astype(str)
+    dates["JudgmentDate"] = pd.to_datetime(
+        dates["JudgmentDate"], format="mixed", dayfirst=True, errors="coerce"
+    ).dt.normalize()
+    unmatched["ID"] = unmatched["ID"].astype(str)
+    unmatched = unmatched.merge(dates, on="ID", how="left", validate="one_to_one")
+    if unmatched["JudgmentDate"].isna().any():
+        raise ValueError(
+            "every unmatched judgment must have a parseable JudgmentDate for vintage sampling"
+        )
+    if "Defendant Address" in unmatched:
+        unmatched = unmatched.rename(columns={"Defendant Address": "source_address"})
+
+    unmatched["__vintage"] = unmatched["JudgmentDate"].dt.year.astype(str)
+    unmatched["sampling_stratum"] = (
+        "reason="
+        + unmatched["reason"].fillna("missing").astype(str)
+        + "|judgment_year="
+        + unmatched["__vintage"]
+    )
+    populations = unmatched["sampling_stratum"].value_counts(sort=False)
+    allocation = _sample_allocations(populations, int(sample_size))
+
+    selected_parts: list[pd.DataFrame] = []
+    for stratum in sorted(populations.index):
+        stratum_frame = unmatched.loc[
+            unmatched["sampling_stratum"].eq(stratum)
+        ].copy()
+        stratum_frame["__rank"] = [
+            _stable_rank(int(seed), f"unmatched|{stratum}", identifier, "")
+            for identifier in stratum_frame["ID"]
+        ]
+        stratum_frame = stratum_frame.sort_values("__rank", kind="stable")
+        sample_n = int(allocation.loc[stratum])
+        population_n = int(populations.loc[stratum])
+        selected = stratum_frame.head(sample_n).copy()
+        selected["validation_arm"] = "unmatched"
+        selected["sampling_design"] = "reason_vintage_stratified_hash_srs"
+        selected["stratum_population_n"] = population_n
+        selected["stratum_sample_n"] = sample_n
+        selected["inclusion_probability"] = sample_n / population_n
+        selected["sampling_weight"] = population_n / sample_n
+        selected_parts.append(selected)
+
+    sampled = pd.concat(selected_parts, ignore_index=True)
+    sampled["match_method"] = sampled["reason"]
+    sampled = sampled.drop(columns=["__vintage", "__rank"], errors="ignore")
+    for column in LINKAGE_REVIEW_COLUMNS:
+        sampled[column] = ""
+    sampled = sampled.sort_values("ID", kind="stable").reset_index(drop=True)
+    _assert_no_outcome_columns(sampled)
+    return sampled
+
+
+def accepted_validation_sample(
+    judgments: pd.DataFrame,
+    matches: pd.DataFrame,
+    settings: Settings,
+    *,
+    seed: int | None = None,
+) -> pd.DataFrame:
+    """Add auditable sampling metadata and blank review fields to accepted pairs."""
+
+    actual_seed = settings.locked_seed if seed is None else int(seed)
+    accepted = pair_sample(judgments, matches, settings, seed=actual_seed).copy()
+    accepted_population_n = int(matches["tier"].eq("exact_unique").sum())
+    accepted_sample_n = len(accepted)
+    accepted["validation_arm"] = "accepted"
+    accepted["sampling_design"] = "equal_probability_systematic"
+    accepted["sampling_stratum"] = "tier=exact_unique"
+    accepted["stratum_population_n"] = accepted_population_n
+    accepted["stratum_sample_n"] = accepted_sample_n
+    accepted["inclusion_probability"] = accepted_sample_n / accepted_population_n
+    accepted["sampling_weight"] = accepted_population_n / accepted_sample_n
+    if "Defendant Address" in judgments:
+        source_address = judgments[["ID", "Defendant Address"]].copy()
+        source_address["ID"] = source_address["ID"].astype(str)
+        accepted["ID"] = accepted["ID"].astype(str)
+        accepted = accepted.merge(
+            source_address.rename(columns={"Defendant Address": "source_address"}),
+            on="ID",
+            how="left",
+            validate="one_to_one",
+        )
+    for column in LINKAGE_REVIEW_COLUMNS:
+        accepted[column] = ""
+    _assert_no_outcome_columns(accepted)
+    return accepted
+
+
+def unmatched_validation_sample(
+    judgments: pd.DataFrame,
+    matches: pd.DataFrame,
+    sample_size: int,
+    *,
+    seed: int,
+) -> pd.DataFrame:
+    """Public, plainly named entry point for the unmatched validation arm."""
+
+    return unmatched_pair_sample(judgments, matches, sample_size, seed=seed)
+
+
+def linkage_validation_sample(
+    judgments: pd.DataFrame,
+    matches: pd.DataFrame,
+    settings: Settings,
+    *,
+    unmatched_sample_size: int,
+    seed: int | None = None,
+) -> pd.DataFrame:
+    """Combine the retained accepted-pair sample with an unmatched audit sample.
+
+    Only identity, matching and sampling fields leave this function. In
+    particular, no Registry Trust outcome/status or Companies House current
+    status field is copied to the adjudication file.
+    """
+
+    actual_seed = settings.locked_seed if seed is None else int(seed)
+    accepted = accepted_validation_sample(
+        judgments, matches, settings, seed=actual_seed
+    )
+
+    unmatched = unmatched_validation_sample(
+        judgments,
+        matches,
+        unmatched_sample_size,
+        seed=actual_seed,
+    )
+    combined = pd.concat([accepted, unmatched], ignore_index=True, sort=False)
+    text_columns = [
+        "source_company_name",
+        "source_trading_name",
+        "source_postcode",
+        "source_address",
+        "matched_company_name",
+        "matched_name",
+        "matched_name_kind",
+        "matched_company_number",
+        "matched_company_postcode",
+        "matched_on",
+        "reason",
+        "match_method",
+        *LINKAGE_REVIEW_COLUMNS,
+    ]
+    for column in text_columns:
+        if column not in combined:
+            combined[column] = ""
+        else:
+            combined[column] = combined[column].fillna("")
+    combined = combined.sort_values(
+        ["validation_arm", "ID"], kind="stable"
+    ).reset_index(drop=True)
+    _assert_no_outcome_columns(combined)
+    return combined
+
+
+def _clean_label(value: object) -> str:
+    if value is None or pd.isna(value):
+        return ""
+    return str(value).strip().lower()
+
+
+def _clean_company_number(value: object) -> str:
+    if value is None or pd.isna(value):
+        return ""
+    return re.sub(r"\s+", "", str(value).strip().upper())
+
+
+def _validate_sampling_metadata(frame: pd.DataFrame) -> None:
+    required = {
+        "ID",
+        "validation_arm",
+        "sampling_stratum",
+        "stratum_population_n",
+        "stratum_sample_n",
+        "inclusion_probability",
+        "sampling_weight",
+    }
+    missing = required - set(frame.columns)
+    if missing:
+        raise ValueError(
+            f"linkage adjudications missing sampling column(s): {sorted(missing)}"
+        )
+    if frame.empty:
+        raise ValueError("linkage adjudications are empty")
+    if frame["ID"].astype(str).duplicated().any():
+        raise ValueError("linkage adjudications contain duplicate ID values")
+    invalid_arms = set(frame["validation_arm"].map(_clean_label)) - set(_ARM_LABELS)
+    if invalid_arms:
+        raise ValueError(f"invalid linkage-validation arm(s): {sorted(invalid_arms)}")
+
+    for (arm, stratum), group in frame.groupby(
+        ["validation_arm", "sampling_stratum"], dropna=False, sort=False
+    ):
+        if not str(stratum).strip():
+            raise ValueError("sampling_stratum must not be blank")
+        metadata: dict[str, float] = {}
+        for column in (
+            "stratum_population_n",
+            "stratum_sample_n",
+            "inclusion_probability",
+            "sampling_weight",
+        ):
+            values = pd.to_numeric(group[column], errors="coerce")
+            if values.isna().any() or values.nunique(dropna=False) != 1:
+                raise ValueError(
+                    f"sampling metadata {column!r} is invalid or inconsistent in "
+                    f"{arm!r}/{stratum!r}"
+                )
+            metadata[column] = float(values.iloc[0])
+        population_n = metadata["stratum_population_n"]
+        sample_n = metadata["stratum_sample_n"]
+        if (
+            not population_n.is_integer()
+            or not sample_n.is_integer()
+            or population_n <= 0
+            or sample_n <= 0
+            or sample_n > population_n
+            or int(sample_n) != len(group)
+        ):
+            raise ValueError(f"invalid sample/population sizes in {arm!r}/{stratum!r}")
+        expected_probability = sample_n / population_n
+        if not math.isclose(
+            metadata["inclusion_probability"], expected_probability, rel_tol=1e-9
+        ):
+            raise ValueError(
+                f"inclusion_probability is inconsistent in {arm!r}/{stratum!r}"
+            )
+        if not math.isclose(
+            metadata["sampling_weight"], 1 / expected_probability, rel_tol=1e-9
+        ):
+            raise ValueError(f"sampling_weight is inconsistent in {arm!r}/{stratum!r}")
+
+
+def validate_linkage_adjudications(adjudications: pd.DataFrame) -> pd.DataFrame:
+    """Validate and normalise a completed, independently double-reviewed sample."""
+
+    _assert_no_outcome_columns(adjudications)
+    _validate_sampling_metadata(adjudications)
+    missing = set(LINKAGE_REVIEW_COLUMNS) - set(adjudications.columns)
+    if missing:
+        raise ValueError(
+            f"linkage adjudications missing review column(s): {sorted(missing)}"
+        )
+    validated = adjudications.copy()
+    validated["validation_arm"] = validated["validation_arm"].map(_clean_label)
+    for column in (
+        "reviewer_1_label",
+        "reviewer_2_label",
+        "adjudicated_label",
+    ):
+        validated[column] = validated[column].map(_clean_label)
+    for column in (
+        "matched_company_number",
+        "reviewer_1_company_number",
+        "reviewer_2_company_number",
+        "adjudicated_company_number",
+    ):
+        if column not in validated:
+            validated[column] = ""
+        validated[column] = validated[column].map(_clean_company_number)
+
+    for row_number, row in validated.iterrows():
+        identifier = str(row["ID"])
+        arm = str(row["validation_arm"])
+        allowed = _ARM_LABELS[arm]
+        labels = {
+            role: str(row[f"{role}_label"])
+            for role in ("reviewer_1", "reviewer_2", "adjudicated")
+        }
+        for role, label in labels.items():
+            if not label:
+                raise ValueError(
+                    f"incomplete linkage adjudication for ID {identifier!r}: "
+                    f"{role}_label is blank"
+                )
+            if label not in allowed:
+                raise ValueError(
+                    f"invalid {role}_label {label!r} for {arm} ID {identifier!r}; "
+                    f"allowed labels are {sorted(allowed)}"
+                )
+        if labels["reviewer_1"] == labels["reviewer_2"]:
+            if labels["adjudicated"] != labels["reviewer_1"]:
+                raise ValueError(
+                    f"adjudicated_label contradicts agreeing reviewers for ID {identifier!r}"
+                )
+
+        for role in ("reviewer_1", "reviewer_2", "adjudicated"):
+            label = labels[role]
+            company_number = str(row[f"{role}_company_number"])
+            if arm == "unmatched":
+                if label == "missed_match" and not company_number:
+                    raise ValueError(
+                        f"{role}_company_number is required for missed_match ID {identifier!r}"
+                    )
+                if label == "true_unmatched" and company_number:
+                    raise ValueError(
+                        f"{role}_company_number must be blank for true_unmatched ID {identifier!r}"
+                    )
+            elif label == "correct_match":
+                proposed = str(row["matched_company_number"])
+                if not proposed:
+                    raise ValueError(
+                        f"accepted ID {identifier!r} has no proposed matched company number"
+                    )
+                if company_number and company_number != proposed:
+                    raise ValueError(
+                        f"{role}_company_number does not equal the proposed match "
+                        f"for ID {identifier!r}"
+                    )
+
+        if arm == "unmatched" and labels["reviewer_1"] == labels["reviewer_2"] == "missed_match":
+            first_number = str(row["reviewer_1_company_number"])
+            second_number = str(row["reviewer_2_company_number"])
+            final_number = str(row["adjudicated_company_number"])
+            if first_number == second_number and final_number != first_number:
+                raise ValueError(
+                    f"adjudicated company number contradicts agreeing reviewers "
+                    f"for ID {identifier!r}"
+                )
+    return validated
+
+
+def _wilson_interval(successes: int, sample_n: int, confidence_level: float) -> tuple[float, float]:
+    if sample_n <= 0:
+        raise ValueError("Wilson interval requires a positive sample size")
+    alpha = 1 - confidence_level
+    z = float(norm.ppf(1 - alpha / 2))
+    proportion = successes / sample_n
+    denominator = 1 + z * z / sample_n
+    centre = (proportion + z * z / (2 * sample_n)) / denominator
+    radius = (
+        z
+        * math.sqrt(
+            proportion * (1 - proportion) / sample_n
+            + z * z / (4 * sample_n * sample_n)
+        )
+        / denominator
+    )
+    return max(0.0, centre - radius), min(1.0, centre + radius)
+
+
+def _design_weighted_prevalence(
+    frame: pd.DataFrame,
+    *,
+    positive_label: str,
+    confidence_level: float,
+) -> dict[str, object]:
+    strata = list(frame.groupby("sampling_stratum", sort=False, dropna=False))
+    if not strata:
+        raise ValueError("cannot estimate a prevalence from an empty validation arm")
+    alpha = 1 - confidence_level
+    stratum_confidence = 1 - alpha / len(strata)
+    population_total = 0
+    estimated_positive_total = 0.0
+    lower_total = 0.0
+    upper_total = 0.0
+    sample_total = 0
+    for _stratum, group in strata:
+        population_n = int(group["stratum_population_n"].iloc[0])
+        sample_n = len(group)
+        successes = int(group["adjudicated_label"].eq(positive_label).sum())
+        estimate = successes / sample_n
+        if sample_n == population_n:
+            lower, upper = estimate, estimate
+        else:
+            lower, upper = _wilson_interval(
+                successes, sample_n, stratum_confidence
+            )
+        population_total += population_n
+        sample_total += sample_n
+        estimated_positive_total += population_n * estimate
+        lower_total += population_n * lower
+        upper_total += population_n * upper
+    return {
+        "estimate": estimated_positive_total / population_total,
+        "lower_ci": lower_total / population_total,
+        "upper_ci": upper_total / population_total,
+        "estimated_positive_total": estimated_positive_total,
+        "population_n": population_total,
+        "sample_n": sample_total,
+        "ci_method": (
+            "Bonferroni-stratified Wilson intervals (census strata exact); "
+            "systematic-sample interval is an approximation"
+        ),
+    }
+
+
+def _cohen_kappa(first: pd.Series, second: pd.Series) -> float:
+    first_binary = first.astype(int)
+    second_binary = second.astype(int)
+    observed = float(first_binary.eq(second_binary).mean())
+    first_positive = float(first_binary.mean())
+    second_positive = float(second_binary.mean())
+    expected = (
+        first_positive * second_positive
+        + (1 - first_positive) * (1 - second_positive)
+    )
+    if math.isclose(expected, 1.0):
+        return float("nan")
+    return (observed - expected) / (1 - expected)
+
+
+def _reviewer_agreement(frame: pd.DataFrame) -> pd.DataFrame:
+    rows: list[dict[str, object]] = []
+    groups: list[tuple[str, pd.DataFrame]] = [
+        (str(arm), group) for arm, group in frame.groupby("validation_arm", sort=True)
+    ]
+    groups.append(("overall", frame))
+    for arm, group in groups:
+        first_positive = pd.Series(
+            [
+                label == _POSITIVE_LABEL[row_arm]
+                for label, row_arm in zip(
+                    group["reviewer_1_label"], group["validation_arm"]
+                )
+            ],
+            index=group.index,
+        )
+        second_positive = pd.Series(
+            [
+                label == _POSITIVE_LABEL[row_arm]
+                for label, row_arm in zip(
+                    group["reviewer_2_label"], group["validation_arm"]
+                )
+            ],
+            index=group.index,
+        )
+        decision_agreement: list[bool] = []
+        for _, row in group.iterrows():
+            labels_agree = row["reviewer_1_label"] == row["reviewer_2_label"]
+            if row["validation_arm"] == "unmatched" and row["reviewer_1_label"] == "missed_match":
+                labels_agree = labels_agree and (
+                    row["reviewer_1_company_number"]
+                    == row["reviewer_2_company_number"]
+                )
+            decision_agreement.append(bool(labels_agree))
+        rows.append(
+            {
+                "validation_arm": arm,
+                "reviewed_n": int(len(group)),
+                "label_agreement": float(first_positive.eq(second_positive).mean()),
+                "decision_agreement": float(pd.Series(decision_agreement).mean()),
+                "cohen_kappa": _cohen_kappa(first_positive, second_positive),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def summarize_linkage_validation(
+    adjudications: pd.DataFrame,
+    *,
+    confidence_level: float = 0.95,
+    recall_denominator_supported: bool = False,
+) -> dict[str, pd.DataFrame]:
+    """Calculate linkage accuracy with design weights and explicit recall gating.
+
+    Set ``recall_denominator_supported`` only when both audit arms used the same
+    target population and reviewers searched a company universe capable of
+    finding every target link (including dissolved companies when those are in
+    scope). Otherwise the function deliberately withholds recall.
+    """
+
+    if not 0 < float(confidence_level) < 1:
+        raise ValueError("confidence_level must lie strictly between zero and one")
+    validated = validate_linkage_adjudications(adjudications)
+    arms = set(validated["validation_arm"])
+    required_arms = {"accepted", "unmatched"}
+    if not required_arms.issubset(arms):
+        raise ValueError(
+            "completed accepted and unmatched adjudication arms are both required"
+        )
+
+    accepted = validated.loc[validated["validation_arm"].eq("accepted")]
+    unmatched = validated.loc[validated["validation_arm"].eq("unmatched")]
+    precision = _design_weighted_prevalence(
+        accepted,
+        positive_label="correct_match",
+        confidence_level=float(confidence_level),
+    )
+    missed = _design_weighted_prevalence(
+        unmatched,
+        positive_label="missed_match",
+        confidence_level=float(confidence_level),
+    )
+    estimate_rows: list[dict[str, object]] = [
+        {
+            "measure": "accepted_match_precision",
+            **precision,
+            "status": "estimated",
+            "reason": "",
+        },
+        {
+            "measure": "unmatched_missed_link_prevalence",
+            **missed,
+            "status": "estimated",
+            "reason": "",
+        },
+    ]
+
+    recall_row: dict[str, object] = {
+        "measure": "linkage_recall",
+        "estimate": float("nan"),
+        "lower_ci": float("nan"),
+        "upper_ci": float("nan"),
+        "estimated_positive_total": float("nan"),
+        "population_n": int(precision["population_n"]) + int(missed["population_n"]),
+        "sample_n": int(precision["sample_n"]) + int(missed["sample_n"]),
+        "ci_method": "",
+        "status": "not_estimated",
+        "reason": (
+            "recall denominator not certified; confirm a common target population "
+            "and an exhaustive adjudication search universe"
+        ),
+    }
+    if recall_denominator_supported:
+        accepted_true = float(precision["estimated_positive_total"])
+        missed_true = float(missed["estimated_positive_total"])
+        denominator = accepted_true + missed_true
+        if denominator <= 0:
+            recall_row["reason"] = "estimated number of true links is zero"
+        else:
+            component_confidence = 1 - (1 - float(confidence_level)) / 2
+            precision_joint = _design_weighted_prevalence(
+                accepted,
+                positive_label="correct_match",
+                confidence_level=component_confidence,
+            )
+            missed_joint = _design_weighted_prevalence(
+                unmatched,
+                positive_label="missed_match",
+                confidence_level=component_confidence,
+            )
+            accepted_population = float(precision["population_n"])
+            unmatched_population = float(missed["population_n"])
+            true_positive_low = accepted_population * float(precision_joint["lower_ci"])
+            true_positive_high = accepted_population * float(precision_joint["upper_ci"])
+            false_negative_low = unmatched_population * float(missed_joint["lower_ci"])
+            false_negative_high = unmatched_population * float(missed_joint["upper_ci"])
+            recall_row.update(
+                {
+                    "estimate": accepted_true / denominator,
+                    "lower_ci": true_positive_low
+                    / (true_positive_low + false_negative_high),
+                    "upper_ci": true_positive_high
+                    / (true_positive_high + false_negative_low),
+                    "estimated_positive_total": denominator,
+                    "ci_method": (
+                        "monotone bounds from Bonferroni-adjusted component "
+                        "prevalence intervals"
+                    ),
+                    "status": "estimated",
+                    "reason": "",
+                }
+            )
+    estimate_rows.append(recall_row)
+
+    stratum_rows: list[dict[str, object]] = []
+    for (arm, stratum), group in validated.groupby(
+        ["validation_arm", "sampling_stratum"], sort=True
+    ):
+        positive = _POSITIVE_LABEL[str(arm)]
+        population_n = int(group["stratum_population_n"].iloc[0])
+        sample_n = len(group)
+        positives = int(group["adjudicated_label"].eq(positive).sum())
+        stratum_rows.append(
+            {
+                "validation_arm": arm,
+                "sampling_stratum": stratum,
+                "stratum_population_n": population_n,
+                "stratum_sample_n": sample_n,
+                "adjudicated_positive_n": positives,
+                "weighted_positive_total": population_n * positives / sample_n,
+                "weighted_prevalence": positives / sample_n,
+            }
+        )
+    return {
+        "estimates": pd.DataFrame(estimate_rows),
+        "reviewer_agreement": _reviewer_agreement(validated),
+        "stratum_estimates": pd.DataFrame(stratum_rows),
+    }
+
+
 __all__ = [
+    "ACCEPTED_LINKAGE_VALIDATION_FILENAME",
     "CH_CURRENT_SNAPSHOT_COLUMNS",
     "CH_REQUIRED_COLUMNS",
     "CHIndex",
     "CompanyRecord",
     "MATCH_TIERS",
     "NamePeriod",
+    "UNMATCHED_LINKAGE_VALIDATION_FILENAME",
+    "accepted_validation_sample",
     "build_relevant_ch_index",
+    "linkage_validation_sample",
     "match_diagnostics",
     "match_judgments",
     "normalize_name",
     "normalize_postcode",
     "pair_sample",
+    "summarize_linkage_validation",
+    "unmatched_pair_sample",
+    "unmatched_validation_sample",
+    "validate_linkage_adjudications",
 ]

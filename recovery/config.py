@@ -12,8 +12,8 @@ import tomllib
 
 @dataclass(frozen=True, slots=True)
 class Settings:
-    primary_min_months: int = 12
-    primary_max_months: int = 36
+    primary_min_months: int = 1
+    primary_max_months: int = 48
     prior_history_months: int = 24
     min_cell_n: int = 10
     diagnostic_seed: int = 20260618
@@ -65,8 +65,8 @@ def load_settings(path: str | Path) -> Settings:
 def _validate(settings: Settings) -> None:
     if not 0 < settings.primary_min_months < settings.primary_max_months:
         raise ValueError("primary cohort months must satisfy 0 < min < max")
-    if settings.prior_history_months <= 0:
-        raise ValueError("prior_history_months must be positive")
+    if settings.prior_history_months != 24:
+        raise ValueError("prior_history_months must be 24 for the frozen feature schema")
     if settings.sample_size != 1_000:
         raise ValueError("pair sample size must be 1,000")
     if settings.diagnostic_seed == settings.locked_seed:

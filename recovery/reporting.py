@@ -58,8 +58,8 @@ class RunRecorder:
 def create_run_paths(base: str | Path, stage: str, run_id: str | None = None) -> RunPaths:
     """Create a new, non-overwriting run directory."""
 
-    if stage not in {"diagnostic", "locked"}:
-        raise ValueError("stage must be 'diagnostic' or 'locked'")
+    if stage not in {"diagnostic", "development", "locked"}:
+        raise ValueError("stage must be diagnostic, development or locked")
     token = run_id or datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     root = Path(base) / f"{stage}_{token}"
     if root.exists():
@@ -144,8 +144,16 @@ def build_data_audit_counts(
     )
     frame["observation_age_band"] = pd.cut(
         age,
-        bins=[-float("inf"), 12, 36, float("inf")],
-        labels=["under_12_months", "12_to_36_months", "over_36_months"],
+        bins=[-float("inf"), 1, 12, 24, 36, 48, 72, float("inf")],
+        labels=[
+            "up_to_1_month",
+            "over_1_to_12_months",
+            "over_12_to_24_months",
+            "over_24_to_36_months",
+            "over_36_to_48_months",
+            "over_48_to_72_months",
+            "over_72_months",
+        ],
         right=False,
     ).astype("string").fillna("missing")
 
@@ -198,6 +206,23 @@ def build_data_audit_counts(
             }
         )
     if audit is not None:
+        rows.append(
+            {
+                "dimension": "data_construct",
+                "value": str(getattr(audit, "data_construct", "unknown")),
+                "rows": support,
+                "share": 1.0,
+            }
+        )
+        for column in getattr(audit, "event_date_columns_present", ()):
+            rows.append(
+                {
+                    "dimension": "event_or_snapshot_column_present",
+                    "value": str(column),
+                    "rows": support,
+                    "share": 1.0,
+                }
+            )
         for position, _header in enumerate(
             getattr(audit, "extra_headers", ()), start=1
         ):
@@ -261,95 +286,157 @@ def write_e2(egress: Path, diagnostics: dict[str, pd.DataFrame]) -> list[str]:
     return files
 
 
+def write_linkage_validation(
+    egress: Path,
+    summaries: dict[str, pd.DataFrame],
+) -> list[str]:
+    names = {
+        "estimates": "E2_linkage_validation_estimates.csv",
+        "reviewer_agreement": "E2_linkage_reviewer_agreement.csv",
+        "stratum_estimates": "E2_linkage_strata.csv",
+    }
+    return [
+        _write_csv(egress / filename, summaries.get(key, pd.DataFrame()))
+        for key, filename in names.items()
+    ]
+
+
 # E3 and E4 model results
+
+def build_development_tables(
+    development: Any,
+    sensitivities: pd.DataFrame | None = None,
+) -> dict[str, pd.DataFrame]:
+    """Return development-only aggregates without test outcomes or class counts."""
+
+    model_rows: list[dict[str, Any]] = []
+    for key, metrics in sorted(development.validation_metrics.items()):
+        family, algorithm = key.split(".", maxsplit=1)
+        model_rows.append(
+            {
+                "model": key,
+                "family": family,
+                "algorithm": algorithm,
+                "selected_for_locked_test": key in development.frozen_evaluation_keys,
+                "validation_rows": metrics.get("n"),
+                "validation_positive": metrics.get("n_positive"),
+                "validation_negative": metrics.get("n_negative"),
+                "validation_roc_auc": metrics.get("roc_auc"),
+                "validation_average_precision": metrics.get("average_precision"),
+                "validation_brier": metrics.get("brier"),
+                "validation_log_loss": metrics.get("log_loss"),
+            }
+        )
+    split_rows = [
+        {"split": split, **counts}
+        for split, counts in development.cohort.split_counts.items()
+    ]
+    return {
+        "development": pd.DataFrame(model_rows),
+        "split_counts": pd.DataFrame(split_rows),
+        "sensitivities": (
+            sensitivities.copy() if sensitivities is not None else pd.DataFrame()
+        ),
+    }
+
+
+def write_development_tables(
+    egress: Path,
+    tables: dict[str, pd.DataFrame],
+    limitations: str,
+) -> list[str]:
+    names = {
+        "development": "E3_development_models.csv",
+        "split_counts": "E3_split_counts.csv",
+        "sensitivities": "E4_population_comparison.csv",
+    }
+    files = [
+        _write_csv(egress / filename, tables.get(key, pd.DataFrame()))
+        for key, filename in names.items()
+    ]
+    path = egress / "E4_limitations.txt"
+    path.write_text(limitations.rstrip() + "\n", encoding="utf-8")
+    files.append(path.name)
+    return files
 
 def build_model_tables(
     evaluation: Any,
     sensitivities: pd.DataFrame | None = None,
 ) -> dict[str, pd.DataFrame]:
-    """Flatten the four aggregate model results into E3/E4 tables."""
+    """Flatten the prespecified locked evaluation into aggregate tables."""
 
     comparison: list[dict[str, Any]] = []
     calibration: list[dict[str, Any]] = []
-    effects: list[dict[str, Any]] = []
-    lift: list[dict[str, Any]] = []
+    ranking: list[dict[str, Any]] = []
+    incremental: list[dict[str, Any]] = []
+
+    prevalence = getattr(evaluation, "prevalence_baseline", {})
+    prevalence_metrics = prevalence.get("metrics", {})
+    prevalence_intervals = prevalence.get("bootstrap_intervals", {})
+    if prevalence_metrics:
+        comparison.append(
+            _comparison_row(
+                "training_prevalence",
+                "constant",
+                "baseline",
+                prevalence_metrics,
+                prevalence_intervals,
+                validation_metrics={},
+                calibration_method="none",
+            )
+        )
     for key, run in sorted(evaluation.runs.items()):
         test = run.test_metrics_calibrated
         intervals = run.bootstrap_intervals
+        role = "age_only_baseline" if run.family == "age_only" else "frozen_primary"
         comparison.append(
-            {
-                "model": key,
-                "family": run.family,
-                "algorithm": run.algorithm,
-                "role": "primary_candidate" if run.family == "prospective" else "exploratory_only",
-                "validation_selected": evaluation.champions.get(run.family) == run.algorithm,
-                "calibration_method": run.calibration.method,
-                "test_rows": test.get("n"),
-                "test_positive": test.get("n_positive"),
-                "test_negative": test.get("n_negative"),
-                "validation_roc_auc": run.validation_metrics.get("roc_auc"),
-                "validation_brier": run.validation_metrics.get("brier"),
-                "test_roc_auc": test.get("roc_auc"),
-                "test_roc_auc_lower_95": intervals.get("roc_auc", {}).get("lower"),
-                "test_roc_auc_upper_95": intervals.get("roc_auc", {}).get("upper"),
-                "test_average_precision": test.get("average_precision"),
-                "test_average_precision_lower_95": intervals.get(
-                    "average_precision", {}
-                ).get("lower"),
-                "test_average_precision_upper_95": intervals.get(
-                    "average_precision", {}
-                ).get("upper"),
-                "test_brier": test.get("brier"),
-                "test_brier_lower_95": intervals.get("brier", {}).get("lower"),
-                "test_brier_upper_95": intervals.get("brier", {}).get("upper"),
-                "training_prevalence_brier": test.get("null_brier"),
-                "test_log_loss": test.get("log_loss"),
-                "test_log_loss_lower_95": intervals.get("log_loss", {}).get("lower"),
-                "test_log_loss_upper_95": intervals.get("log_loss", {}).get("upper"),
-                "mean_prediction": test.get("mean_prediction"),
-                "observed_rate": test.get("base_rate"),
-                "calibration_gap_lower_95": intervals.get("calibration_gap", {}).get(
-                    "lower"
-                ),
-                "calibration_gap_upper_95": intervals.get("calibration_gap", {}).get(
-                    "upper"
-                ),
-                "calibration_intercept": test.get("calibration_intercept"),
-                "calibration_slope": test.get("calibration_slope"),
-            }
+            _comparison_row(
+                key,
+                run.algorithm,
+                role,
+                test,
+                intervals,
+                validation_metrics=run.validation_metrics,
+                calibration_method=run.calibration.method,
+            )
         )
         for row in run.reliability_bins:
             calibration.append({"model": key, **row})
-        support = int(test.get("n", 0))
-        for row in run.feature_effects:
-            effects.append(
+        for capacity, values in test.get("capacity_metrics", {}).items():
+            ranking.append(
                 {
                     "model": key,
-                    "family": run.family,
-                    "algorithm": run.algorithm,
-                    "support_rows": support,
-                    "feature_name": row["feature"],
-                    "effect_type": row["effect_type"],
-                    "value": row["value"],
-                    "absolute_share": row["absolute_share"],
-                    "direction": row["direction"],
+                    "capacity": capacity,
+                    "selected": values.get("selected"),
+                    "selected_positive": values.get("selected_positive"),
+                    "selected_negative": values.get("selected_negative"),
+                    "positive_rate": values.get("positive_rate"),
+                    "base_rate": test.get("base_rate"),
+                    "lift": values.get("lift"),
+                    "lift_lower_95": intervals.get(
+                        f"capacity_{capacity}_lift", {}
+                    ).get("lower"),
+                    "lift_upper_95": intervals.get(
+                        f"capacity_{capacity}_lift", {}
+                    ).get("upper"),
+                    "recall": values.get("recall"),
                 }
             )
-        top = test.get("top_decile", {})
-        lift.append(
-            {
-                "model": key,
-                "selected": top.get("selected"),
-                "selected_positive": top.get("selected_positive"),
-                "selected_negative": top.get("selected_negative"),
-                "positive_rate": top.get("positive_rate"),
-                "base_rate": test.get("base_rate"),
-                "lift": top.get("lift"),
-                "lift_lower_95": intervals.get("top_decile_lift", {}).get("lower"),
-                "lift_upper_95": intervals.get("top_decile_lift", {}).get("upper"),
-                "recall": top.get("recall"),
-            }
-        )
+        comparison_block = run.comparison_to_age_only
+        if comparison_block:
+            points = comparison_block.get("point_estimates", {})
+            cis = comparison_block.get("paired_company_clustered_intervals", {})
+            for metric, value in points.items():
+                incremental.append(
+                    {
+                        "model": key,
+                        "comparator": "age_only.logistic",
+                        "metric": metric,
+                        "estimate": value,
+                        "lower_95": cis.get(metric, {}).get("lower"),
+                        "upper_95": cis.get(metric, {}).get("upper"),
+                    }
+                )
 
     split_rows = [
         {"split": split, **counts}
@@ -358,12 +445,55 @@ def build_model_tables(
     return {
         "comparison": pd.DataFrame(comparison),
         "calibration": pd.DataFrame(calibration),
-        "feature_effects": pd.DataFrame(effects),
         "split_counts": pd.DataFrame(split_rows),
         "sensitivities": (
             sensitivities.copy() if sensitivities is not None else pd.DataFrame()
         ),
-        "lift": pd.DataFrame(lift),
+        "ranking": pd.DataFrame(ranking),
+        "incremental": pd.DataFrame(incremental),
+    }
+
+
+def _comparison_row(
+    model: str,
+    algorithm: str,
+    role: str,
+    metrics: dict[str, Any],
+    intervals: dict[str, Any],
+    *,
+    validation_metrics: dict[str, Any],
+    calibration_method: str,
+) -> dict[str, Any]:
+    return {
+        "model": model,
+        "algorithm": algorithm,
+        "role": role,
+        "calibration_method": calibration_method,
+        "test_rows": metrics.get("n"),
+        "test_positive": metrics.get("n_positive"),
+        "test_negative": metrics.get("n_negative"),
+        "validation_roc_auc": validation_metrics.get("roc_auc"),
+        "validation_brier": validation_metrics.get("brier"),
+        "test_roc_auc": metrics.get("roc_auc"),
+        "test_roc_auc_lower_95": intervals.get("roc_auc", {}).get("lower"),
+        "test_roc_auc_upper_95": intervals.get("roc_auc", {}).get("upper"),
+        "test_average_precision": metrics.get("average_precision"),
+        "test_average_precision_lower_95": intervals.get(
+            "average_precision", {}
+        ).get("lower"),
+        "test_average_precision_upper_95": intervals.get(
+            "average_precision", {}
+        ).get("upper"),
+        "test_brier": metrics.get("brier"),
+        "test_brier_lower_95": intervals.get("brier", {}).get("lower"),
+        "test_brier_upper_95": intervals.get("brier", {}).get("upper"),
+        "test_log_loss": metrics.get("log_loss"),
+        "test_log_loss_lower_95": intervals.get("log_loss", {}).get("lower"),
+        "test_log_loss_upper_95": intervals.get("log_loss", {}).get("upper"),
+        "mean_prediction": metrics.get("mean_prediction"),
+        "observed_rate": metrics.get("base_rate"),
+        "calibration_intercept": metrics.get("calibration_intercept"),
+        "calibration_slope": metrics.get("calibration_slope"),
     }
 
 
@@ -373,7 +503,7 @@ def build_population_sensitivities(
     observation_date: str | pd.Timestamp,
     settings: Settings,
 ) -> pd.DataFrame:
-    """Describe locked and alternative populations without fitting extra models."""
+    """Compare the defined linked and excluded register-stock populations."""
 
     columns = [
         "ID",
@@ -395,39 +525,24 @@ def build_population_sensitivities(
     observed = pd.Timestamp(observation_date).normalize()
     lower = observed - pd.DateOffset(months=settings.primary_max_months)
     upper = observed - pd.DateOffset(months=settings.primary_min_months)
-    primary_age = frame["JudgmentDate"].between(lower, upper, inclusive="both")
-    aged_12_plus = frame["JudgmentDate"] <= upper
+    primary_age = frame["JudgmentDate"].ge(lower) & frame["JudgmentDate"].lt(upper)
     corporate = frame["DefendantType"].eq("Corporate")
-    noncorporate = frame["DefendantType"].eq("Non-Corporate")
     ew = frame["Jurisdiction"].eq("England and Wales")
-    scotland = frame["Jurisdiction"].eq("Scotland")
     labelled = frame["JudgmentStatus"].isin(("Satisfied", "Unsatisfied"))
-    cancelled = frame["JudgmentStatus"].eq("Cancelled")
     exact_unique = frame["tier"].eq("exact_unique")
 
     rows: list[dict[str, Any]] = []
 
-    def add(name: str, mask: pd.Series, *, earliest: bool) -> None:
+    def add(name: str, mask: pd.Series, *, analysis: str = "population") -> None:
         selected = frame.loc[mask].sort_values(
             ["JudgmentDate", "matched_company_number", "ID"], kind="stable"
         )
-        if earliest:
-            matched = selected["matched_company_number"].fillna("").ne("")
-            selected = pd.concat(
-                [
-                    selected.loc[matched].drop_duplicates(
-                        "matched_company_number", keep="first"
-                    ),
-                    selected.loc[~matched],
-                ],
-                ignore_index=True,
-            )
         positive = int(selected["JudgmentStatus"].eq("Satisfied").sum())
         negative = int(selected["JudgmentStatus"].eq("Unsatisfied").sum())
         denominator = positive + negative
         rows.append(
             {
-                "analysis": "population",
+                "analysis": analysis,
                 "stratum": name,
                 "rows": int(len(selected)),
                 "unique_companies": int(
@@ -439,46 +554,21 @@ def build_population_sensitivities(
             }
         )
 
-    base = corporate & ew & labelled
-    add(
-        "primary_12_36_exact_unique_earliest",
-        base & primary_age & exact_unique,
-        earliest=True,
-    )
-    add(
-        "primary_12_36_exact_unique_with_repeats",
-        base & primary_age & exact_unique,
-        earliest=False,
-    )
-    add(
-        "aged_12_plus_exact_unique_earliest",
-        base & aged_12_plus & exact_unique,
-        earliest=True,
-    )
-    add(
-        "aged_12_plus_exact_unique_with_repeats",
-        base & aged_12_plus & exact_unique,
-        earliest=False,
-    )
-    add(
-        "noncorporate_12_36_kept_separate",
-        noncorporate & ew & labelled & primary_age,
-        earliest=False,
-    )
-    add(
-        "scotland_12_36_kept_separate",
-        corporate & scotland & labelled & primary_age,
-        earliest=False,
-    )
-    add(
-        "cancelled_12_36_kept_separate",
-        corporate & ew & cancelled & primary_age,
-        earliest=False,
-    )
+    descriptive = corporate & ew
+    base = descriptive & labelled
+    add("all_corporate_england_wales_register_stock", descriptive)
+    add("binary_status_corporate_england_wales", base)
+    add("post_one_to_48_month_binary_status", base & primary_age)
+    add("included_unique_exact_live_company", base & primary_age & exact_unique)
+    add("excluded_unmatched_live_company_bulk", base & primary_age & ~exact_unique)
 
     eligible = frame.loc[base & primary_age].copy()
     for tier, selected in eligible.groupby("tier", dropna=False, sort=True):
-        add(f"match_tier_{tier}", frame.index.isin(selected.index), earliest=False)
+        add(
+            f"match_tier_{tier}",
+            frame.index.isin(selected.index),
+            analysis="linkage_selection",
+        )
 
     exact_primary = frame.loc[base & primary_age & exact_unique].copy()
     exact_primary["judgment_year"] = exact_primary["JudgmentDate"].dt.year.astype("Int64")
@@ -489,7 +579,15 @@ def build_population_sensitivities(
         right=False,
     ).astype("string").fillna("amount_missing")
     exact_primary["amount_band"] = amount_bands
-    for dimension in ("judgment_year", "amount_band"):
+    age_months = (observed - exact_primary["JudgmentDate"]).dt.days / (365.25 / 12)
+    exact_primary["age_band"] = pd.cut(
+        age_months,
+        bins=[1, 12, 24, 36, 48],
+        labels=["over_1_to_12", "over_12_to_24", "over_24_to_36", "over_36_to_48"],
+        include_lowest=False,
+        right=True,
+    ).astype("string").fillna("outside_or_missing")
+    for dimension in ("judgment_year", "amount_band", "age_band"):
         for value, selected in exact_primary.groupby(dimension, dropna=False, sort=True):
             positive = int(selected["JudgmentStatus"].eq("Satisfied").sum())
             negative = int(selected["JudgmentStatus"].eq("Unsatisfied").sum())
@@ -517,10 +615,10 @@ def write_e3_e4(
     names = {
         "comparison": "E3_model_comparison.csv",
         "calibration": "E3_calibration.csv",
-        "feature_effects": "E3_feature_effects.csv",
         "split_counts": "E3_split_counts.csv",
-        "sensitivities": "E4_sensitivities.csv",
-        "lift": "E4_lift.csv",
+        "incremental": "E3_incremental_vs_age.csv",
+        "ranking": "E3_operational_ranking.csv",
+        "sensitivities": "E4_population_comparison.csv",
     }
     files = []
     for key, filename in names.items():
@@ -560,81 +658,86 @@ def write_e5(
 
 
 def write_summary(path: str | Path, context: dict[str, Any]) -> None:
-    """Write a short cover page for either the matching or model stage."""
+    """Write a compact, stage-aware cover page without row identifiers."""
 
     if context.get("scope") == "matching_only":
         _write_matching_summary(path, context)
         return
 
     counts = context.get("counts", {})
-    match = context.get("match", {})
-    primary = context.get("primary", {})
-    exploratory = context.get("exploratory", {})
-    gates = context.get("gates", {})
     splits = context.get("splits", {})
-    min_cell_n = int(context.get("min_cell_n", 10))
+    primary = context.get("primary", {})
+    linkage = context.get("linkage", {})
+    minimum = int(context.get("min_cell_n", 10))
+    stage = str(context.get("stage", "unknown"))
     lines = [
         "RT INTERNAL — NOT AUTHORISED FOR EXTERNAL USE",
-        "RECOVERY ANALYSIS — SUMMARY",
-        "===========================",
-        f"Run stage                     {context.get('stage', 'unknown')}",
-        f"Run status                    {context.get('status', 'PROVISIONAL')}",
-        f"Statuses observed on           {context.get('observation_date', 'unknown')}",
+        "RECORDED-SATISFACTION STUDY — SUMMARY",
+        "========================================",
+        f"Stage                           {stage}",
+        f"Status                          {context.get('status', 'PROVISIONAL')}",
+        f"RT observation date             {context.get('observation_date', 'unknown')}",
+        f"Companies House snapshot date   {context.get('companies_house_date', 'unknown')}",
+        f"RT data construct               {context.get('data_construct', 'unknown')}",
         "",
-        "Data funnel",
-        f"  Judgments read               {_fmt_count(counts.get('rows_read'), min_cell_n)}",
-        "  Corporate E&W, valid label   "
-        f"{_fmt_count(counts.get('corporate_ew_labelled'), min_cell_n)}",
-        "  Aged 12–36 months            "
-        f"{_fmt_count(counts.get('primary_age_eligible'), min_cell_n)}",
-        "  Unique exact-name eligible   "
-        f"{_fmt_count(counts.get('exact_unique_matched_eligible'), min_cell_n)}",
-        f"  Unique companies/model rows  {_fmt_count(counts.get('model_rows'), min_cell_n)}",
-        "  Satisfied / Unsatisfied      "
-        f"{_fmt_count(counts.get('satisfied'), min_cell_n)} / "
-        f"{_fmt_count(counts.get('unsatisfied'), min_cell_n)}",
+        "Defined population",
+        f"  RT records read               {_fmt_count(counts.get('rows_read'), minimum)}",
+        "  Corporate E&W binary status   "
+        f"{_fmt_count(counts.get('corporate_ew_labelled'), minimum)}",
+        "  Strict >1 to <=48 months      "
+        f"{_fmt_count(counts.get('primary_age_eligible'), minimum)}",
+        "  Unique-exact linked rows      "
+        f"{_fmt_count(counts.get('model_rows'), minimum)}",
+        "  Unique linked companies       "
+        f"{_fmt_count(counts.get('model_companies'), minimum)}",
         "",
-        "Exact-name matching coverage",
-        f"  Corporate denominator        {_fmt_count(match.get('denominator'), min_cell_n)}",
-        "  Unique exact-name matches     "
-        f"{_fmt_count(match.get('exact_unique'), min_cell_n)}",
-        f"  Unmatched                     {_fmt_count(match.get('unmatched'), min_cell_n)}",
+        "Linkage validation",
+        f"  Accepted-link precision       {_fmt_percent(linkage.get('precision'))}",
+        f"  Missed-link prevalence        {_fmt_percent(linkage.get('missed'))}",
+        f"  Recall                         {_fmt_percent(linkage.get('recall'))}",
+        f"  Recall status                  {_fmt(linkage.get('recall_status'))}",
         "",
-        "Primary judgment-time model",
-        f"  Locked algorithm              {_fmt(primary.get('champion'))}",
-        f"  Train rows / positives        {_split_count(splits, 'train', min_cell_n)}",
-        f"  Validation rows / positives   {_split_count(splits, 'validation', min_cell_n)}",
-        f"  Calibration rows / positives  {_split_count(splits, 'calibration', min_cell_n)}",
-        f"  Test rows / positives         {_split_count(splits, 'test', min_cell_n)}",
-        f"  ROC-AUC (95% CI)              {_metric_ci(primary, 'roc_auc')}",
-        f"  Average precision             {_fmt_float(primary.get('average_precision'))}",
-        "  Brier / prevalence baseline   "
-        f"{_fmt_float(primary.get('brier'))} / "
-        f"{_fmt_float(primary.get('baseline_brier'))}",
-        "  Mean predicted / observed     "
-        f"{_fmt_float(primary.get('mean_predicted'))} / "
-        f"{_fmt_float(primary.get('observed_rate'))}",
-        f"  Primary model gates           {_fmt(gates.get('primary_model'))}",
-        "",
-        "EXPLORATORY — CURRENT-SNAPSHOT FEATURES — NOT PROSPECTIVE",
-        f"  ROC-AUC                       {_fmt_float(exploratory.get('roc_auc'))}",
-        "",
-        "Decisive caveats",
-        "  - Date Inserted measures registration delay; it is not used for seasoning.",
-        "  - Satisfied/Unsatisfied is register status when this fresh extract was run.",
-        "  - Companies House bulk contains live companies and cannot match every defendant.",
-        "  - Only unique exact normalized-name matches enter the model.",
-        "  - Current-snapshot features may post-date the judgment and are exploratory only.",
-        "  - RT permission is required before any result or model artefact leaves.",
-        "",
-        "Other reports in this folder",
-        "  E1 data audit and exclusion funnel",
-        "  E2 matching coverage and diagnosis",
-        "  E3 model comparison, calibration and effects",
-        "  E4 population sensitivities, lift and limitations",
-        "  E5 timings, memory, fingerprints and artefact manifest",
-        f"Matching pairs: {context.get('pair_file', 'not produced')}",
     ]
+    if stage == "development":
+        lines.extend(
+            [
+                "Development freeze",
+                f"  Frozen primary                {_fmt(primary.get('champion'))}",
+                f"  Specification SHA-256         {_fmt(primary.get('specification_hash'))}",
+                f"  Train rows                     {_split_rows(splits, 'train', minimum)}",
+                f"  Validation rows                {_split_rows(splits, 'validation', minimum)}",
+                f"  Calibration rows               {_split_rows(splits, 'calibration', minimum)}",
+                f"  Locked-test rows               {_split_rows(splits, 'test', minimum)}",
+                "  Test outcomes/classes          NOT ACCESSED",
+                "",
+            ]
+        )
+    elif stage == "locked":
+        lines.extend(
+            [
+                "One-time locked evaluation",
+                f"  Frozen primary                {_fmt(primary.get('champion'))}",
+                f"  ROC-AUC (95% CI)              {_metric_ci(primary, 'roc_auc')}",
+                f"  Average precision             {_fmt_float(primary.get('average_precision'))}",
+                f"  Brier score                   {_fmt_float(primary.get('brier'))}",
+                f"  Calibration intercept         {_fmt_float(primary.get('calibration_intercept'))}",
+                f"  Calibration slope             {_fmt_float(primary.get('calibration_slope'))}",
+                f"  Internal operational screen   {_fmt(primary.get('internal_screen'))}",
+                "  Publication validity           NOT DETERMINED BY AUC 0.70",
+                "",
+            ]
+        )
+    lines.extend(
+        [
+            "Interpretation boundary",
+            "  - Outcome: Registry Trust status at this extract date.",
+            "  - Not cash recovery, partial recovery, LGD, return, or future satisfaction.",
+            "  - Held-out cross-sectional validation; not temporal or fixed-horizon.",
+            "  - Companies House bulk contains live companies only.",
+            "  - Repeated judgments are retained and grouped by company.",
+            "  - No fitted coefficient, model weight, threshold, or row prediction is public.",
+        ]
+    )
     Path(path).write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
@@ -646,10 +749,12 @@ def _write_matching_summary(path: str | Path, context: dict[str, Any]) -> None:
     min_cell_n = int(context.get("min_cell_n", 10))
     lines = [
         "RT INTERNAL — NOT AUTHORISED FOR EXTERNAL USE",
-        "RECOVERY ANALYSIS — RUN 1 MATCHING SUMMARY",
-        "==========================================",
+        "RECORDED-SATISFACTION STUDY — DIAGNOSTIC",
+        "=========================================",
         f"Run status                    {context.get('status', 'PROVISIONAL')}",
         f"RT extract date                {context.get('observation_date', 'unknown')}",
+        f"CH snapshot date               {context.get('companies_house_date', 'unknown')}",
+        f"Data construct                 {context.get('data_construct', 'unknown')}",
         "",
         "Full-dataset matching",
         f"  Judgments read               {_fmt_count(counts.get('rows_read'), min_cell_n)}",
@@ -671,8 +776,8 @@ def _write_matching_summary(path: str | Path, context: dict[str, Any]) -> None:
         "What this run did",
         "  - Every valid row was sent through matching, with no age, status,",
         "    defendant-type or jurisdiction filter.",
-        "  - No satisfaction model was trained or assessed.",
-        "  - It created a separate file containing 1,000 matching pairs.",
+        "  - No model was trained or assessed.",
+        "  - It created outcome-blind accepted and unmatched validation samples.",
         "",
         "Important limits",
         "  - A match requires one unique, date-valid exact normalized name.",
@@ -685,7 +790,8 @@ def _write_matching_summary(path: str | Path, context: dict[str, Any]) -> None:
         "  E1 data audit and matching funnel",
         "  E2 matching coverage, methods and unmatched reasons",
         "  E5 timings, memory, settings and run record",
-        f"Matching pairs: {context.get('pair_file', 'not produced')}",
+        f"Accepted validation sample: {context.get('accepted_file', 'not produced')}",
+        f"Unmatched validation sample: {context.get('unmatched_file', 'not produced')}",
     ]
     Path(path).write_text("\n".join(lines) + "\n", encoding="utf-8")
 
@@ -785,6 +891,12 @@ def _split_count(
         f"{_fmt_count(values.get('rows'), min_cell_n)} / "
         f"{_fmt_count(values.get('positive'), min_cell_n)}"
     )
+
+
+def _split_rows(
+    splits: dict[str, Any], split: str, min_cell_n: int = 10
+) -> str:
+    return _fmt_count(splits.get(split, {}).get("rows"), min_cell_n)
 
 
 def _fmt_float(value: Any) -> str:

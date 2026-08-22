@@ -1,7 +1,8 @@
-"""Self-test. Runs matching and the model on fake data before any RT file is opened.
+"""Self-test. Runs the permitted matching workflow on fake data.
 
-It checks the known matches, the four model fits, the pair files and the final
-output check. ``--write-inputs`` saves the fake files for the Windows tests.
+It checks known matches, the pair file and the final output check without bypassing
+the validity lock. Model components remain covered by the unit tests.
+``--write-inputs`` saves the fake files for the Windows tests.
 """
 
 from __future__ import annotations
@@ -16,7 +17,7 @@ import sys
 import pandas as pd
 
 from .disclosure import validate_egress
-from .run import PAIR_FILENAME, analyze
+from .run import PAIR_FILENAME, UNMATCHED_FILENAME, analyze
 from .synthetic import make_synthetic_bundle, write_bundle
 
 
@@ -37,10 +38,10 @@ _MATCHING_EGRESS = {
 _MODEL_EGRESS = {
     "E3_model_comparison.csv",
     "E3_calibration.csv",
-    "E3_feature_effects.csv",
     "E3_split_counts.csv",
-    "E4_sensitivities.csv",
-    "E4_lift.csv",
+    "E3_incremental_vs_age.csv",
+    "E3_operational_ranking.csv",
+    "E4_population_comparison.csv",
     "E4_limitations.txt",
 }
 
@@ -185,6 +186,9 @@ def _assert_outputs(run_root: Path, *, stage: str) -> None:
         raise AssertionError(f"match-example file has {len(pairs)} rows, expected 1,000")
     if set(pairs["tier"]) != {"exact_unique"}:
         raise AssertionError("pair file contains a non-exact match")
+    unmatched = pd.read_csv(run_root / "working_files" / UNMATCHED_FILENAME)
+    if unmatched.empty or set(unmatched["tier"]) != {"unmatched"}:
+        raise AssertionError("unmatched validation file is empty or contaminated")
 
     coverage = pd.read_csv(results / "E2_match_coverage.csv")
     funnel = pd.read_csv(results / "E1_data_funnel.csv").set_index("stage")
@@ -214,10 +218,10 @@ def _assert_outputs(run_root: Path, *, stage: str) -> None:
             raise AssertionError("the four declared partitions were not all reported")
     else:
         summary = (results / "SUMMARY.txt").read_text(encoding="utf-8")
-        if "No satisfaction model was trained or assessed" not in summary:
+        if "No model was trained or assessed" not in summary:
             raise AssertionError("diagnostic summary does not state that modelling was skipped")
 
-# Run both stages
+# Run the permitted diagnostic stage
 
 def _run_full(args: object) -> int:
     if args.n_companies < 1_600:
@@ -238,26 +242,16 @@ def _run_full(args: object) -> int:
             judgments_path=judgments,
             companies_house_path=companies,
             observation_date=bundle.observation_date,
+            companies_house_date=bundle.observation_date,
             settings_path=args.settings,
             output_base=root / "outputs !",
             run_id="selftest_diagnostic",
             _match_validator=lambda matches: _assert_match_truth(matches, truth),
         )
         _assert_outputs(diagnostic.root, stage="diagnostic")
-        locked = analyze(
-            stage="locked",
-            judgments_path=judgments,
-            companies_house_path=companies,
-            observation_date=bundle.observation_date,
-            settings_path=args.settings,
-            output_base=root / "outputs !",
-            run_id="selftest_locked",
-            _match_validator=lambda matches: _assert_match_truth(matches, truth),
-        )
-        _assert_outputs(locked.root, stage="locked")
     print(
-        "SELF-TEST: PASS. Matching-only Run 1, locked Run 2, planted match "
-        "identities, four model fits and the disclosure boundary all passed."
+        "SELF-TEST: PASS. Matching-only Run 1, planted match identities and "
+        "the disclosure boundary all passed. Run 2 remained locked."
     )
     return 0
 

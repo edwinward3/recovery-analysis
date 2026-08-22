@@ -56,22 +56,23 @@ set "STAGE=%~1"
 set "JUDGMENTS=%~2"
 set "COMPANIES=%~3"
 set "OBSERVATION=%~4"
-set "OUTPUT_BASE=%~5"
+set "CH_DATE=%~5"
+set "OUTPUT_BASE=%~6"
 set "INTERACTIVE="
 
 if defined STAGE goto have_stage
 set "INTERACTIVE=1"
 echo Choose what to run:
 echo   1. Full-data exact-name matching
-echo   2. Satisfaction model
+echo   2. Satisfaction model ^(LOCKED pending validity-gate approval^)
 set /p "STAGE=Enter 1 or 2: "
 
 :have_stage
 set "STAGE=%STAGE:"=%"
 if "%STAGE%"=="1" set "STAGE=diagnostic"
-if "%STAGE%"=="2" set "STAGE=locked"
+if "%STAGE%"=="2" goto locked_disabled
 if /i "%STAGE%"=="diagnostic" goto stage_ok
-if /i "%STAGE%"=="locked" goto stage_ok
+if /i "%STAGE%"=="locked" goto locked_disabled
 goto bad_stage
 
 :stage_ok
@@ -91,24 +92,18 @@ if not exist "%JUDGMENTS%" goto missing_judgments
 if not exist "%COMPANIES%" goto missing_companies
 
 if not defined INTERACTIVE goto arguments_ready
-if defined OBSERVATION goto arguments_ready
-if /i "%STAGE%"=="locked" set /p "OBSERVATION=RT extract date YYYY-MM-DD (required): "
-if /i "%STAGE%"=="diagnostic" set /p "OBSERVATION=RT extract date YYYY-MM-DD (blank = today): "
+if not defined OBSERVATION set /p "OBSERVATION=RT extract date YYYY-MM-DD (required): "
+if not defined CH_DATE set /p "CH_DATE=Companies House snapshot date YYYY-MM-DD (required): "
 
 :arguments_ready
-if /i "%STAGE%"=="locked" if not defined OBSERVATION goto missing_observation
+if not defined OBSERVATION goto missing_observation
+if not defined CH_DATE goto missing_ch_date
 if not defined OUTPUT_BASE set "OUTPUT_BASE=outputs"
 
 echo.
 if /i "%STAGE%"=="diagnostic" echo Running Run 1: full-data matching only. No satisfaction model will be trained.
 if /i "%STAGE%"=="locked" echo Running Run 2: exact-name matching plus the satisfaction model.
-if defined OBSERVATION goto run_with_date
-".venv\Scripts\python.exe" -m recovery.run analyze --stage "%STAGE%" --judgments "%JUDGMENTS%" --companies-house "%COMPANIES%" --settings "settings.toml" --output-base "%OUTPUT_BASE%"
-if errorlevel 1 goto run_failed
-goto run_succeeded
-
-:run_with_date
-".venv\Scripts\python.exe" -m recovery.run analyze --stage "%STAGE%" --judgments "%JUDGMENTS%" --companies-house "%COMPANIES%" --observation-date "%OBSERVATION%" --settings "settings.toml" --output-base "%OUTPUT_BASE%"
+".venv\Scripts\python.exe" -m recovery.run analyze --stage "%STAGE%" --judgments "%JUDGMENTS%" --companies-house "%COMPANIES%" --observation-date "%OBSERVATION%" --companies-house-date "%CH_DATE%" --settings "settings.toml" --output-base "%OUTPUT_BASE%"
 if errorlevel 1 goto run_failed
 
 :run_succeeded
@@ -139,6 +134,12 @@ echo.
 echo STOP: Choose 1 for full-data matching or 2 for the satisfaction model.
 goto stop
 
+:locked_disabled
+echo.
+echo STOP: Run 2 is disabled pending validity-gate approval.
+echo The locked test must not be opened until the study design and release manifest are frozen.
+goto stop
+
 :missing_judgments
 echo.
 echo STOP: Cannot find the RT judgment file: "%JUDGMENTS%"
@@ -151,7 +152,12 @@ goto stop
 
 :missing_observation
 echo.
-echo STOP: Run 2 needs the RT extract date in YYYY-MM-DD format.
+echo STOP: The RT extract date is required in YYYY-MM-DD format.
+goto stop
+
+:missing_ch_date
+echo.
+echo STOP: The Companies House snapshot date is required in YYYY-MM-DD format.
 goto stop
 
 :run_failed

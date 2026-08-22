@@ -19,3 +19,5 @@ fold.csv
 
 # Test and tool caches
 .pytest_cache/
+.release_receipts/
+*.release-key
