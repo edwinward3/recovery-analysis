@@ -69,6 +69,9 @@ jobs:
           }
           if (Test-Path "blocked outputs !") { throw "blocked Run 2 touched its output directory" }
           if (Test-Path ".release_receipts") { throw "blocked Run 2 created a release receipt" }
+          # GitHub's pwsh wrapper propagates the last native exit code. The
+          # non-zero code above is expected and has now been fully asserted.
+          $global:LASTEXITCODE = 0
 
       - name: Assert diagnostic outputs and outcome-blind review samples
         shell: pwsh
