@@ -499,7 +499,7 @@ def _write_matching_summary(path: str | Path, context: dict[str, Any]) -> None:
         "  Date Inserted before judgment (all RT) "
         f"{_fmt_count(counts.get('date_inserted_before_judgment'), min_cell_n)}",
         "",
-        "Date Inserted (as supplied)",
+        "Date Inserted (RT registration date)",
         f"  Distinct values              {_fmt(inserted.get('distinct_values'))}",
         f"  Minimum value                {_fmt(inserted.get('minimum'))}",
         f"  Maximum value                {_fmt(inserted.get('maximum'))}",
@@ -520,7 +520,8 @@ def _write_matching_summary(path: str | Path, context: dict[str, Any]) -> None:
         "    the supplied live-company file with a matching current or former",
         "    name that was valid on the judgment date.",
         "  - Postcode is shown as a check. It never creates or chooses a match.",
-        "  - Date Inserted is reported as supplied; no meaning is assumed.",
+        "  - Date Inserted is the RT registration date; its delay from",
+        "    JudgmentDate is reported.",
         "  - The Companies House file contains live companies only.",
         "  - Send the ZIP file only to Edwin.",
         "",

@@ -109,7 +109,7 @@ class RunTests(unittest.TestCase):
 
             summary = (paths.results / "SUMMARY.txt").read_text(encoding="utf-8")
             self.assertIn("RT MATCHING CHECK", summary)
-            self.assertIn("Date Inserted (as supplied)", summary)
+            self.assertIn("Date Inserted (RT registration date)", summary)
             self.assertIn("Satisfaction Date", summary)
             self.assertIn("absent; 0 filled", summary)
             self.assertIn("Stock or historical extract", summary)

@@ -160,10 +160,10 @@ def test_summary_is_short_and_explicit(tmp_path: Path) -> None:
     assert "Made two review samples for Edwin" in text
     assert "Companies House file contains live companies only" in text
     assert "One exact live-company match" in text
-    assert "Date Inserted (as supplied)" in text
+    assert "Date Inserted (RT registration date)" in text
     assert "Satisfaction Date" in text and "absent; 0 filled" in text
     assert "Stock or historical extract" in text
-    assert "Date Inserted is reported as supplied" in text
+    assert "Date Inserted is the RT registration date" in text
     assert "Minimum value                2026-05-31" in text
     assert "Corporate E&W rows" in text
     assert "Full-dataset" not in text
