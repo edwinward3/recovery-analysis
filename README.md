@@ -17,4 +17,4 @@ You need:
 
 Use the RT export exactly as produced. If it contains Satisfaction Date, Cancellation Date, Cancellation Reason, Status Effective Date or Snapshot Date, leave those columns in place. The program does not upload either source file. Keep the internet connected on the first run while it installs the required packages.
 
-If the program shows **STOP**, send Edwin the complete message. Do not alter the data to get around the check.
+If the program shows **STOP**, send Edwin the complete message.
