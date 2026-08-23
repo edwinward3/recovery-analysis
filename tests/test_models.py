@@ -1,4 +1,4 @@
-"""Test cohort timing, four fits, calibration, gates and safe model artefacts.
+"""Test cohort timing, model selection, calibration, gates and safe artefacts.
 
 Inputs are synthetic in-memory rows; temporary outputs contain no RT data.
 The tests perform no network or shell operations.
@@ -26,17 +26,19 @@ from recovery.models import (
     LightGBMUnavailableError,
     ModelDataError,
     PreparedCohort,
-    assign_chronological_splits,
+    assign_company_group_splits,
     assess_acceptance,
     bootstrap_metrics,
     choose_champion,
+    develop_models,
+    evaluate_locked_models,
     evaluate_predictions,
     fit_calibrator,
-    fit_evaluate_models,
     prepare_model_cohort,
     reliability_table,
     write_model_artifacts,
-    _add_prior_judgment_features,
+    _as_timestamp,
+    _guard_splits,
     _select_model_matches,
 )
 
@@ -56,15 +58,39 @@ def _match_row(identifier: str, company: str, tier: str = "exact_unique") -> dic
 
 
 class CohortTests(TestCase):
-    def test_primary_filters_earliest_company_and_strict_prior_history(self) -> None:
+    def test_split_guard_rejects_missing_labels_and_company_numbers(self) -> None:
+        valid = pd.DataFrame(
+            {
+                "matched_company_number": ["C1", "C2"],
+                "split": ["train", "test"],
+            }
+        )
+        _guard_splits(valid)
+        for column in ("matched_company_number", "split"):
+            broken = valid.copy()
+            broken.loc[1, column] = pd.NA
+            with self.subTest(column=column), self.assertRaises(ModelDataError):
+                _guard_splits(broken)
+
+    def test_model_date_strings_require_iso_format(self) -> None:
+        self.assertEqual(
+            _as_timestamp("2026-06-01", "observation_date"),
+            pd.Timestamp("2026-06-01"),
+        )
+        for value in ("01/06/2026", "2026/06/01", "2026-06-01T00:00:00"):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(ModelDataError, "YYYY-MM-DD"):
+                    _as_timestamp(value, "observation_date")
+
+    def test_primary_keeps_repeats_and_strict_prior_history(self) -> None:
         rows = [
             # Two strictly-prior events in the 24-month window. Their statuses
             # are deliberately non-primary; history must not use prior status.
             ("A-boundary", "01/01/2023", "Cancelled", "Corporate", "England and Wales", 10),
             ("A-prior", "01/12/2024", "Cancelled", "Corporate", "England and Wales", 20),
             ("A-target", "01/01/2025", "Satisfied", "Corporate", "England and Wales", 100),
-            # Same-day is not strictly prior; later row is dropped because the
-            # target is the earliest eligible judgment for company A.
+            # Same-day is not strictly prior to A-target. The later binary row is
+            # retained because judgments, rather than companies, are the unit.
             ("A-same-day", "01/01/2025", "Cancelled", "Corporate", "England and Wales", 30),
             ("A-later", "01/02/2025", "Unsatisfied", "Corporate", "England and Wales", 200),
             ("B-unmatched", "01/01/2025", "Satisfied", "Corporate", "England and Wales", 100),
@@ -100,13 +126,24 @@ class CohortTests(TestCase):
             "2026-06-01",
             Settings(),
         )
-        self.assertEqual(cohort.frame["ID"].tolist(), ["A-target"])
-        target = cohort.frame.iloc[0]
-        self.assertEqual(int(target["label"]), 1)
-        self.assertEqual(int(target["prior_judgment_count_24m"]), 2)
-        self.assertEqual(float(target["prior_judgment_value_24m"]), 30.0)
-        self.assertEqual(float(target["days_since_prior_judgment_24m"]), 31.0)
-        self.assertEqual(int(target["no_prior_judgment_24m"]), 0)
+        self.assertEqual(
+            cohort.frame["ID"].tolist(), ["A-target", "A-later", "E-recent"]
+        )
+        target = cohort.frame.set_index("ID").loc["A-target"]
+        self.assertEqual(
+            int(target["observable_retained_prior_judgment_count_24m"]), 2
+        )
+        self.assertEqual(
+            float(target["observable_retained_prior_judgment_value_24m"]), 30.0
+        )
+        self.assertEqual(
+            float(target["days_since_observable_retained_prior_judgment_24m"]),
+            31.0,
+        )
+        self.assertEqual(
+            int(target["no_observable_retained_prior_judgment_24m"]), 0
+        )
+        self.assertEqual(cohort.funnel["eligible_repeat_judgments"], 1)
 
     def test_matcher_native_tier_and_raw_snapshot_columns_are_supported(self) -> None:
         judgments = pd.DataFrame(
@@ -213,92 +250,6 @@ class CohortTests(TestCase):
                         Settings(),
                     )
 
-    def test_chronological_split_is_common_and_company_unique(self) -> None:
-        dates = pd.date_range("2020-01-01", periods=20, freq="D")
-        frame = pd.DataFrame(
-            {
-                "ID": [f"J{i:02d}" for i in range(20)],
-                "matched_company_number": [f"C{i:02d}" for i in range(20)],
-                "JudgmentDate": dates,
-            }
-        )
-        split = assign_chronological_splits(frame)
-        self.assertEqual(split["split"].value_counts().to_dict(), {
-            "train": 12,
-            "validation": 3,
-            "calibration": 2,
-            "test": 3,
-        })
-        positions = {
-            name: i
-            for i, name in enumerate(("train", "validation", "calibration", "test"))
-        }
-        encoded = split["split"].map(positions).to_numpy()
-        self.assertTrue(np.all(encoded[:-1] <= encoded[1:]))
-
-    def test_chronological_split_keeps_identical_dates_together(self) -> None:
-        frame = pd.DataFrame(
-            {
-                "ID": [f"J{i:02d}" for i in range(16)],
-                "matched_company_number": [f"C{i:02d}" for i in range(16)],
-                "JudgmentDate": pd.to_datetime(
-                    ["2020-01-01"] * 5
-                    + ["2020-01-02"] * 4
-                    + ["2020-01-03"] * 3
-                    + ["2020-01-04"] * 2
-                    + ["2020-01-05"] * 2
-                ),
-            }
-        )
-        split = assign_chronological_splits(frame)
-        self.assertTrue(
-            (split.groupby("JudgmentDate")["split"].nunique() == 1).all()
-        )
-
-    def test_prior_history_offsets_cover_multiple_and_absent_companies(self) -> None:
-        targets = pd.DataFrame(
-            {
-                "matched_company_number": [" C2 ", "C-missing", "C1"],
-                "JudgmentDate": pd.to_datetime(
-                    ["2025-06-15", "2025-03-01", "2025-01-01"]
-                ),
-            }
-        )
-        history = pd.DataFrame(
-            {
-                "matched_company_number": ["C1", "C2", "C1", "C2", "C1", "C2"],
-                "JudgmentDate": pd.to_datetime(
-                    [
-                        "2024-12-01",
-                        "2025-06-15",  # same day: never prior
-                        "2022-12-31",  # outside C1's 24-month window
-                        "2023-06-15",  # exact 24-month boundary
-                        "2023-01-01",  # exact 24-month boundary
-                        "2024-06-15",
-                    ]
-                ),
-                "_amount_numeric": [np.nan, 999.0, 50.0, 20.0, 10.0, 30.0],
-            }
-        )
-
-        _add_prior_judgment_features(targets, history, 24)
-
-        self.assertEqual(
-            targets["prior_judgment_count_24m"].tolist(), [2, 0, 2]
-        )
-        self.assertEqual(
-            targets["prior_judgment_value_24m"].tolist(), [50.0, 0.0, 10.0]
-        )
-        self.assertEqual(
-            float(targets.loc[0, "days_since_prior_judgment_24m"]), 365.0
-        )
-        self.assertTrue(pd.isna(targets.loc[1, "days_since_prior_judgment_24m"]))
-        self.assertEqual(
-            float(targets.loc[2, "days_since_prior_judgment_24m"]), 31.0
-        )
-        self.assertEqual(targets["no_prior_judgment_24m"].tolist(), [0, 1, 0])
-
-
 class SelectionAndCalibrationTests(TestCase):
     def test_conservative_champion_rule(self) -> None:
         logistic = {"brier": 0.10, "roc_auc": 0.70}
@@ -371,7 +322,7 @@ class SelectionAndCalibrationTests(TestCase):
 
     def test_acceptance_uses_only_primary_model_test_guards(self) -> None:
         run = SimpleNamespace(
-            family="prospective",
+            family="cross_sectional_primary",
             algorithm="logistic",
             calibration=SimpleNamespace(powered=True),
             test_metrics_calibrated={
@@ -388,7 +339,7 @@ class SelectionAndCalibrationTests(TestCase):
                 "brier_improvement_vs_null": {"lower": 0.01, "upper": 0.03},
             },
         )
-        settings = Settings()
+        settings = Settings(min_test_companies=10)
         cohort = _prepared_numeric_cohort(100)
         accepted = assess_acceptance(
             run,
@@ -400,6 +351,29 @@ class SelectionAndCalibrationTests(TestCase):
         self.assertNotIn("match_precision_floor", accepted["guards"])
         self.assertNotIn("match_precision_lower_ci_floor", accepted["guards"])
         self.assertFalse(any("match" in reason for reason in accepted["reasons"]))
+
+        cohort.split_counts["test"]["unique_companies"] = 9
+        too_few_companies = assess_acceptance(
+            run,
+            cohort,
+            settings,
+            training_prevalence=0.10,
+        )
+        self.assertFalse(too_few_companies["passed"])
+        self.assertIn(
+            "test_companies_below_minimum", too_few_companies["reasons"]
+        )
+        cohort.split_counts["test"]["unique_companies"] = 15
+
+        run.family = "prospective"
+        rejected = assess_acceptance(
+            run,
+            cohort,
+            settings,
+            training_prevalence=0.10,
+        )
+        self.assertFalse(rejected["passed"])
+        self.assertIn("non_primary_model_family", rejected["reasons"])
 
     def test_acceptance_fails_closed_on_non_finite_gate_values(self) -> None:
         metrics = {
@@ -429,7 +403,7 @@ class SelectionAndCalibrationTests(TestCase):
             bad_metrics = dict(metrics)
             bad_metrics[metric] = float("nan")
             run = SimpleNamespace(
-                family="prospective",
+                family="cross_sectional_primary",
                 algorithm="logistic",
                 calibration=SimpleNamespace(powered=True),
                 test_metrics_calibrated=bad_metrics,
@@ -446,7 +420,7 @@ class SelectionAndCalibrationTests(TestCase):
                 self.assertIn(expected_reason, result["reasons"])
 
         run = SimpleNamespace(
-            family="prospective",
+            family="cross_sectional_primary",
             algorithm="logistic",
             calibration=SimpleNamespace(powered=True),
             test_metrics_calibrated=metrics,
@@ -475,14 +449,14 @@ class SelectionAndCalibrationTests(TestCase):
                     LightGBMUnavailableError,
                     "no estimator fallback is permitted",
                 ):
-                    fit_evaluate_models(tiny, _test_settings())
+                    develop_models(tiny, _test_settings())
 
     def test_single_class_training_split_stops_before_fitting(self) -> None:
         cohort = _prepared_numeric_cohort(100)
         cohort.frame.loc[cohort.frame["split"].eq("train"), "label"] = 0
         with patch("recovery.models._require_lightgbm", return_value=_FakeLightGBMModule):
             with self.assertRaisesRegex(ModelDataError, "only one outcome class"):
-                fit_evaluate_models(cohort, _test_settings())
+                develop_models(cohort, _test_settings())
 
 
 class _FakeBooster:
@@ -519,28 +493,31 @@ class _FakeLightGBMModule:
 
 
 class EndToEndTests(TestCase):
-    def test_two_families_two_algorithms_and_json_only_artifacts(self) -> None:
+    def test_frozen_baseline_and_champion_and_json_only_artifacts(self) -> None:
         cohort = _prepared_numeric_cohort(400)
         settings = _test_settings()
         with warnings.catch_warnings(), patch(
             "recovery.models._require_lightgbm", return_value=_FakeLightGBMModule
         ):
             warnings.simplefilter("ignore", RuntimeWarning)
-            evaluation = fit_evaluate_models(cohort, settings)
+            development = develop_models(cohort, settings)
+        test = cohort.frame.loc[cohort.frame["split"].eq("test")]
+        outcomes = test.loc[:, ["ID", "locked_label"]].rename(
+            columns={"locked_label": "label"}
+        )
+        evaluation = evaluate_locked_models(development, outcomes, settings)
         self.assertEqual(
             set(evaluation.runs),
-            {
-                "prospective.logistic",
-                "prospective.lightgbm",
-                "snapshot_exploratory.logistic",
-                "snapshot_exploratory.lightgbm",
-            },
+            set(development.frozen_evaluation_keys),
         )
-        self.assertIn(evaluation.champions["prospective"], {"logistic", "lightgbm"})
-        for key in ("prospective.lightgbm", "snapshot_exploratory.lightgbm"):
-            parameters = evaluation.runs[key].model.estimator.get_params()
-            self.assertEqual(parameters["subsample"], 0.8)
-            self.assertEqual(parameters["subsample_freq"], 1)
+        self.assertIn(
+            evaluation.champions["cross_sectional_primary"],
+            {"logistic", "lightgbm"},
+        )
+        self.assertEqual(development.frozen_evaluation_keys[0], "age_only.logistic")
+        self.assertTrue(
+            all(not key.startswith("snapshot_exploratory") for key in evaluation.runs)
+        )
         with TemporaryDirectory() as directory:
             first = write_model_artifacts(evaluation, directory)
             first_json = Path(first["evaluation"]).read_text(encoding="utf-8")
@@ -548,7 +525,7 @@ class EndToEndTests(TestCase):
             second_json = Path(second["evaluation"]).read_text(encoding="utf-8")
             self.assertEqual(first_json, second_json)
             payload = json.loads(first_json)
-            self.assertEqual(payload["schema_version"], 2)
+            self.assertEqual(payload["schema_version"], 3)
             self.assertNotIn("match_audit", payload)
             self.assertFalse(hasattr(evaluation, "match_precision"))
             self.assertFalse(hasattr(evaluation, "match_precision_lower_ci"))
@@ -565,6 +542,7 @@ class EndToEndTests(TestCase):
 def _test_settings() -> Settings:
     return Settings(
         min_test_rows=20,
+        min_test_companies=5,
         min_test_each_class=5,
         min_calibration_each_class=5,
         isotonic_each_class=20,
@@ -587,14 +565,34 @@ def _prepared_numeric_cohort(n: int) -> PreparedCohort:
             "matched_company_number": [f"C{i:05d}" for i in range(n)],
             "JudgmentDate": dates,
             "label": labels,
+            "locked_label": labels,
+            "observation_age_months": np.linspace(2, 47, n),
+            "observation_age_scaled_squared": np.linspace(2, 47, n) ** 2 / 48**2,
+            "observation_age_scaled_cubed": np.linspace(2, 47, n) ** 3 / 48**3,
+            "observation_age_hinge_12m_cubed": np.maximum(
+                np.linspace(2, 47, n) - 12, 0
+            ) ** 3 / 48**3,
+            "observation_age_hinge_24m_cubed": np.maximum(
+                np.linspace(2, 47, n) - 24, 0
+            ) ** 3 / 48**3,
+            "observation_age_hinge_36m_cubed": np.maximum(
+                np.linspace(2, 47, n) - 36, 0
+            ) ** 3 / 48**3,
             "company_age_at_judgment_years": 5 + signal,
             "company_age_at_judgment_missing": np.zeros(n),
             "log1p_judgment_amount": 6 + 0.25 * signal,
             "judgment_amount_missing": np.zeros(n),
-            "prior_judgment_count_24m": np.maximum(0, np.round(signal + 1)),
-            "prior_judgment_value_24m": np.maximum(0, 100 * (signal + 1)),
-            "days_since_prior_judgment_24m": np.where(signal > -1, 30, np.nan),
-            "no_prior_judgment_24m": (signal <= -1).astype(int),
+            "observable_retained_prior_judgment_count_24m": np.maximum(
+                0, np.round(signal + 1)
+            ),
+            "observable_retained_prior_judgment_value_24m": np.maximum(
+                0, 100 * (signal + 1)
+            ),
+            "days_since_observable_retained_prior_judgment_24m": np.where(
+                signal > -1, 30, np.nan
+            ),
+            "no_observable_retained_prior_judgment_24m": (signal <= -1).astype(int),
+            "observable_retained_history_calendar_coverage_24m": np.ones(n),
             "snapshot_any_charges": (signal > 0).astype(int),
             "snapshot_n_charges": np.maximum(0, np.round(signal + 1)),
             "snapshot_pct_charges_satisfied": np.clip((signal + 2) / 4, 0, 1),
@@ -602,22 +600,21 @@ def _prepared_numeric_cohort(n: int) -> PreparedCohort:
             "snapshot_company_status_active": (signal > -1.5).astype(int),
         }
     )
-    frame = assign_chronological_splits(frame)
+    frame = assign_company_group_splits(frame, 20260619)
+    frame.loc[frame["split"].eq("test"), "label"] = pd.NA
     split_counts = {}
     for split in ("train", "validation", "calibration", "test"):
         part = frame.loc[frame["split"] == split]
-        positive = int(part["label"].sum())
         split_counts[split] = {
             "rows": len(part),
             "unique_companies": len(part),
-            "positive": positive,
-            "negative": len(part) - positive,
+            "mean_observation_age_months": float(part["observation_age_months"].mean()),
         }
     return PreparedCohort(
         frame=frame,
         observation_date=pd.Timestamp("2026-06-01"),
         feature_families=dict(FEATURE_FAMILIES),
-        funnel={"earliest_eligible_unique_companies": n},
+        funnel={"eligible_unique_companies": n},
         split_counts=split_counts,
     )
 

@@ -13,13 +13,13 @@ import pandas as pd
 import pytest
 
 from recovery.config import Settings
-from recovery.data import read_rt_extract
+from recovery.data import iter_ch_chunks, read_rt_extract
 from recovery.matching import (
+    accepted_validation_sample,
     build_relevant_ch_index,
     match_diagnostics,
     match_judgments,
     normalize_name,
-    pair_sample,
 )
 
 
@@ -56,6 +56,7 @@ def _ch_row(
     postcode: str,
     incorporation: str = "01/01/2010",
     *,
+    status: str = "Active",
     former_name: str = "",
     former_change: str = "",
 ) -> dict[str, object]:
@@ -64,7 +65,7 @@ def _ch_row(
         "CompanyNumber": number,
         "RegAddress.PostCode": postcode,
         "IncorporationDate": incorporation,
-        "CompanyStatus": "Active",
+        "CompanyStatus": status,
         "CompanyCategory": "Private Limited Company",
         "Accounts.NextDueDate": "01/09/2026",
         "Mortgages.NumMortCharges": "1",
@@ -94,18 +95,20 @@ def _write_inputs(
     return judgments, ch_zip
 
 
-def test_rt_dates_distinguish_registration_lag_from_observation_age(tmp_path: Path) -> None:
+def test_rt_dates_keep_inserted_difference_distinct_from_observation_age(
+    tmp_path: Path,
+) -> None:
     rows = [_rt_row("J-1", "Example Limited", "SW1A 1AA", "01/01/2024")]
     rows[0]["Date Inserted"] = "11/01/2024"
     path = tmp_path / "rt.csv"
     pd.DataFrame(rows).to_csv(path, index=False)
 
-    frame, audit = read_rt_extract(path, "01/07/2024")
+    frame, audit = read_rt_extract(path, "2024-07-01")
 
-    assert frame.loc[0, "registration_lag_days"] == 10
+    assert frame.loc[0, "date_inserted_minus_judgment_days"] == 10
     assert frame.loc[0, "age_at_observation_days"] == 182
     assert frame.loc[0, "age_at_observation_months"] == pytest.approx(182 / 30.44)
-    assert audit.registration_lag_days_median == 10
+    assert audit.date_inserted_minus_judgment_days_median == 10
     assert audit.observation_date == "2024-07-01"
     assert frame.loc[0, "Amount"] == pytest.approx(1250.5)
 
@@ -124,11 +127,11 @@ def test_real_excel_dates_are_not_swapped_when_day_and_month_are_ambiguous(
 
     assert frame.loc[0, "JudgmentDate"] == pd.Timestamp("2025-05-01")
     assert frame.loc[0, "Date Inserted"] == pd.Timestamp("2025-05-02")
-    assert frame.loc[0, "registration_lag_days"] == 1
+    assert frame.loc[0, "date_inserted_minus_judgment_days"] == 1
     assert audit.date_inserted_before_judgment_rows == 0
 
 
-def test_registration_date_anomalies_are_audited_without_blocking_matching(
+def test_date_inserted_anomalies_are_audited_without_assuming_field_meaning(
     tmp_path: Path,
 ) -> None:
     row = _rt_row("J-1", "Example Limited", "SW1A 1AA", "02/05/2025")
@@ -136,9 +139,9 @@ def test_registration_date_anomalies_are_audited_without_blocking_matching(
     path = tmp_path / "registration-anomaly.csv"
     pd.DataFrame([row]).to_csv(path, index=False)
 
-    frame, audit = read_rt_extract(path, "03/07/2025")
+    frame, audit = read_rt_extract(path, "2025-07-03")
 
-    assert frame.loc[0, "registration_lag_days"] == -1
+    assert frame.loc[0, "date_inserted_minus_judgment_days"] == -1
     assert audit.date_inserted_before_judgment_rows == 1
 
 
@@ -149,7 +152,7 @@ def test_judgment_after_extract_date_still_stops_the_run(tmp_path: Path) -> None
     pd.DataFrame([row]).to_csv(path, index=False)
 
     with pytest.raises(ValueError, match="JudgmentDate is after the RT extract date"):
-        read_rt_extract(path, "03/07/2025")
+        read_rt_extract(path, "2025-07-03")
 
 
 def test_rt_csv_and_xlsx_validation_reject_duplicate_ids(tmp_path: Path) -> None:
@@ -190,20 +193,128 @@ def test_rt_validation_rejects_missing_or_unexpected_values(
         read_rt_extract(path, OBSERVATION_DATE)
 
 
-def test_missing_and_malformed_amounts_are_audited_not_silently_zeroed(
+def test_missing_or_invalid_amounts_are_audited_not_silently_zeroed(
     tmp_path: Path,
 ) -> None:
     rows = [
         _rt_row("J-1", "One Limited", "AA1 1AA"),
         _rt_row("J-2", "Two Limited", "BB1 1BB"),
+        _rt_row("J-3", "Three Limited", "CC1 1CC"),
+        _rt_row("J-4", "Four Limited", "DD1 1DD"),
     ]
     rows[0]["Amount"] = ""
     rows[1]["Amount"] = "not-an-amount"
+    rows[2]["Amount"] = "inf"
+    rows[3]["Amount"] = "-1"
     path = tmp_path / "amounts.csv"
     pd.DataFrame(rows).to_csv(path, index=False)
     frame, audit = read_rt_extract(path, OBSERVATION_DATE)
     assert frame["Amount"].isna().all()
-    assert audit.invalid_amount_rows == 1
+    assert audit.invalid_amount_rows == 3
+
+
+def test_companies_house_status_header_is_required(tmp_path: Path) -> None:
+    judgments = pd.DataFrame(
+        [_rt_row("J-1", "Example Limited", "AA1 1AA")]
+    )
+    company = _ch_row("00000001", "EXAMPLE LIMITED", "AA1 1AA")
+    del company["CompanyStatus"]
+    path = tmp_path / "missing-status.csv"
+    pd.DataFrame([company]).to_csv(path, index=False)
+
+    with pytest.raises(ValueError, match="missing required.*CompanyStatus"):
+        build_relevant_ch_index(judgments, path)
+
+
+def test_companies_house_zip_with_multiple_csvs_stops_for_review(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "multiple.csv.files.zip"
+    with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("first.csv", "CompanyName,CompanyNumber\nA,1\n")
+        archive.writestr("second.csv", "CompanyName,CompanyNumber\nB,2\n")
+    with pytest.raises(ValueError, match="exactly one CSV"):
+        list(iter_ch_chunks(path))
+
+
+@pytest.mark.parametrize(
+    "status",
+    [
+        "Active",
+        "Active - Proposal to Strike off",
+        "Administration",
+        "ADMINISTRATION ORDER",
+        "ADMINISTRATIVE RECEIVER",
+        "In Administration",
+        "In Administration/Administrative Receiver",
+        "In Administration/Receiver Manager",
+        "Liquidation",
+        "Live but Receiver Manager on at least one charge",
+        "RECEIVER MANAGER / ADMINISTRATIVE RECEIVER",
+        "RECEIVERSHIP",
+        "Registered",
+        "Voluntary Arrangement",
+        "VOLUNTARY ARRANGEMENT / ADMINISTRATIVE RECEIVER",
+        "VOLUNTARY ARRANGEMENT / RECEIVER MANAGER",
+    ],
+)
+def test_recognised_live_company_statuses_are_not_reduced_to_active(
+    tmp_path: Path,
+    status: str,
+) -> None:
+    judgments = pd.DataFrame(
+        [_rt_row("J-1", "Example Limited", "AA1 1AA")]
+    )
+    path = tmp_path / "live-status.csv"
+    pd.DataFrame(
+        [_ch_row("00000001", "EXAMPLE LIMITED", "AA1 1AA", status=status)]
+    ).to_csv(path, index=False)
+
+    index = build_relevant_ch_index(judgments, path)
+
+    assert index.companies["00000001"].current_snapshot["CompanyStatus"] == status
+
+
+@pytest.mark.parametrize("status", ["", "Dissolved", "not a real status"])
+def test_blank_non_live_or_unknown_company_status_fails_closed(
+    tmp_path: Path,
+    status: str,
+) -> None:
+    judgments = pd.DataFrame(
+        [_rt_row("J-1", "Example Limited", "AA1 1AA")]
+    )
+    path = tmp_path / "bad-status.csv"
+    pd.DataFrame(
+        [_ch_row("00000001", "EXAMPLE LIMITED", "AA1 1AA", status=status)]
+    ).to_csv(path, index=False)
+
+    with pytest.raises(ValueError, match="CompanyStatus.*non-live"):
+        build_relevant_ch_index(judgments, path)
+
+
+@pytest.mark.parametrize("zipped", [False, True])
+def test_duplicate_raw_companies_house_headers_fail_before_pandas_mangling(
+    tmp_path: Path,
+    zipped: bool,
+) -> None:
+    judgments = pd.DataFrame(
+        [_rt_row("J-1", "Example Limited", "AA1 1AA")]
+    )
+    company = _ch_row("00000001", "EXAMPLE LIMITED", "AA1 1AA")
+    frame = pd.DataFrame(
+        [[*company.values(), "shadow number"]],
+        columns=[*company.keys(), "CompanyNumber"],
+    )
+    csv_path = tmp_path / "duplicate-company-header.csv"
+    frame.to_csv(csv_path, index=False)
+    path = csv_path
+    if zipped:
+        path = tmp_path / "duplicate-company-header.zip"
+        with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+            archive.write(csv_path, arcname=csv_path.name)
+
+    with pytest.raises(ValueError, match="duplicate raw header.*CompanyNumber"):
+        build_relevant_ch_index(judgments, path)
 
 
 def test_only_unique_exact_names_match_and_postcode_never_selects(tmp_path: Path) -> None:
@@ -367,13 +478,16 @@ def test_diagnostics_are_aggregate_and_sample_is_deterministic() -> None:
         }
     )
 
-    first = pair_sample(judgments, matches, settings)
-    second = pair_sample(judgments, matches, settings)
+    first = accepted_validation_sample(
+        judgments, matches, settings, seed=settings.diagnostic_seed
+    )
+    second = accepted_validation_sample(
+        judgments, matches, settings, seed=settings.diagnostic_seed
+    )
 
     pd.testing.assert_frame_equal(first, second)
     assert len(first) == 1_000
     assert first["tier"].value_counts().to_dict() == {"exact_unique": 1_000}
-    assert "sampling_weight" not in first
     expected_sources = matches.set_index("ID")[[
         "source_company_name",
         "source_trading_name",

@@ -1,49 +1,28 @@
-# Recovery analysis
+# Registry Trust data check
 
-Matches a court judgment file to Companies House data. Run 1 reports the matching
-coverage; Run 2 fits the satisfaction model.
+The program runs on the local computer. It does not upload RT data.
+
+## What you need
+
+- 64-bit Python 3.13 or 3.14, with **Add Python to PATH** selected
+- the full RT CSV or XLSX, with no columns removed or renamed
+- the dated Companies House Basic Company Data CSV or ZIP
+- the RT extract date and Companies House file date
 
 ## Run it
 
-1. Check that Python 3.13 or 3.14 is installed and added to PATH.
-2. Double-click `RUN.bat`.
-3. Choose Run 1 for matching or Run 2 for the satisfaction model.
-4. Drag in your judgment file, then the Companies House file, when prompted.
-5. Enter the date of the RT extract (required for Run 2).
-6. Open `SUMMARY.txt` from the location shown when it finishes.
+1. [Download the program](https://github.com/edwinward3/recovery-analysis/archive/refs/heads/main.zip) and select **Extract All**.
+2. Open the extracted folder and double-click `RUN.bat`.
+3. Drag the RT file into the black window and press Enter.
+4. Drag the Companies House file into the window and press Enter.
+5. Enter the two requested dates as `YYYY-MM-DD`.
+6. Wait for **RUN COMPLETE**.
 
-The Companies House file is the free "BasicCompanyDataAsOneFile" download from
-https://download.companieshouse.gov.uk/. Leave it zipped.
+The first run may download the required Python packages. It does not send either
+data file over the internet.
 
-It also creates a separate file containing 1,000 matching pairs.
+When the run finishes, it shows **SEND THIS FOLDER TO EDWIN**. Zip that folder
+and send the ZIP to Edwin.
 
-## Your judgment file
-
-A .csv or .xlsx with these columns (upper/lower case and order don't matter):
-
-`ID`, `Date Inserted`, `JudgmentDate`, `JudgmentStatus`, `DefendantType`, `Jurisdiction`,
-`Defendant Company Name`, `Defendant_Postcode`.
-
-Dates as DD/MM/YYYY. `Amount`, `Defendant Trading Name` and `Defendant Address` are optional.
-`Date Inserted` is the date RT put the judgment on the register.
-
-## Reading it before you run it
-
-Every file has a short line at the top saying what it does, and the code is commented throughout.
-The analysis itself never uses the internet. On the first run, `RUN.bat` may use it to install
-the required Python packages; neither data file is uploaded.
-It does not save a full copy of the matching data, and a failed run removes its new files.
-
-To watch it run on fake data, with no real file: `python -m recovery.selftest`.
-
-## The files
-
-Everything is in `recovery/`:
-
-- `config.py` holds the fixed numbers used by the matching and model.
-- `data.py` reads the two files and checks their columns and dates.
-- `matching.py` matches unique exact names and makes the 1,000-pair example file.
-- `models.py` contains the satisfaction-model code. It is used only in Run 2.
-- `reporting.py` writes the summary and detail files; `disclosure.py` runs the final check.
-- `run.py` holds the shared code the steps call.
-- `selftest.py` runs the whole thing on fake data made by `synthetic.py`.
+If the program displays **STOP**, send Edwin the complete message. Do not alter
+the data or remove columns to work around it.

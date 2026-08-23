@@ -13,9 +13,14 @@ __pycache__/
 # OS clutter
 .DS_Store
 wheels/
-ch.csv
-fold.csv
 *.csv
+*.xls
+*.xlsx
+*.xlsm
+*.zip
 
 # Test and tool caches
 .pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/

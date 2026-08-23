@@ -35,7 +35,7 @@ _SAFE_EIGHT_DIGIT_COLUMNS = frozenset(
         "date",
         "diagnostic_seed",
         "judgment_date",
-        "locked_seed",
+        "model_seed",
         "observation_date",
         "run_seed",
         "sample_seed",
@@ -89,14 +89,14 @@ class DisclosureReport:
 
 
 class DisclosureViolation(RuntimeError):
-    """Raised when a candidate egress directory is not disclosure-safe."""
+    """Raised when output may reveal identifying information."""
 
     def __init__(self, report: DisclosureReport):
         self.report = report
         summary = "; ".join(
             f"{finding.relative_path}: {finding.kind}" for finding in report.findings
         )
-        super().__init__("egress disclosure gate failed" + (f": {summary}" if summary else ""))
+        super().__init__("output disclosure check failed" + (f": {summary}" if summary else ""))
 
 
 # Remove small counts and check for identifying values

@@ -1,8 +1,8 @@
-@rem Sets up Python, runs the fake-data self-test, then runs matching or the model.
+@rem Sets up Python, checks the setup with fake data, then runs matching.
 @echo off
 setlocal DisableDelayedExpansion
 cd /d "%~dp0"
-title Registry Trust recovery analysis
+title Registry Trust data check
 
 set "SETUP_ONLY="
 if /i "%~1"=="--setup-only" set "SETUP_ONLY=1"
@@ -27,18 +27,18 @@ if not exist ".venv\Scripts\python.exe" goto install
 if "%INSTALLED_KEY%"=="%SETUP_KEY%" goto environment_ready
 
 :install
-echo Preparing the fixed Python environment...
+echo Preparing the Python environment...
 if exist ".venv" rmdir /s /q ".venv"
 python -m venv ".venv"
 if errorlevel 1 goto setup_failed
 if exist "wheels\%PY_TAG%\*.whl" goto install_offline
-echo Downloading the fixed packages from PyPI. No RT data is read or sent during setup.
+echo Downloading the required packages from PyPI. No RT data is read or sent.
 ".venv\Scripts\python.exe" -m pip install --require-hashes --only-binary=:all: -r "requirements.lock"
 if errorlevel 1 goto setup_failed
 goto install_done
 
 :install_offline
-echo Installing the fixed packages from the local wheel folder. No internet is needed.
+echo Installing the required packages from the offline folder. No internet is needed.
 ".venv\Scripts\python.exe" -m pip install --no-index --find-links "wheels\%PY_TAG%" --require-hashes --only-binary=:all: -r "requirements.lock"
 if errorlevel 1 goto setup_failed
 
@@ -48,7 +48,7 @@ if errorlevel 1 goto setup_failed
 :environment_ready
 if defined SETUP_ONLY exit /b 0
 
-echo Running the self-test on fake data...
+echo Checking the setup with fake data...
 ".venv\Scripts\python.exe" -m recovery.selftest
 if errorlevel 1 goto run_failed
 
@@ -56,23 +56,19 @@ set "STAGE=%~1"
 set "JUDGMENTS=%~2"
 set "COMPANIES=%~3"
 set "OBSERVATION=%~4"
-set "OUTPUT_BASE=%~5"
+set "CH_DATE=%~5"
+set "OUTPUT_BASE=%~6"
 set "INTERACTIVE="
 
 if defined STAGE goto have_stage
 set "INTERACTIVE=1"
-echo Choose what to run:
-echo   1. Full-data exact-name matching
-echo   2. Satisfaction model
-set /p "STAGE=Enter 1 or 2: "
+set "STAGE=diagnostic"
 
 :have_stage
 set "STAGE=%STAGE:"=%"
 if "%STAGE%"=="1" set "STAGE=diagnostic"
-if "%STAGE%"=="2" set "STAGE=locked"
 if /i "%STAGE%"=="diagnostic" goto stage_ok
-if /i "%STAGE%"=="locked" goto stage_ok
-goto bad_stage
+goto modelling_disabled
 
 :stage_ok
 if defined JUDGMENTS goto have_judgments
@@ -91,29 +87,22 @@ if not exist "%JUDGMENTS%" goto missing_judgments
 if not exist "%COMPANIES%" goto missing_companies
 
 if not defined INTERACTIVE goto arguments_ready
-if defined OBSERVATION goto arguments_ready
-if /i "%STAGE%"=="locked" set /p "OBSERVATION=RT extract date YYYY-MM-DD (required): "
-if /i "%STAGE%"=="diagnostic" set /p "OBSERVATION=RT extract date YYYY-MM-DD (blank = today): "
+if not defined OBSERVATION set /p "OBSERVATION=RT extract date YYYY-MM-DD (required): "
+if not defined CH_DATE set /p "CH_DATE=Companies House file date YYYY-MM-DD (required): "
 
 :arguments_ready
-if /i "%STAGE%"=="locked" if not defined OBSERVATION goto missing_observation
+if not defined OBSERVATION goto missing_observation
+if not defined CH_DATE goto missing_ch_date
 if not defined OUTPUT_BASE set "OUTPUT_BASE=outputs"
 
 echo.
-if /i "%STAGE%"=="diagnostic" echo Running Run 1: full-data matching only. No satisfaction model will be trained.
-if /i "%STAGE%"=="locked" echo Running Run 2: exact-name matching plus the satisfaction model.
-if defined OBSERVATION goto run_with_date
-".venv\Scripts\python.exe" -m recovery.run analyze --stage "%STAGE%" --judgments "%JUDGMENTS%" --companies-house "%COMPANIES%" --settings "settings.toml" --output-base "%OUTPUT_BASE%"
-if errorlevel 1 goto run_failed
-goto run_succeeded
-
-:run_with_date
-".venv\Scripts\python.exe" -m recovery.run analyze --stage "%STAGE%" --judgments "%JUDGMENTS%" --companies-house "%COMPANIES%" --observation-date "%OBSERVATION%" --settings "settings.toml" --output-base "%OUTPUT_BASE%"
+if /i "%STAGE%"=="diagnostic" echo Checking the files and matching companies...
+".venv\Scripts\python.exe" -m recovery.run analyze --stage "%STAGE%" --judgments "%JUDGMENTS%" --companies-house "%COMPANIES%" --observation-date "%OBSERVATION%" --companies-house-date "%CH_DATE%" --settings "settings.toml" --output-base "%OUTPUT_BASE%"
 if errorlevel 1 goto run_failed
 
 :run_succeeded
 echo.
-echo Done. The summary and matching-pair file are shown above.
+echo Done. Send the folder shown above to Edwin.
 if "%RECOVERY_NO_PAUSE%"=="" pause
 exit /b 0
 
@@ -130,13 +119,13 @@ goto stop
 :setup_failed
 echo.
 echo STOP: Python setup failed. See the message above.
-echo If PyPI is blocked on this machine, ask for the optional reviewed wheel folder.
+echo If PyPI is blocked on this machine, use the optional offline package folder.
 echo No RT data was read or sent during setup.
 goto stop
 
-:bad_stage
+:modelling_disabled
 echo.
-echo STOP: Choose 1 for full-data matching or 2 for the satisfaction model.
+echo STOP: Run 2 is not available until the data and study design have been checked.
 goto stop
 
 :missing_judgments
@@ -151,12 +140,18 @@ goto stop
 
 :missing_observation
 echo.
-echo STOP: Run 2 needs the RT extract date in YYYY-MM-DD format.
+echo STOP: The RT extract date is required in YYYY-MM-DD format.
+goto stop
+
+:missing_ch_date
+echo.
+echo STOP: The Companies House file date is required in YYYY-MM-DD format.
 goto stop
 
 :run_failed
 echo.
-echo STOP: The run did not complete. No output is cleared to leave RT.
+echo STOP: The run failed and any incomplete output was removed.
+echo Do not use or share output from this failed run.
 
 :stop
 if "%RECOVERY_NO_PAUSE%"=="" pause

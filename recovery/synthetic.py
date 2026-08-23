@@ -70,7 +70,6 @@ def make_synthetic_bundle(
     source_postcodes = current_postcodes.copy()
 
     for i, cls in enumerate(corruption):
-        stem = f"ALPHA {i:06d} SERVICES"
         if cls == "punctuation":
             source_names[i] = f"ALPHA-{i:06d} SERVICES LTD."
         elif cls == "same_postcode_wrong_name":

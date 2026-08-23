@@ -1,8 +1,4 @@
-"""Self-test. Runs matching and the model on fake data before any RT file is opened.
-
-It checks the known matches, the four model fits, the pair files and the final
-output check. ``--write-inputs`` saves the fake files for the Windows tests.
-"""
+"""Test matching and output generation using fake data."""
 
 from __future__ import annotations
 
@@ -16,7 +12,11 @@ import sys
 import pandas as pd
 
 from .disclosure import validate_egress
-from .run import PAIR_FILENAME, analyze
+from .matching import (
+    ACCEPTED_LINKAGE_VALIDATION_FILENAME,
+    UNMATCHED_LINKAGE_VALIDATION_FILENAME,
+)
+from .run import analyze
 from .synthetic import make_synthetic_bundle, write_bundle
 
 
@@ -32,16 +32,6 @@ _MATCHING_EGRESS = {
     "E2_incorporation_guards.csv",
     "E5_run_log.csv",
     "E5_run_manifest.json",
-}
-
-_MODEL_EGRESS = {
-    "E3_model_comparison.csv",
-    "E3_calibration.csv",
-    "E3_feature_effects.csv",
-    "E3_split_counts.csv",
-    "E4_sensitivities.csv",
-    "E4_lift.csv",
-    "E4_limitations.txt",
 }
 
 _EXPECTED_TIERS = {
@@ -128,18 +118,18 @@ def _assert_match_truth(matches: pd.DataFrame, truth_path: Path) -> None:
         )
 
 
-def _assert_pair_truth(run_root: Path, truth_path: Path) -> None:
-    """Check the identities in the retained 1,000-pair scale-test sample."""
+def _assert_accepted_sample_truth(run_root: Path, truth_path: Path) -> None:
+    """Check identities in the 1,000-row matched review sample."""
 
-    pairs = pd.read_csv(
-        run_root / "working_files" / PAIR_FILENAME,
+    accepted = pd.read_csv(
+        run_root / "working_files" / ACCEPTED_LINKAGE_VALIDATION_FILENAME,
         dtype={"ID": "string", "matched_company_number": "string"},
     )
     truth = pd.read_csv(
         truth_path,
         dtype={"ID": "string", "expected_company_number": "string"},
     )
-    checked = pairs.merge(truth, on="ID", how="left", validate="one_to_one")
+    checked = accepted.merge(truth, on="ID", how="left", validate="one_to_one")
     if checked["expected_company_number"].isna().any():
         raise AssertionError("one or more sampled IDs are absent from synthetic truth")
     wrong = checked["matched_company_number"].ne(checked["expected_company_number"])
@@ -147,18 +137,15 @@ def _assert_pair_truth(run_root: Path, truth_path: Path) -> None:
         raise AssertionError(f"{int(wrong.sum())} sampled matches have the wrong identity")
 
 
-def _assert_outputs(run_root: Path, *, stage: str) -> None:
+def _assert_outputs(run_root: Path) -> None:
     results = run_root / "results"
     actual = {path.name for path in results.iterdir() if path.is_file()}
-    expected = _MATCHING_EGRESS | (_MODEL_EGRESS if stage == "locked" else set())
-    missing = sorted(expected - actual)
+    missing = sorted(_MATCHING_EGRESS - actual)
     if missing:
         raise AssertionError(f"missing aggregate outputs: {missing}")
-    unexpected_models = sorted(_MODEL_EGRESS & actual) if stage == "diagnostic" else []
-    if unexpected_models:
-        raise AssertionError(
-            f"matching-only diagnostic wrote model outputs: {unexpected_models}"
-        )
+    unexpected = sorted(actual - _MATCHING_EGRESS)
+    if unexpected:
+        raise AssertionError(f"unexpected diagnostic outputs: {unexpected}")
     validate_egress(results)
 
     manifest = json.loads(
@@ -180,11 +167,20 @@ def _assert_outputs(run_root: Path, *, stage: str) -> None:
     if (run_root / ".aggregate_staging").exists():
         raise AssertionError("aggregate staging was retained after a successful run")
 
-    pairs = pd.read_csv(run_root / "working_files" / PAIR_FILENAME)
-    if len(pairs) != 1_000:
-        raise AssertionError(f"match-example file has {len(pairs)} rows, expected 1,000")
-    if set(pairs["tier"]) != {"exact_unique"}:
-        raise AssertionError("pair file contains a non-exact match")
+    accepted = pd.read_csv(
+        run_root / "working_files" / ACCEPTED_LINKAGE_VALIDATION_FILENAME
+    )
+    if len(accepted) != 1_000:
+        raise AssertionError(
+            f"accepted-link validation file has {len(accepted)} rows, expected 1,000"
+        )
+    if set(accepted["tier"]) != {"exact_unique"}:
+        raise AssertionError("accepted-link validation file contains a non-exact match")
+    unmatched = pd.read_csv(
+        run_root / "working_files" / UNMATCHED_LINKAGE_VALIDATION_FILENAME
+    )
+    if unmatched.empty or set(unmatched["tier"]) != {"unmatched"}:
+        raise AssertionError("unmatched validation file is empty or contaminated")
 
     coverage = pd.read_csv(results / "E2_match_coverage.csv")
     funnel = pd.read_csv(results / "E1_data_funnel.csv").set_index("stage")
@@ -195,29 +191,9 @@ def _assert_outputs(run_root: Path, *, stage: str) -> None:
     if int(coverage["rows"].sum()) != matching_rows:
         raise AssertionError("E2 coverage does not account for every matching decision")
 
-    if stage == "locked":
-        comparison = pd.read_csv(results / "E3_model_comparison.csv")
-        if set(comparison["model"]) != {
-            "prospective.logistic",
-            "prospective.lightgbm",
-            "snapshot_exploratory.logistic",
-            "snapshot_exploratory.lightgbm",
-        }:
-            raise AssertionError("the four declared model fits were not all reported")
-        split_rows = pd.read_csv(results / "E3_split_counts.csv")
-        if set(split_rows["split"]) != {
-            "train",
-            "validation",
-            "calibration",
-            "test",
-        }:
-            raise AssertionError("the four declared partitions were not all reported")
-    else:
-        summary = (results / "SUMMARY.txt").read_text(encoding="utf-8")
-        if "No satisfaction model was trained or assessed" not in summary:
-            raise AssertionError("diagnostic summary does not state that modelling was skipped")
-
-# Run both stages
+    summary = (results / "SUMMARY.txt").read_text(encoding="utf-8")
+    if "No model was run" not in summary:
+        raise AssertionError("summary does not state that modelling was skipped")
 
 def _run_full(args: object) -> int:
     if args.n_companies < 1_600:
@@ -238,26 +214,16 @@ def _run_full(args: object) -> int:
             judgments_path=judgments,
             companies_house_path=companies,
             observation_date=bundle.observation_date,
+            companies_house_date=bundle.observation_date,
             settings_path=args.settings,
             output_base=root / "outputs !",
             run_id="selftest_diagnostic",
             _match_validator=lambda matches: _assert_match_truth(matches, truth),
         )
-        _assert_outputs(diagnostic.root, stage="diagnostic")
-        locked = analyze(
-            stage="locked",
-            judgments_path=judgments,
-            companies_house_path=companies,
-            observation_date=bundle.observation_date,
-            settings_path=args.settings,
-            output_base=root / "outputs !",
-            run_id="selftest_locked",
-            _match_validator=lambda matches: _assert_match_truth(matches, truth),
-        )
-        _assert_outputs(locked.root, stage="locked")
+        _assert_outputs(diagnostic.root)
     print(
-        "SELF-TEST: PASS. Matching-only Run 1, locked Run 2, planted match "
-        "identities, four model fits and the disclosure boundary all passed."
+        "SELF-TEST: PASS. Matching, review samples and output checks all passed. "
+        "No model was run."
     )
     return 0
 

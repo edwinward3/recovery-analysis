@@ -1,6 +1,4 @@
-# Purpose: test the real Windows launchers on synthetic, non-confidential data.
-# Inputs are generated fixtures; outputs are CI-only reports and no RT data is accessed.
-# Analysis is local; setup may download the fixed packages tested here.
+# Tests the Windows launcher with synthetic data.
 name: windows-run
 
 on:
@@ -9,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       run_500k_scale_gate:
-        description: "Run the exact 500,000-row cold Windows release gate"
+        description: "Run the 500,000-row test on Python 3.13 and 3.14"
         required: true
         default: false
         type: boolean
@@ -17,11 +15,16 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: true
+
 env:
   PIP_DISABLE_PIP_VERSION_CHECK: "1"
 
 jobs:
   windows-test:
+    name: Tests (Python ${{ matrix.python }})
     runs-on: windows-latest
     timeout-minutes: 90
     strategy:
@@ -30,49 +33,55 @@ jobs:
         python: ["3.13", "3.14"]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: ${{ matrix.python }}
 
-      - name: Unit tests and in-memory self-test
+      - name: Unit tests and fake-data test
         shell: pwsh
         run: |
-          python -m pip install -r requirements-dev.txt
+          python -m pip install --require-hashes --only-binary=:all: -r requirements.lock
+          python -m pip install pytest==9.1.1
           python -m pytest -q
           python -m recovery.selftest
 
-      - name: Write XLSX and ZIP inputs with awkward paths
+      - name: Create test files with spaces and symbols in their paths
         shell: pwsh
         run: python -m recovery.selftest --write-inputs "ci inputs !" --n-companies 2400 --no-prior-rows
 
-      - name: Run both analysis stages through RUN.bat
+      - name: Run RUN.bat and check Run 2 is disabled
         shell: pwsh
         env:
           RECOVERY_NO_PAUSE: "1"
         run: |
           @(
-            "1",
             '"ci inputs !\synthetic judgments.xlsx"',
             '"ci inputs !\BasicCompanyDataAsOneFile-2026-06-01.zip"',
-            ""
+            "2026-06-01",
+            "2026-06-01"
           ) | Set-Content "ci inputs !\launcher answers.txt" -Encoding ascii
           cmd.exe /d /c 'RUN.bat < "ci inputs !\launcher answers.txt"'
           if ($LASTEXITCODE -ne 0) { throw "diagnostic RUN.bat failed with exit code $LASTEXITCODE" }
-          @(
-            "2",
-            '"ci inputs !\synthetic judgments.xlsx"',
-            '"ci inputs !\BasicCompanyDataAsOneFile-2026-06-01.zip"',
-            "2026-06-01"
-          ) | Set-Content "ci inputs !\model launcher answers.txt" -Encoding ascii
-          cmd.exe /d /c 'RUN.bat < "ci inputs !\model launcher answers.txt"'
-          if ($LASTEXITCODE -ne 0) { throw "locked RUN.bat failed with exit code $LASTEXITCODE" }
+          $blockedLog = @(cmd.exe /d /c 'RUN.bat 2 "ci inputs !\synthetic judgments.xlsx" "ci inputs !\BasicCompanyDataAsOneFile-2026-06-01.zip" 2026-06-01 2026-06-01 "blocked outputs !"' 2>&1)
+          $blockedExit = $LASTEXITCODE
+          $blockedLog | Write-Host
+          if ($blockedExit -eq 0) { throw "Run 2 should be disabled" }
+          if (($blockedLog -join "`n") -notmatch "Run 2 is not available until the data and study design have been checked") {
+            throw "Run 2 did not show its disabled message"
+          }
+          if (Test-Path "blocked outputs !") { throw "blocked Run 2 touched its output directory" }
+          $global:LASTEXITCODE = 0
 
-      - name: Assert matching-only Run 1 and model Run 2 outputs
+      - name: Check output files and review samples
         shell: pwsh
         run: |
           $diagnostic = Get-ChildItem "outputs" -Directory -Filter "diagnostic_*" | Sort-Object Name | Select-Object -Last 1
-          $locked = Get-ChildItem "outputs" -Directory -Filter "locked_*" | Sort-Object Name | Select-Object -Last 1
-          if (-not $diagnostic -or -not $locked) { throw "both run directories were not produced" }
+          if (-not $diagnostic) { throw "diagnostic run directory was not produced" }
+          if (Get-ChildItem "outputs" -Directory | Where-Object { $_.Name -like "locked_*" -or $_.Name -like "development_*" }) {
+            throw "diagnostic launcher unexpectedly produced a development or locked run"
+          }
           $matchingExpected = @(
             "SUMMARY.txt",
             "E1_data_audit.csv", "E1_data_funnel.csv",
@@ -80,63 +89,67 @@ jobs:
             "E2_match_by_defendant_type.csv", "E2_match_by_judgment_vintage.csv", "E2_incorporation_guards.csv",
             "E5_run_log.csv", "E5_run_manifest.json"
           )
-          $modelExpected = @(
-            "E3_model_comparison.csv", "E3_calibration.csv", "E3_feature_effects.csv", "E3_split_counts.csv",
-            "E4_sensitivities.csv", "E4_lift.csv", "E4_limitations.txt"
-          )
-          foreach ($run in @($diagnostic, $locked)) {
-            $results = Join-Path $run.FullName "results"
-            $expected = if ($run.Name -like "locked_*") { $matchingExpected + $modelExpected } else { $matchingExpected }
-            foreach ($name in $expected) {
-              if (-not (Test-Path (Join-Path $results $name))) { throw "missing $($run.Name) result: $name" }
+          $results = Join-Path $diagnostic.FullName "results"
+          foreach ($name in $matchingExpected) {
+            if (-not (Test-Path (Join-Path $results $name))) { throw "missing diagnostic result: $name" }
+          }
+          $actualResults = @(Get-ChildItem $results -File | Select-Object -ExpandProperty Name | Sort-Object)
+          $expectedResults = @($matchingExpected | Sort-Object)
+          if (($actualResults -join ',') -ne ($expectedResults -join ',')) {
+            throw "diagnostic result allowlist mismatch: $($actualResults -join ', ')"
+          }
+          if (Get-ChildItem $results -File | Where-Object { $_.Name -match '^E[34]_' }) {
+            throw "diagnostic unexpectedly wrote a development or model report"
+          }
+
+          $acceptedPath = Join-Path $diagnostic.FullName "working_files\linkage_validation_accepted.csv"
+          $unmatchedPath = Join-Path $diagnostic.FullName "working_files\linkage_validation_unmatched.csv"
+          if (-not (Test-Path $acceptedPath)) { throw "accepted-link validation sample is missing" }
+          if (-not (Test-Path $unmatchedPath)) { throw "unmatched validation sample is missing" }
+          $accepted = Import-Csv $acceptedPath
+          $unmatched = Import-Csv $unmatchedPath
+          if ($accepted.Count -ne 1000) { throw "accepted sample has $($accepted.Count) rows, expected 1000" }
+          if ($unmatched.Count -ne 900) { throw "unmatched sample has $($unmatched.Count) rows, expected the 900-row census" }
+          $acceptedTiers = @($accepted.tier | Sort-Object -Unique)
+          $unmatchedTiers = @($unmatched.tier | Sort-Object -Unique)
+          if ($acceptedTiers.Count -ne 1 -or $acceptedTiers[0] -ne "exact_unique") { throw "accepted sample contains a non-exact match" }
+          if ($unmatchedTiers.Count -ne 1 -or $unmatchedTiers[0] -ne "unmatched") { throw "unmatched sample contains an accepted match" }
+          if (-not ($accepted | Where-Object { $_.source_company_name -match "ALPHA" } | Select-Object -First 1)) {
+            throw "planted accepted names are missing"
+          }
+          foreach ($frame in @($accepted, $unmatched)) {
+            $canonicalHeaders = @($frame[0].PSObject.Properties.Name | ForEach-Object { ($_ -replace '[^A-Za-z0-9]', '').ToLowerInvariant() })
+            foreach ($forbidden in @("judgmentstatus", "satisfactiondate", "cancellationdate", "cancellationreason", "companystatus", "outcome", "target", "issatisfied", "satisfied", "unsatisfied", "y")) {
+              if ($canonicalHeaders -contains $forbidden) { throw "review sample leaked forbidden field: $forbidden" }
             }
-            $pair = Join-Path $run.FullName "working_files\matching_pairs_1000.csv"
-            if (-not (Test-Path $pair)) { throw "$($run.Name) pair-example file missing" }
-            $pairs = Import-Csv $pair
-            if ($pairs.Count -ne 1000) { throw "$($run.Name) pair file has $($pairs.Count) rows, expected 1000" }
-            $pairTiers = @($pairs.tier | Sort-Object -Unique)
-            if ($pairTiers.Count -ne 1 -or $pairTiers[0] -ne "exact_unique") { throw "$($run.Name) pair file contains a non-exact match" }
-            if (-not ($pairs | Where-Object { $_.source_company_name -match "ALPHA" } | Select-Object -First 1)) { throw "$($run.Name) planted names missing" }
-            $env:CI_RESULTS = $results
-            python -c "import os; from recovery.disclosure import validate_egress; validate_egress(os.environ['CI_RESULTS'])"
           }
+
+          $workingNames = @(Get-ChildItem (Join-Path $diagnostic.FullName "working_files") -File | Select-Object -ExpandProperty Name | Sort-Object)
+          $expectedWorking = @("linkage_validation_accepted.csv", "linkage_validation_unmatched.csv")
+          if (($workingNames -join ',') -ne ($expectedWorking -join ',')) { throw "unexpected diagnostic working files: $($workingNames -join ', ')" }
+
           $diagnosticSummary = Get-Content (Join-Path $diagnostic.FullName "results\SUMMARY.txt") -Raw
-          if ($diagnosticSummary -notmatch "RUN 1 MATCHING SUMMARY") { throw "diagnostic matching summary missing" }
-          if ($diagnosticSummary -notmatch "No satisfaction model was trained") { throw "diagnostic did not clearly defer modelling" }
-          foreach ($name in $modelExpected) {
-            if (Test-Path (Join-Path $diagnostic.FullName "results\$name")) { throw "diagnostic unexpectedly wrote model output: $name" }
-          }
+          if ($diagnosticSummary -notmatch "RT MATCHING CHECK") { throw "summary heading missing" }
+          if ($diagnosticSummary -notmatch "No model was run") { throw "summary does not say that modelling was skipped" }
           if (Test-Path (Join-Path $diagnostic.FullName "working_files\models")) {
             throw "diagnostic unexpectedly retained an internal model folder"
           }
           if (Test-Path (Join-Path $diagnostic.FullName "working_files\model_rows.csv")) {
             throw "diagnostic unexpectedly wrote model split membership"
           }
-          foreach ($run in @($diagnostic, $locked)) {
-            if (Test-Path (Join-Path $run.FullName "working_files\matching_table.csv.gz")) {
-              throw "$($run.Name) retained the full row-level match table"
-            }
-            if (Test-Path (Join-Path $run.FullName ".aggregate_staging")) {
-              throw "$($run.Name) retained aggregate staging files"
-            }
-          }
-          if (Test-Path (Join-Path $locked.FullName "working_files\model_rows.csv")) {
-            throw "locked run retained identifiable model split membership"
-          }
+          if (Test-Path (Join-Path $diagnostic.FullName "working_files\matching_table.csv.gz")) { throw "diagnostic retained the full row-level match table" }
+          if (Test-Path (Join-Path $diagnostic.FullName ".aggregate_staging")) { throw "diagnostic retained aggregate staging files" }
           $diagnosticManifest = Get-Content (Join-Path $diagnostic.FullName "results\E5_run_manifest.json") -Raw | ConvertFrom-Json
-          if ($null -ne $diagnosticManifest.model_only_acceptance) {
-            throw "diagnostic unexpectedly retained model acceptance"
-          }
+          if ($diagnosticManifest.stage -ne "diagnostic") { throw "manifest stage is not diagnostic" }
+          if ($diagnosticManifest.schema_construct -ne "status_only_unique_judgment_rows") { throw "unexpected diagnostic schema construct" }
+          if ($diagnosticManifest.observation_date -ne "2026-06-01") { throw "manifest RT extract date changed" }
+          if ($diagnosticManifest.companies_house_snapshot_date -ne "2026-06-01") { throw "manifest CH snapshot date changed" }
+          $manifestWorking = @($diagnosticManifest.artifact_manifest.working_files | Sort-Object)
+          if (($manifestWorking -join ',') -ne ($expectedWorking -join ',')) { throw "manifest working-file list is wrong" }
           $diagnosticLog = Import-Csv (Join-Path $diagnostic.FullName "results\E5_run_log.csv")
           if ($diagnosticLog.stage | Where-Object { $_ -like "E3*" -or $_ -like "E4*" }) {
             throw "diagnostic unexpectedly executed a model stage"
           }
-          $lockedSummary = Get-Content (Join-Path $locked.FullName "results\SUMMARY.txt") -Raw
-          if ($lockedSummary -notmatch "Primary judgment-time model") { throw "primary model missing from locked summary" }
-          if ($lockedSummary -notmatch "CURRENT-SNAPSHOT FEATURES") { throw "exploratory warning missing from locked summary" }
-          $diagnosticPairs = Import-Csv (Join-Path $diagnostic.FullName "working_files\matching_pairs_1000.csv")
-          $lockedPairs = Import-Csv (Join-Path $locked.FullName "working_files\matching_pairs_1000.csv")
-          if (($diagnosticPairs.ID -join ',') -eq ($lockedPairs.ID -join ',')) { throw "Run 2 pair examples did not change" }
           $truth = Import-Csv "ci inputs !\synthetic_ground_truth.csv"
           if (($truth.corruption_class | Sort-Object -Unique).Count -ne 8) { throw "synthetic corruption classes missing" }
           $coverage = Import-Csv (Join-Path $diagnostic.FullName "results\E2_match_coverage.csv")
@@ -145,8 +158,10 @@ jobs:
           if ($exactRows -ne 1500 -or $unmatchedRows -ne 900) {
             throw "exact-only matching counts are wrong: exact=$exactRows unmatched=$unmatchedRows"
           }
+          $env:CI_RESULTS = $results
+          python -c "import os; from recovery.disclosure import validate_egress; validate_egress(os.environ['CI_RESULTS'])"
 
-      - name: Prove setup is cached
+      - name: Check repeat setup
         shell: pwsh
         env:
           RECOVERY_NO_PAUSE: "1"
@@ -160,6 +175,7 @@ jobs:
           if ($before -ne $after) { throw "unchanged lock/version unexpectedly reinstalled the environment" }
 
   offline-bundle:
+    name: Offline setup (Python ${{ matrix.python }})
     runs-on: windows-latest
     timeout-minutes: 45
     strategy:
@@ -168,6 +184,8 @@ jobs:
         python: ["3.13", "3.14"]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: ${{ matrix.python }}
@@ -177,7 +195,7 @@ jobs:
           $tag = python -c "import sys; print('py'+str(sys.version_info.major)+str(sys.version_info.minor))"
           New-Item -ItemType Directory -Force "wheels\$tag" | Out-Null
           python -m pip download --require-hashes --only-binary=:all: -r requirements.lock -d "wheels\$tag"
-      - name: Prove the optional bundle sets up and runs offline
+      - name: Test offline setup
         shell: pwsh
         env:
           RECOVERY_NO_PAUSE: "1"
@@ -191,18 +209,25 @@ jobs:
           .\.venv\Scripts\python.exe -m recovery.selftest
 
   manual-scale:
+    name: 500,000-row test (Python ${{ matrix.python }})
     if: github.event_name == 'workflow_dispatch' && inputs.run_500k_scale_gate
     runs-on: windows-latest
     timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.13", "3.14"]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
-          python-version: "3.13"
-      - name: Prepare developer test tools
+          python-version: ${{ matrix.python }}
+      - name: Install test tools
         shell: pwsh
         run: python -m pip install -r requirements-dev.txt
-      - name: Generate 500K inputs and enforce both run gates
+      - name: Run the 500,000-row test
         shell: pwsh
         env:
           RECOVERY_NO_PAUSE: "1"
@@ -222,70 +247,55 @@ jobs:
             }
             return $value
           }
-          function Test-ScaleRun([string]$stage) {
-            $clock = [System.Diagnostics.Stopwatch]::StartNew()
-            & .\RUN.bat $stage "scale inputs !\synthetic judgments.csv" "scale inputs !\BasicCompanyDataAsOneFile-2026-06-01.zip" 2026-06-01 "scale outputs !"
-            $runExit = $LASTEXITCODE
-            $clock.Stop()
-            if ($runExit -ne 0) { throw "$stage scale launcher failed" }
-            if ($clock.Elapsed.TotalSeconds -gt 7200) { throw "$stage runtime exceeded two hours: $($clock.Elapsed)" }
-            $run = Get-ChildItem "scale outputs !" -Directory -Filter "$stage`_*" | Sort-Object Name | Select-Object -Last 1
-            if (-not $run) { throw "$stage scale run did not produce an output directory" }
-            $env:SCALE_RUN_ROOT = $run.FullName
-            python -c "import os; from pathlib import Path; from recovery.selftest import _assert_pair_truth; _assert_pair_truth(Path(os.environ['SCALE_RUN_ROOT']), Path('scale inputs !/synthetic_ground_truth.csv'))"
-            $log = Import-Csv (Join-Path $run.FullName "results\E5_run_log.csv")
-            $manifest = Get-Content (Join-Path $run.FullName "results\E5_run_manifest.json") -Raw | ConvertFrom-Json
-            $coverage = Import-Csv (Join-Path $run.FullName "results\E2_match_coverage.csv")
-            $exactRows = [int](($coverage | Where-Object tier -eq "exact_unique").rows)
-            $unmatchedRows = [int](($coverage | Where-Object tier -eq "unmatched").rows)
-            if ($exactRows -ne 312500 -or $unmatchedRows -ne 187500) {
-              throw "$stage exact-only counts are wrong: exact=$exactRows unmatched=$unmatchedRows"
-            }
-            $peaks = @($log | ForEach-Object {
-              ConvertTo-ValidPeak $_.peak_memory_mb "$stage E5 stage '$($_.stage)'"
-            })
-            $peaks += ConvertTo-ValidPeak $manifest.runtime.peak_memory_mb "$stage E5 manifest"
-            $peak = ($peaks | Measure-Object -Maximum).Maximum
-            if ($peak -gt 8192) { throw "$stage peak memory exceeded 8 GB: $peak MB" }
-            if ($manifest.disclosure.status -ne "pass") { throw "$stage disclosure gate did not pass" }
-            $modelReport = Join-Path $run.FullName "results\E3_model_comparison.csv"
-            if ($stage -eq "diagnostic" -and (Test-Path $modelReport)) { throw "diagnostic scale run wrote a model report" }
-            if ($stage -eq "locked" -and -not (Test-Path $modelReport)) { throw "locked scale run did not write a model report" }
-            return [PSCustomObject]@{
-              Stage = $stage
-              Run = $run
-              Manifest = $manifest
-              ElapsedSeconds = $clock.Elapsed.TotalSeconds
-              PeakMemoryMb = $peak
-            }
+          $clock = [System.Diagnostics.Stopwatch]::StartNew()
+          & .\RUN.bat diagnostic "scale inputs !\synthetic judgments.csv" "scale inputs !\BasicCompanyDataAsOneFile-2026-06-01.zip" 2026-06-01 2026-06-01 "scale outputs !"
+          $runExit = $LASTEXITCODE
+          $clock.Stop()
+          if ($runExit -ne 0) { throw "diagnostic scale launcher failed" }
+          if ($clock.Elapsed.TotalSeconds -gt 7200) { throw "diagnostic runtime exceeded two hours: $($clock.Elapsed)" }
+          $run = Get-ChildItem "scale outputs !" -Directory -Filter "diagnostic_*" | Sort-Object Name | Select-Object -Last 1
+          if (-not $run) { throw "diagnostic scale run did not produce an output directory" }
+          if (Get-ChildItem "scale outputs !" -Directory | Where-Object { $_.Name -like "locked_*" -or $_.Name -like "development_*" }) {
+            throw "500,000-row test should not run a model"
           }
-          $diagnostic = Test-ScaleRun "diagnostic"
-          $locked = Test-ScaleRun "locked"
+          $env:SCALE_RUN_ROOT = $run.FullName
+          python -c "import os; from pathlib import Path; from recovery.selftest import _assert_accepted_sample_truth; _assert_accepted_sample_truth(Path(os.environ['SCALE_RUN_ROOT']), Path('scale inputs !/synthetic_ground_truth.csv'))"
+          $log = Import-Csv (Join-Path $run.FullName "results\E5_run_log.csv")
+          $manifest = Get-Content (Join-Path $run.FullName "results\E5_run_manifest.json") -Raw | ConvertFrom-Json
+          $coverage = Import-Csv (Join-Path $run.FullName "results\E2_match_coverage.csv")
+          $exactRows = [int](($coverage | Where-Object tier -eq "exact_unique").rows)
+          $unmatchedRows = [int](($coverage | Where-Object tier -eq "unmatched").rows)
+          if ($exactRows -ne 312500 -or $unmatchedRows -ne 187500) {
+            throw "diagnostic exact-only counts are wrong: exact=$exactRows unmatched=$unmatchedRows"
+          }
+          $peaks = @($log | ForEach-Object {
+            ConvertTo-ValidPeak $_.peak_memory_mb "diagnostic E5 stage '$($_.stage)'"
+          })
+          $peaks += ConvertTo-ValidPeak $manifest.runtime.peak_memory_mb "diagnostic E5 manifest"
+          $peak = ($peaks | Measure-Object -Maximum).Maximum
+          if ($peak -gt 8192) { throw "diagnostic peak memory exceeded 8 GB: $peak MB" }
+          if ($manifest.disclosure.status -ne "pass") { throw "output safety check did not pass" }
+          if (Test-Path (Join-Path $run.FullName "results\E3_model_comparison.csv")) { throw "diagnostic scale run wrote a model report" }
           New-Item -ItemType Directory -Force "scale evidence" | Out-Null
           @(
-            "EXACT_WINDOWS_SCALE_GATE=PASS",
+            "EXACT_WINDOWS_DIAGNOSTIC_SCALE_GATE=PASS",
             "PYTHON=$(& python -c 'import platform; print(platform.python_version())')",
             "JUDGMENT_ROWS=500000",
-            "PLANTED_PAIR_TRUTH=PASS",
-            "DIAGNOSTIC_ELAPSED_SECONDS=$($diagnostic.ElapsedSeconds)",
-            "DIAGNOSTIC_PEAK_PROCESS_MEMORY_MB=$($diagnostic.PeakMemoryMb)",
-            "DIAGNOSTIC_DISCLOSURE_GATE=$($diagnostic.Manifest.disclosure.status)",
-            "DIAGNOSTIC_RUN_ID=$($diagnostic.Manifest.run_id)",
-            "LOCKED_ELAPSED_SECONDS=$($locked.ElapsedSeconds)",
-            "LOCKED_PEAK_PROCESS_MEMORY_MB=$($locked.PeakMemoryMb)",
-            "LOCKED_DISCLOSURE_GATE=$($locked.Manifest.disclosure.status)",
-            "LOCKED_RUN_ID=$($locked.Manifest.run_id)"
+            "SAMPLED_ACCEPTED_LINK_TRUTH=PASS",
+            "DIAGNOSTIC_ELAPSED_SECONDS=$($clock.Elapsed.TotalSeconds)",
+            "DIAGNOSTIC_PEAK_PROCESS_MEMORY_MB=$peak",
+            "DIAGNOSTIC_DISCLOSURE_GATE=$($manifest.disclosure.status)",
+            "DIAGNOSTIC_RUN_ID=$($manifest.run_id)",
+            "LOCKED_STAGE=NOT_RUN_VALIDITY_GATE_ENFORCED"
           ) | Set-Content -Encoding utf8 "scale evidence\scale_gate_evidence.txt"
-          foreach ($result in @($diagnostic, $locked)) {
-            Copy-Item (Join-Path $result.Run.FullName "results\E5_run_log.csv") "scale evidence\$($result.Stage)_E5_run_log.csv"
-            Copy-Item (Join-Path $result.Run.FullName "results\E5_run_manifest.json") "scale evidence\$($result.Stage)_E5_run_manifest.json"
-            Write-Host "$($result.Stage) scale gate passed: $($result.ElapsedSeconds) seconds; $($result.PeakMemoryMb) MB peak"
-          }
+          Copy-Item (Join-Path $run.FullName "results\E5_run_log.csv") "scale evidence\diagnostic_E5_run_log.csv"
+          Copy-Item (Join-Path $run.FullName "results\E5_run_manifest.json") "scale evidence\diagnostic_E5_run_manifest.json"
+          Write-Host "500,000-row test passed: $($clock.Elapsed.TotalSeconds) seconds; $peak MB peak"
 
-      - name: Preserve aggregate scale-gate evidence
+      - name: Save test results
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: exact-500k-windows-scale-evidence
+          name: exact-500k-windows-py${{ matrix.python }}-diagnostic-scale-evidence
           path: scale evidence
           if-no-files-found: error
           retention-days: 30

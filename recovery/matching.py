@@ -1,4 +1,4 @@
-"""Matches the judgments to Companies House and makes the 1,000-pair file for RT."""
+"""Match judgments to Companies House and create review samples."""
 
 from __future__ import annotations
 
@@ -20,6 +20,7 @@ CH_REQUIRED_COLUMNS: tuple[str, ...] = (
     "CompanyNumber",
     "RegAddress.PostCode",
     "IncorporationDate",
+    "CompanyStatus",
 )
 
 CH_CURRENT_SNAPSHOT_COLUMNS: tuple[str, ...] = (
@@ -35,6 +36,48 @@ CH_CURRENT_SNAPSHOT_COLUMNS: tuple[str, ...] = (
 )
 
 MATCH_TIERS: tuple[str, ...] = ("exact_unique", "unmatched")
+
+_LIVE_COMPANY_STATUSES = frozenset(
+    {
+        "active",
+        "active proposal to strike off",
+        "administration",
+        "administration order",
+        "administrative receiver",
+        "in administration",
+        "in administration administrative receiver",
+        "in administration receiver manager",
+        "insolvency proceedings",
+        "liquidation",
+        "live but receiver manager on at least one charge",
+        "open",
+        "receiver manager administrative receiver",
+        "receivership",
+        "registered",
+        "voluntary arrangement",
+        "voluntary arrangement administrative receiver",
+        "voluntary arrangement receiver manager",
+    }
+)
+
+ACCEPTED_LINKAGE_VALIDATION_FILENAME = "linkage_validation_accepted.csv"
+UNMATCHED_LINKAGE_VALIDATION_FILENAME = "linkage_validation_unmatched.csv"
+
+_FORBIDDEN_VALIDATION_COLUMNS: frozenset[str] = frozenset(
+    {
+        "judgmentstatus",
+        "satisfactiondate",
+        "cancellationdate",
+        "cancellationreason",
+        "companystatus",
+        "outcome",
+        "target",
+        "issatisfied",
+        "satisfied",
+        "unsatisfied",
+        "y",
+    }
+)
 
 _LEGAL_SUFFIXES: tuple[tuple[str, ...], ...] = tuple(
     tuple(value.split())
@@ -172,6 +215,23 @@ def _standardise_ch_headers(frame: pd.DataFrame) -> pd.DataFrame:
     return frame.rename(columns=rename)
 
 
+def _validate_live_company_status(series: pd.Series) -> None:
+    raw = series.astype("string").fillna("").str.strip()
+    canonical = (
+        raw.str.lower()
+        .str.replace(r"[^a-z0-9]+", " ", regex=True)
+        .str.strip()
+    )
+    invalid = ~canonical.isin(_LIVE_COMPANY_STATUSES)
+    if invalid.any():
+        values = sorted(set(raw.loc[invalid].tolist()))
+        raise ValueError(
+            "CompanyStatus has "
+            f"{int(invalid.sum())} blank, unsupported, or non-live row(s): "
+            f"{values[:5]}"
+        )
+
+
 def _parse_dates(series: pd.Series) -> pd.Series:
     raw = series.astype("string").fillna("").str.strip()
     iso = raw.str.fullmatch(r"\d{4}-\d{2}-\d{2}(?:[ T].*)?", na=False)
@@ -278,6 +338,7 @@ def build_relevant_ch_index(
                     f"Companies House file is missing required column(s): {sorted(missing)}"
                 )
             first_chunk = False
+        _validate_live_company_status(chunk["CompanyStatus"])
         rows_read += len(chunk)
 
         current_norm = chunk["CompanyName"].map(normalize_name)
@@ -700,7 +761,7 @@ def match_diagnostics(
     }
 
 
-# Select 1,000 matching pairs
+# Select accepted links for manual checking
 
 def _stable_rank(seed: int, tier: str, identifier: str, company_number: str) -> str:
     value = f"{seed}|{tier}|{identifier}|{company_number}".encode("utf-8")
@@ -714,14 +775,7 @@ def _equal_probability_systematic_sample(
     seed: int,
     tier: str,
 ) -> pd.DataFrame:
-    """Take an equal-probability sample spread across ordered match strata.
-
-    Sorting by the composite stratum before a random-start systematic draw
-    gives the requested spread across name source, vintage and method.
-    Every row within the tier has the same inclusion probability, so unweighted
-    precision is unbiased. Wilson is the declared approximation because the
-    systematic selections are not independent.
-    """
+    """Take a repeatable sample spread across match groups."""
 
     if count <= 0:
         return frame.head(0).copy()
@@ -737,14 +791,14 @@ def _equal_probability_systematic_sample(
     return ordered.iloc[positions].copy()
 
 
-def pair_sample(
+def _sample_accepted_links(
     judgments: pd.DataFrame,
     matches: pd.DataFrame,
     settings: Settings,
     *,
-    seed: int | None = None,
+    seed: int,
 ) -> pd.DataFrame:
-    """Select 1,000 exact-name matches across name, date and postcode groups."""
+    """Select up to 1,000 accepted exact links across matching groups."""
 
     sampling_columns = [
         "ID",
@@ -762,33 +816,33 @@ def pair_sample(
     )
     missing = set((*sampling_columns, *canonical_source_columns)) - set(matches.columns)
     if missing:
-        raise ValueError(f"matches missing pair-sample column(s): {sorted(missing)}")
+        raise ValueError(
+            f"matches missing accepted-validation column(s): {sorted(missing)}"
+        )
 
     accepted_mask = matches["tier"].eq("exact_unique")
     accepted = matches.loc[accepted_mask, sampling_columns].copy()
     accepted["__match_position"] = accepted_mask.to_numpy().nonzero()[0]
     if accepted["ID"].astype(str).duplicated().any():
         raise ValueError("matches contain duplicate ID values")
-    if len(accepted) < settings.sample_size:
-        raise ValueError(
-            f"only {len(accepted):,} unique exact-name matches are available; "
-            f"{settings.sample_size:,} are required for the example file"
-        )
-    actual_seed = settings.locked_seed if seed is None else int(seed)
+    actual_seed = int(seed)
     dates = judgments[["ID", "JudgmentDate"]].copy()
     dates["JudgmentDate"] = pd.to_datetime(
         dates["JudgmentDate"], format="mixed", dayfirst=True, errors="coerce"
     )
     accepted = accepted.merge(dates, on="ID", how="left", validate="one_to_one")
     accepted["__vintage"] = accepted["JudgmentDate"].dt.year.astype("Int64").astype("string")
-    accepted["__stratum"] = (
-        accepted[
-            ["matched_on", "matched_name_kind", "reason", "postcode_agrees", "__vintage"]
-        ]
-        .astype("string")
-        .fillna("missing")
-        .agg("|".join, axis=1)
-    )
+    if accepted.empty:
+        accepted["__stratum"] = pd.Series(index=accepted.index, dtype="string")
+    else:
+        accepted["__stratum"] = (
+            accepted[
+                ["matched_on", "matched_name_kind", "reason", "postcode_agrees", "__vintage"]
+            ]
+            .astype("string")
+            .fillna("missing")
+            .agg("|".join, axis=1)
+        )
     accepted["__rank"] = [
         _stable_rank(actual_seed, str(tier), str(identifier), str(company_number))
         for tier, identifier, company_number in zip(
@@ -843,17 +897,153 @@ def pair_sample(
     return sampled.loc[:, [column for column in columns if column in sampled]].copy()
 
 
+# Make review samples without judgment outcomes
+
+def _assert_no_outcome_columns(frame: pd.DataFrame) -> None:
+    forbidden = {
+        str(column)
+        for column in frame.columns
+        if _canon_header(column) in _FORBIDDEN_VALIDATION_COLUMNS
+    }
+    if forbidden:
+        raise ValueError(
+            "linkage-validation files must not contain outcome/status column(s): "
+            f"{sorted(forbidden)}"
+        )
+
+
+def _escape_spreadsheet_formulas(frame: pd.DataFrame) -> pd.DataFrame:
+    """Keep source text inert when reviewers open the CSV in a spreadsheet."""
+
+    safe = frame.copy()
+    for column in safe.select_dtypes(include=("object", "string")).columns:
+        text = safe[column].astype("string").fillna("")
+        dangerous = text.str.match(r"^[=+\-@\t\r]", na=False)
+        safe.loc[dangerous, column] = "'" + text.loc[dangerous]
+    return safe
+
+
+def unmatched_validation_sample(
+    judgments: pd.DataFrame,
+    matches: pd.DataFrame,
+    sample_size: int,
+    *,
+    seed: int,
+) -> pd.DataFrame:
+    """Draw a repeatable random sample of unmatched judgments."""
+
+    if int(sample_size) <= 0:
+        raise ValueError("unmatched sample size must be positive")
+    required_matches = {
+        "ID",
+        "tier",
+        "reason",
+        "source_company_name",
+        "source_trading_name",
+        "source_postcode",
+    }
+    missing = required_matches - set(matches.columns)
+    if missing:
+        raise ValueError(
+            f"matches missing unmatched-sample column(s): {sorted(missing)}"
+        )
+    if "ID" not in judgments or "JudgmentDate" not in judgments:
+        raise ValueError("judgments must contain ID and JudgmentDate")
+    if matches["ID"].astype(str).duplicated().any():
+        raise ValueError("matches contain duplicate ID values")
+    if judgments["ID"].astype(str).duplicated().any():
+        raise ValueError("judgments contain duplicate ID values")
+
+    allowed_match_columns = [
+        "ID",
+        "tier",
+        "reason",
+        "source_company_name",
+        "source_trading_name",
+        "source_postcode",
+        "exact_name_candidate_count",
+        "rejected_post_incorporation",
+        "incorporation_date_missing",
+        "name_history_incomplete",
+    ]
+    unmatched = matches.loc[
+        matches["tier"].eq("unmatched"),
+        [column for column in allowed_match_columns if column in matches],
+    ].copy()
+
+    judgment_columns = ["ID", "JudgmentDate"]
+    if "Defendant Address" in judgments:
+        judgment_columns.append("Defendant Address")
+    dates = judgments.loc[:, judgment_columns].copy()
+    dates["ID"] = dates["ID"].astype(str)
+    dates["JudgmentDate"] = pd.to_datetime(
+        dates["JudgmentDate"], format="mixed", dayfirst=True, errors="coerce"
+    ).dt.normalize()
+    unmatched["ID"] = unmatched["ID"].astype(str)
+    unmatched = unmatched.merge(dates, on="ID", how="left", validate="one_to_one")
+    if unmatched["JudgmentDate"].isna().any():
+        raise ValueError(
+            "every unmatched judgment must have a parseable JudgmentDate"
+        )
+    if "Defendant Address" in unmatched:
+        unmatched = unmatched.rename(columns={"Defendant Address": "source_address"})
+
+    unmatched["__rank"] = [
+        _stable_rank(int(seed), "unmatched", identifier, "")
+        for identifier in unmatched["ID"]
+    ]
+    sampled = unmatched.sort_values(["__rank", "ID"], kind="stable").head(
+        min(int(sample_size), len(unmatched))
+    ).copy()
+    sampled["match_method"] = sampled["reason"]
+    sampled = sampled.drop(columns="__rank")
+    sampled = sampled.sort_values("ID", kind="stable").reset_index(drop=True)
+    sampled = _escape_spreadsheet_formulas(sampled)
+    _assert_no_outcome_columns(sampled)
+    return sampled
+
+
+def accepted_validation_sample(
+    judgments: pd.DataFrame,
+    matches: pd.DataFrame,
+    settings: Settings,
+    *,
+    seed: int,
+) -> pd.DataFrame:
+    """Return up to 1,000 accepted links without judgment outcomes."""
+
+    accepted = _sample_accepted_links(
+        judgments, matches, settings, seed=int(seed)
+    ).copy()
+    if "Defendant Address" in judgments:
+        source_address = judgments[["ID", "Defendant Address"]].copy()
+        source_address["ID"] = source_address["ID"].astype(str)
+        accepted["ID"] = accepted["ID"].astype(str)
+        accepted = accepted.merge(
+            source_address.rename(columns={"Defendant Address": "source_address"}),
+            on="ID",
+            how="left",
+            validate="one_to_one",
+        )
+    accepted = _escape_spreadsheet_formulas(accepted)
+    _assert_no_outcome_columns(accepted)
+    return accepted
+
+
 __all__ = [
+    "ACCEPTED_LINKAGE_VALIDATION_FILENAME",
     "CH_CURRENT_SNAPSHOT_COLUMNS",
     "CH_REQUIRED_COLUMNS",
     "CHIndex",
     "CompanyRecord",
     "MATCH_TIERS",
     "NamePeriod",
+    "UNMATCHED_LINKAGE_VALIDATION_FILENAME",
+    "accepted_validation_sample",
     "build_relevant_ch_index",
     "match_diagnostics",
     "match_judgments",
     "normalize_name",
     "normalize_postcode",
-    "pair_sample",
+    "unmatched_validation_sample",
 ]
