@@ -646,7 +646,11 @@ def match_diagnostics(
     if "ID" not in judgments or "ID" not in matches:
         raise ValueError("judgments and matches must both contain ID")
     joined = judgments[[column for column in (
-        "ID", "DefendantType", "Jurisdiction", "JudgmentDate"
+        "ID",
+        "JudgmentStatus",
+        "JudgmentDate",
+        "Amount",
+        "age_at_observation_months",
     ) if column in judgments]].merge(matches, on="ID", how="left", validate="one_to_one")
     if joined["tier"].isna().any():
         raise ValueError("matches do not cover every judgment ID")
@@ -679,29 +683,6 @@ def match_diagnostics(
             .sort_values(["tier", "matched_on", "matched_name_kind"])
             .reset_index(drop=True)
         )
-    if "DefendantType" in joined:
-        by_defendant_type = (
-            joined.groupby(["DefendantType", "tier"], dropna=False)
-            .size()
-            .rename("rows")
-            .reset_index()
-        )
-    else:
-        by_defendant_type = pd.DataFrame(columns=["DefendantType", "tier", "rows"])
-    if "JudgmentDate" in joined:
-        dates = pd.to_datetime(
-            joined["JudgmentDate"], format="mixed", dayfirst=True, errors="coerce"
-        )
-        vintage = dates.dt.year.astype("Int64").astype("string").fillna("missing")
-        by_judgment_vintage = (
-            joined.assign(judgment_year=vintage)
-            .groupby(["judgment_year", "tier"], dropna=False)
-            .size()
-            .rename("rows")
-            .reset_index()
-        )
-    else:
-        by_judgment_vintage = pd.DataFrame(columns=["judgment_year", "tier", "rows"])
     guard_counts = pd.DataFrame(
         [
             {
@@ -751,17 +732,120 @@ def match_diagnostics(
             },
         ]
     )
+    selection_profile = _selection_profile(joined)
+    linkage_checks = pd.concat(
+        [
+            guard_counts.rename(columns={"guard": "measure"}),
+            _linked_company_history(joined),
+        ],
+        ignore_index=True,
+    )
     return {
         "tier_counts": tier_counts,
         "unmatched_reasons": unmatched_reasons,
         "method_counts": method_counts,
-        "by_defendant_type": by_defendant_type,
-        "by_judgment_vintage": by_judgment_vintage,
-        "guard_counts": guard_counts,
+        "selection_profile": selection_profile,
+        "linkage_checks": linkage_checks,
     }
 
 
-# Select accepted links for manual checking
+def _selection_profile(joined: pd.DataFrame) -> pd.DataFrame:
+    frame = joined.copy()
+    frame["linkage_group"] = frame["tier"].map(
+        {
+            "exact_unique": "linked_to_one_live_company",
+            "unmatched": "not_linked_to_one_live_company",
+        }
+    ).fillna("other")
+    dates = pd.to_datetime(frame["JudgmentDate"], errors="coerce")
+    frame["judgment_year"] = (
+        dates.dt.year.astype("Int64").astype("string").fillna("missing")
+    )
+    frame["judgment_status"] = (
+        frame.get("JudgmentStatus", pd.Series("missing", index=frame.index))
+        .astype("string")
+        .fillna("missing")
+    )
+    amounts = pd.to_numeric(
+        frame.get("Amount", pd.Series(float("nan"), index=frame.index)),
+        errors="coerce",
+    )
+    frame["amount_band"] = pd.cut(
+        amounts,
+        bins=[-float("inf"), 500, 1_000, 5_000, 25_000, float("inf")],
+        labels=["under_500", "500_999", "1000_4999", "5000_24999", "25000_plus"],
+        right=False,
+    ).astype("string").fillna("missing")
+    ages = pd.to_numeric(
+        frame.get(
+            "age_at_observation_months",
+            pd.Series(float("nan"), index=frame.index),
+        ),
+        errors="coerce",
+    )
+    frame["age_band_months"] = pd.cut(
+        ages,
+        bins=[-float("inf"), 12, 24, 36, 48, 60, 72, float("inf")],
+        labels=["under_12", "12_23", "24_35", "36_47", "48_59", "60_71", "72_plus"],
+        right=False,
+    ).astype("string").fillna("missing")
+
+    tables: list[pd.DataFrame] = []
+    for measure in (
+        "judgment_status",
+        "judgment_year",
+        "amount_band",
+        "age_band_months",
+    ):
+        table = (
+            frame.groupby(["linkage_group", measure], observed=True, dropna=False)
+            .size()
+            .rename("rows")
+            .reset_index()
+            .rename(columns={measure: "band"})
+        )
+        table.insert(1, "measure", measure)
+        totals = table.groupby("linkage_group")["rows"].transform("sum")
+        table["share_within_linkage_group"] = table["rows"] / totals.clip(lower=1)
+        tables.append(table)
+    return pd.concat(tables, ignore_index=True)
+
+
+def _linked_company_history(joined: pd.DataFrame) -> pd.DataFrame:
+    linked = joined.loc[
+        joined["tier"].eq("exact_unique")
+        & joined["matched_company_number"].astype("string").str.strip().ne("")
+    ].copy()
+    if linked.empty:
+        values = {
+            "linked_judgments": 0,
+            "distinct_live_companies": 0,
+            "live_companies_with_multiple_linked_judgments": 0,
+            "linked_judgments_at_repeated_companies": 0,
+            "linked_judgments_with_an_earlier_linked_judgment": 0,
+        }
+    else:
+        company_counts = linked.groupby("matched_company_number")["ID"].transform("size")
+        distinct_counts = linked.groupby("matched_company_number")["ID"].size()
+        dates = pd.to_datetime(linked["JudgmentDate"], errors="coerce")
+        first_dates = dates.groupby(linked["matched_company_number"]).transform("min")
+        values = {
+            "linked_judgments": int(len(linked)),
+            "distinct_live_companies": int(distinct_counts.size),
+            "live_companies_with_multiple_linked_judgments": int(
+                distinct_counts.gt(1).sum()
+            ),
+            "linked_judgments_at_repeated_companies": int(company_counts.gt(1).sum()),
+            "linked_judgments_with_an_earlier_linked_judgment": int(
+                dates.gt(first_dates).sum()
+            ),
+        }
+    return pd.DataFrame(
+        [{"measure": measure, "rows": value} for measure, value in values.items()]
+    )
+
+
+# Select accepted links for Edwin's review sample
 
 def _stable_rank(seed: int, tier: str, identifier: str, company_number: str) -> str:
     value = f"{seed}|{tier}|{identifier}|{company_number}".encode("utf-8")

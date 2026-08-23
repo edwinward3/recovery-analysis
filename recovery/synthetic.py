@@ -141,8 +141,7 @@ def make_synthetic_bundle(
         }
     )
 
-    # Earlier judgments are outside the 12–36-month primary window but inside
-    # the target judgment's 24-month look-back for the selected companies.
+    # Add older judgments to test repeated companies.
     if include_prior_rows:
         prior_indices = np.flatnonzero(prior_flag)
         prior_dates = target_dates[prior_indices] - pd.to_timedelta(

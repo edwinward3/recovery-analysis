@@ -1,6 +1,6 @@
-"""Synthetic tests for the fail-closed RT schema and provenance audit.
+"""Synthetic tests for the RT file checks.
 
-No private or locked data are read by this module.
+No private data are read by this module.
 """
 
 from __future__ import annotations
@@ -12,6 +12,7 @@ import pandas as pd
 import pytest
 
 from recovery.data import read_rt_extract
+from recovery.reporting import build_data_audit_counts
 
 
 OBSERVED = "2024-12-31"
@@ -124,6 +125,42 @@ def test_event_and_snapshot_aliases_are_preserved_parsed_and_audited(
     assert ("Date Satisfied", "Satisfaction Date") in audit.raw_header_schema
     assert ("Extract Date", "Snapshot Date") in audit.raw_header_schema
 
+    table = build_data_audit_counts(frame, audit)
+    populated = table.loc[
+        table["dimension"].eq("optional_field_populated")
+    ].set_index("value")["rows"]
+    assert populated["Satisfaction Date"] == 1
+    assert populated["Cancellation Date"] == 1
+    source_columns = set(table.loc[table["dimension"].eq("source_column"), "value"])
+    assert "Date Satisfied -> Satisfaction Date" in source_columns
+    assert "Extract Date -> Snapshot Date" in source_columns
+
+
+def test_one_month_check_uses_a_calendar_month(tmp_path: Path) -> None:
+    within = _row("J-WITHIN", status="Satisfied")
+    within.update(
+        {
+            "JudgmentDate": "31/01/2024",
+            "Date Inserted": "01/02/2024",
+            "Satisfaction Date": "29/02/2024",
+        }
+    )
+    after = _row("J-AFTER", status="Satisfied")
+    after.update(
+        {
+            "JudgmentDate": "31/01/2024",
+            "Date Inserted": "01/02/2024",
+            "Satisfaction Date": "01/03/2024",
+        }
+    )
+    frame, audit = read_rt_extract(
+        _write(tmp_path / "calendar-month.csv", [within, after]), OBSERVED
+    )
+
+    table = build_data_audit_counts(frame, audit)
+    checks = table.loc[table["dimension"].eq("follow_up_check")].set_index("value")
+    assert checks.loc["recorded_satisfaction_within_1_months", "rows"] == 1
+
 
 def test_exact_extra_headers_stay_internal_and_affect_schema_provenance(
     tmp_path: Path,
@@ -145,6 +182,12 @@ def test_exact_extra_headers_stay_internal_and_affect_schema_provenance(
     assert first_audit.analysis_fingerprint == second_audit.analysis_fingerprint
     assert first_audit.raw_header_schema_sha256 != second_audit.raw_header_schema_sha256
     assert first_audit.provenance_fingerprint != second_audit.provenance_fingerprint
+    public_columns = set(
+        build_data_audit_counts(first_frame, first_audit)
+        .loc[lambda table: table["dimension"].eq("source_column"), "value"]
+    )
+    assert "Source Batch -> <unrecognised>" not in public_columns
+    assert "extra_column_1 -> <unrecognised>" in public_columns
 
 
 def test_raw_file_hash_and_all_retained_columns_are_fingerprinted(tmp_path: Path) -> None:

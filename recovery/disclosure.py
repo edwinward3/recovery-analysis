@@ -1,4 +1,4 @@
-"""Copies the approved aggregate reports after checking small counts and identifying values."""
+"""Check and copy aggregate output files."""
 
 from __future__ import annotations
 
@@ -27,17 +27,13 @@ _COMPANY_NAME_RE = re.compile(
     r"\b(?:[A-Z0-9][A-Z0-9&.'’()/-]*\s+){1,10}(?:LTD|LIMITED|PLC|LLP)\b",
     re.IGNORECASE,
 )
-_SAFE_NAME_COLUMNS = frozenset(
-    {"artifact_name", "feature_name", "file_name", "filename", "metric_name", "model_name"}
-)
+_SAFE_NAME_COLUMNS = frozenset({"artifact_name", "file_name", "filename"})
 _SAFE_EIGHT_DIGIT_COLUMNS = frozenset(
     {
         "date",
         "diagnostic_seed",
         "judgment_date",
-        "model_seed",
         "observation_date",
-        "run_seed",
         "sample_seed",
         "seed",
         "snapshot_date",
@@ -176,7 +172,7 @@ def validate_egress(
     return report
 
 
-# Copy the approved reports
+# Copy the checked reports
 
 def stage_egress(
     source_dir: str | Path,
@@ -186,11 +182,11 @@ def stage_egress(
     min_cell_n: int = 10,
     known_identifiers: Iterable[str] = (),
 ) -> DisclosureReport:
-    """Copy only explicitly named artefacts into a newly validated egress area.
+    """Copy only the named output files after checking them.
 
     ``allowlist`` maps each relative filename to its disclosure count column(s),
     or to ``None`` for a count-free aggregate.  Unlisted source files are never
-    copied. The named working-file folder cannot be allowlisted.
+    copied. The working-file folder cannot be included.
     """
 
     source_root = Path(source_dir).resolve()
@@ -349,7 +345,7 @@ def _is_identifier_column(value: object) -> bool:
         return True
     if "postcode" in key or "address" in key:
         return True
-    if key.endswith("_id") and key not in {"model_id", "run_id"}:
+    if key.endswith("_id") and key != "run_id":
         return True
     if "company" in key and ("name" in key or "number" in key):
         return True

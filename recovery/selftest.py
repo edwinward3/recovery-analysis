@@ -27,9 +27,8 @@ _MATCHING_EGRESS = {
     "E2_match_coverage.csv",
     "E2_unmatched_reasons.csv",
     "E2_match_methods.csv",
-    "E2_match_by_defendant_type.csv",
-    "E2_match_by_judgment_vintage.csv",
-    "E2_incorporation_guards.csv",
+    "E2_linkage_profile.csv",
+    "E2_linkage_checks.csv",
     "E5_run_log.csv",
     "E5_run_manifest.json",
 }
@@ -145,7 +144,7 @@ def _assert_outputs(run_root: Path) -> None:
         raise AssertionError(f"missing aggregate outputs: {missing}")
     unexpected = sorted(actual - _MATCHING_EGRESS)
     if unexpected:
-        raise AssertionError(f"unexpected diagnostic outputs: {unexpected}")
+        raise AssertionError(f"unexpected outputs: {unexpected}")
     validate_egress(results)
 
     manifest = json.loads(
@@ -191,10 +190,6 @@ def _assert_outputs(run_root: Path) -> None:
     if int(coverage["rows"].sum()) != matching_rows:
         raise AssertionError("E2 coverage does not account for every matching decision")
 
-    summary = (results / "SUMMARY.txt").read_text(encoding="utf-8")
-    if "No model was run" not in summary:
-        raise AssertionError("summary does not state that modelling was skipped")
-
 def _run_full(args: object) -> int:
     if args.n_companies < 1_600:
         raise ValueError("the full self-test requires at least 1,600 companies")
@@ -209,21 +204,19 @@ def _run_full(args: object) -> int:
             root / "inputs !",
             excel=args.format == "xlsx",
         )
-        diagnostic = analyze(
-            stage="diagnostic",
+        run = analyze(
             judgments_path=judgments,
             companies_house_path=companies,
             observation_date=bundle.observation_date,
             companies_house_date=bundle.observation_date,
             settings_path=args.settings,
             output_base=root / "outputs !",
-            run_id="selftest_diagnostic",
+            run_id="selftest",
             _match_validator=lambda matches: _assert_match_truth(matches, truth),
         )
-        _assert_outputs(diagnostic.root)
+        _assert_outputs(run.root)
     print(
-        "SELF-TEST: PASS. Matching, review samples and output checks all passed. "
-        "No model was run."
+        "SELF-TEST: PASS. Matching, review samples and output checks passed."
     )
     return 0
 

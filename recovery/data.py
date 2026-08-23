@@ -138,7 +138,7 @@ _CODED_VALUE_MAPS: dict[str, dict[str, str]] = {
 
 @dataclass(frozen=True, slots=True)
 class DataAudit:
-    """Facts about how the RT file was read; extra column names stay inside RT."""
+    """Facts about how the RT file was read; unknown extra headings stay inside RT."""
 
     rows: int
     observation_date: str

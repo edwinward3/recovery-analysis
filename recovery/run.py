@@ -41,9 +41,6 @@ from .reporting import (
 
 
 MAX_CH_SNAPSHOT_LAG_DAYS = 35
-MODELLING_BLOCK_MESSAGE = (
-    "Run 2 is not available until the data and study design have been checked"
-)
 
 
 class RunFailure(RuntimeError):
@@ -52,7 +49,6 @@ class RunFailure(RuntimeError):
 
 def analyze(
     *,
-    stage: str,
     judgments_path: str | Path,
     companies_house_path: str | Path,
     observation_date: str | pd.Timestamp | None,
@@ -64,8 +60,6 @@ def analyze(
 ) -> RunPaths:
     """Run the matching check."""
 
-    if stage != "diagnostic":
-        raise RunFailure(MODELLING_BLOCK_MESSAGE)
     if observation_date is None:
         raise RunFailure("RT extract date is required; it must not default to today")
     if companies_house_date is None:
@@ -79,9 +73,8 @@ def analyze(
 
     paths: RunPaths | None = None
     try:
-        paths = create_run_paths(output_base, stage, run_id)
+        paths = create_run_paths(output_base, run_id)
         result = _analyze_created_run(
-            stage=stage,
             judgments_path=judgments_path,
             companies_house_path=companies_file,
             observed=observed,
@@ -106,7 +99,6 @@ def analyze(
 
 def _analyze_created_run(
     *,
-    stage: str,
     judgments_path: str | Path,
     companies_house_path: Path,
     observed: pd.Timestamp,
@@ -133,10 +125,11 @@ def _analyze_created_run(
         matches = match_judgments(judgments, ch_index)
         if _match_validator is not None:
             _match_validator(matches)
-        diagnostics = match_diagnostics(judgments, matches)
-        record["judgments_matched"] = int(matches["tier"].eq("exact_unique").sum())
-
-    linkage_judgments, linkage_matches = _linkage_target(judgments, matches)
+        linkage_judgments, linkage_matches = _linkage_target(judgments, matches)
+        diagnostics = match_diagnostics(linkage_judgments, linkage_matches)
+        record["judgments_matched"] = int(
+            linkage_matches["tier"].eq("exact_unique").sum()
+        )
     with recorder.stage("E2_probability_validation_samples") as record:
         accepted_sample = accepted_validation_sample(
             linkage_judgments,
@@ -167,7 +160,7 @@ def _analyze_created_run(
     with recorder.stage("aggregate_reports"):
         audit_counts = build_data_audit_counts(judgments, audit)
         funnel = _matching_funnel(
-            judgments, matches, len(accepted_sample), len(unmatched_sample)
+            judgments, linkage_matches, len(accepted_sample), len(unmatched_sample)
         )
         write_e1(aggregate, audit_counts, funnel)
         write_e2(aggregate, diagnostics)
@@ -190,7 +183,6 @@ def _analyze_created_run(
     )
     manifest = _run_manifest(
         paths=paths,
-        stage=stage,
         observed=observed,
         ch_observed=ch_observed,
         audit=audit,
@@ -245,7 +237,6 @@ def _analyze_created_run(
     ):
         raise RunFailure("final disclosure copy differed from its checked preview")
     shutil.rmtree(aggregate)
-    paths.models.rmdir()
     return paths
 
 
@@ -300,18 +291,32 @@ def _summary_context(
     exact = int(target_matches["tier"].eq("exact_unique").sum())
     denominator = int(len(target_matches))
     return {
-        "scope": "matching_only",
-        "stage": "diagnostic",
-        "status": "MATCHING COMPLETE — CHECK THE TWO REVIEW FILES",
+        "status": "MATCHING COMPLETE",
         "observation_date": audit.observation_date,
         "companies_house_date": ch_observed.date().isoformat(),
         "data_construct": audit.data_construct,
-        "satisfaction_date_field": (
-            "present"
-            if "Satisfaction Date" in audit.event_date_columns_present
-            else "absent"
-        ),
-        "satisfaction_date_rows": audit.satisfaction_date_present_rows,
+        "optional_fields": {
+            "Satisfaction Date": {
+                "present": "Satisfaction Date" not in audit.absent_optional_columns,
+                "rows": audit.satisfaction_date_present_rows,
+            },
+            "Cancellation Date": {
+                "present": "Cancellation Date" not in audit.absent_optional_columns,
+                "rows": audit.cancellation_date_present_rows,
+            },
+            "Cancellation Reason": {
+                "present": "Cancellation Reason" not in audit.absent_optional_columns,
+                "rows": audit.cancellation_reason_present_rows,
+            },
+            "Status Effective Date": {
+                "present": "Status Effective Date" not in audit.absent_optional_columns,
+                "rows": audit.status_effective_date_present_rows,
+            },
+            "Snapshot Date": {
+                "present": "Snapshot Date" not in audit.absent_optional_columns,
+                "rows": audit.snapshot_date_present_rows,
+            },
+        },
         "min_cell_n": settings.min_cell_n,
         "date_inserted": {
             "distinct_values": audit.date_inserted_distinct,
@@ -339,7 +344,6 @@ def _summary_context(
 def _run_manifest(
     *,
     paths: RunPaths,
-    stage: str,
     observed: pd.Timestamp,
     ch_observed: pd.Timestamp,
     audit: DataAudit,
@@ -352,10 +356,9 @@ def _run_manifest(
     allowlist: dict[str, str | Sequence[str] | None],
 ) -> dict[str, Any]:
     return {
-        "schema_version": 5,
-        "status": "RT INTERNAL - NOT AUTHORISED FOR EXTERNAL USE",
+        "schema_version": 6,
+        "status": "CONFIDENTIAL - SEND ONLY TO EDWIN",
         "run_id": paths.root.name,
-        "stage": stage,
         "schema_construct": audit.data_construct,
         "observation_date": observed.date().isoformat(),
         "companies_house_snapshot_date": ch_observed.date().isoformat(),
@@ -400,9 +403,8 @@ def _analysis_allowlist() -> dict[str, str | Sequence[str] | None]:
         "E2_match_coverage.csv": "rows",
         "E2_unmatched_reasons.csv": "rows",
         "E2_match_methods.csv": "rows",
-        "E2_match_by_defendant_type.csv": "rows",
-        "E2_match_by_judgment_vintage.csv": "rows",
-        "E2_incorporation_guards.csv": "rows",
+        "E2_linkage_profile.csv": "rows",
+        "E2_linkage_checks.csv": "rows",
         "E5_run_log.csv": None,
         "E5_run_manifest.json": None,
     }
@@ -475,11 +477,8 @@ def _package_versions() -> dict[str, str]:
     for name in (
         "numpy",
         "pandas",
-        "scipy",
-        "scikit-learn",
-        "lightgbm",
         "openpyxl",
-        "narwhals",
+        "python-dateutil",
         "tzdata",
     ):
         try:
@@ -489,11 +488,26 @@ def _package_versions() -> dict[str, str]:
     return result
 
 
+def package_results(paths: RunPaths) -> Path:
+    """Put the completed run in one ZIP file."""
+
+    token = paths.root.name.removeprefix("run_")
+    archive = paths.root.parent / f"SEND_TO_EDWIN_{token}.zip"
+    if archive.exists():
+        raise RunFailure(f"output ZIP already exists: {archive}")
+    written = shutil.make_archive(
+        str(archive.with_suffix("")),
+        "zip",
+        root_dir=paths.root.parent,
+        base_dir=paths.root.name,
+    )
+    return Path(written).resolve()
+
+
 def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Offline Registry Trust analysis")
+    parser = argparse.ArgumentParser(description="Registry Trust data check")
     commands = parser.add_subparsers(dest="command", required=True)
     analyze_parser = commands.add_parser("analyze")
-    analyze_parser.add_argument("--stage", required=True)
     analyze_parser.add_argument("--judgments", required=True)
     analyze_parser.add_argument("--companies-house", required=True)
     analyze_parser.add_argument("--observation-date", required=True)
@@ -507,7 +521,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
     try:
         paths = analyze(
-            stage=args.stage,
             judgments_path=args.judgments,
             companies_house_path=args.companies_house,
             observation_date=args.observation_date,
@@ -515,8 +528,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             settings_path=args.settings,
             output_base=args.output_base,
         )
+        archive = package_results(paths)
         print("RUN COMPLETE")
-        print(f"SEND THIS FOLDER TO EDWIN: {paths.root.resolve()}")
+        print(f"SEND THIS FILE TO EDWIN: {archive}")
         return 0
     except Exception as exc:
         print(f"STOP: {type(exc).__name__}: {exc}", file=sys.stderr)

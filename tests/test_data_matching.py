@@ -1,4 +1,4 @@
-"""Test offline RT input handling and conservative Companies House matching.
+"""Test RT input handling and conservative Companies House matching.
 
 Inputs are synthetic rows and temporary CSV/XLSX/ZIP files. Outputs are test
 assertions only; no confidential data, network calls or persistent files occur.
@@ -497,11 +497,54 @@ def test_diagnostics_are_aggregate_and_sample_is_deterministic() -> None:
     pd.testing.assert_frame_equal(actual_sources, expected_sources.loc[actual_sources.index])
 
     diagnostics = match_diagnostics(judgments, matches)
-    assert set(diagnostics) >= {"tier_counts", "unmatched_reasons", "method_counts"}
+    assert set(diagnostics) >= {
+        "tier_counts",
+        "unmatched_reasons",
+        "method_counts",
+        "selection_profile",
+        "linkage_checks",
+    }
     assert all("ID" not in table.columns for table in diagnostics.values())
+    history = diagnostics["linkage_checks"].set_index("measure")["rows"]
+    assert history["linked_judgments"] == 1_050
+    assert history["distinct_live_companies"] == 1_050
+    assert history["live_companies_with_multiple_linked_judgments"] == 0
 
 
 def test_name_normalisation_handles_suffixes_and_formatting() -> None:
     assert normalize_name("A&B, Ltd.") == "A AND B"
     assert normalize_name("Limited Edition Designs Ltd") == "LIMITED EDITION DESIGNS"
     assert normalize_name("Example Ltd (in liquidation)") == "EXAMPLE"
+
+
+def test_matching_reports_selection_and_repeated_companies() -> None:
+    judgments = pd.DataFrame(
+        {
+            "ID": ["J1", "J2", "J3"],
+            "JudgmentDate": pd.to_datetime(["2024-01-01", "2025-01-01", "2025-06-01"]),
+            "DefendantType": "Corporate",
+            "Jurisdiction": "England and Wales",
+            "Amount": [400, 2_000, 30_000],
+            "age_at_observation_months": [30.0, 18.0, 8.0],
+        }
+    )
+    matches = pd.DataFrame(
+        {
+            "ID": ["J1", "J2", "J3"],
+            "tier": ["exact_unique", "exact_unique", "unmatched"],
+            "reason": ["exact", "exact", "no_exact_name"],
+            "matched_company_number": ["00000001", "00000001", ""],
+            "matched_on": ["company_name", "company_name", ""],
+            "matched_name_kind": ["current", "current", ""],
+        }
+    )
+
+    diagnostics = match_diagnostics(judgments, matches)
+    history = diagnostics["linkage_checks"].set_index("measure")["rows"]
+    assert history["distinct_live_companies"] == 1
+    assert history["live_companies_with_multiple_linked_judgments"] == 1
+    assert history["linked_judgments_with_an_earlier_linked_judgment"] == 1
+    assert set(diagnostics["selection_profile"]["linkage_group"]) == {
+        "linked_to_one_live_company",
+        "not_linked_to_one_live_company",
+    }
