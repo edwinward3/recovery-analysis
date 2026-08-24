@@ -15,6 +15,8 @@ You need:
 5. Enter the RT extract date, then the date shown in the Companies House filename.
 6. Wait for **RUN COMPLETE** and send Edwin the ZIP file marked **SEND_TO_EDWIN**.
 
+The check will usually take about an hour. On a slower computer it may take up to three hours.
+
 Use the RT export exactly as produced. If it contains Satisfaction Date, Cancellation Date, Cancellation Reason, Status Effective Date or Snapshot Date, leave those columns in place. The program does not upload either source file. Keep the internet connected on the first run while it installs the required packages.
 
 If the program shows **STOP**, send Edwin the complete message.

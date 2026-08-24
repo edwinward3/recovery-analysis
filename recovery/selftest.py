@@ -24,11 +24,21 @@ _MATCHING_EGRESS = {
     "SUMMARY.txt",
     "E1_data_audit.csv",
     "E1_data_funnel.csv",
+    "E1_registration_gate.csv",
+    "E1_registration_counts.csv",
+    "E1_registration_statistics.csv",
     "E2_match_coverage.csv",
     "E2_unmatched_reasons.csv",
     "E2_match_methods.csv",
     "E2_linkage_profile.csv",
     "E2_linkage_checks.csv",
+    "E2_population_comparison.csv",
+    "E2_validation_sampling.csv",
+    "E3_outcome_gate.csv",
+    "E3_status_at_extract.csv",
+    "E4_prediction_gate.csv",
+    "E5_artifact_manifest.csv",
+    "E5_output_dictionary.csv",
     "E5_run_log.csv",
     "E5_run_manifest.json",
 }
@@ -61,6 +71,11 @@ def _parser() -> ArgumentParser:
         action="store_true",
         help="omit earlier history rows so n-companies equals judgment rows",
     )
+    parser.add_argument(
+        "--event-dates",
+        action="store_true",
+        help="include complete synthetic satisfaction and cancellation dates",
+    )
     parser.add_argument("--settings", default="settings.toml")
     return parser
 
@@ -69,6 +84,7 @@ def _write_inputs(args: object) -> int:
     bundle = make_synthetic_bundle(
         args.n_companies,
         include_prior_rows=not args.no_prior_rows,
+        include_event_dates=args.event_dates,
     )
     paths = write_bundle(
         bundle,
@@ -196,6 +212,7 @@ def _run_full(args: object) -> int:
     bundle = make_synthetic_bundle(
         args.n_companies,
         include_prior_rows=not args.no_prior_rows,
+        include_event_dates=args.event_dates,
     )
     with TemporaryDirectory(prefix="recovery-selftest-") as temporary:
         root = Path(temporary)

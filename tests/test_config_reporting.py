@@ -16,6 +16,7 @@ from recovery.reporting import (
     RunRecorder,
     _fmt_count,
     build_data_audit_counts,
+    build_output_dictionary,
     create_run_paths,
     peak_memory_mb,
     source_fingerprint,
@@ -156,8 +157,8 @@ def test_summary_is_short_and_explicit(tmp_path: Path) -> None:
         },
     )
     text = path.read_text(encoding="utf-8")
-    assert "MATCHING COMPLETE" in text
-    assert "Made two review samples for Edwin" in text
+    assert "ANALYSIS COMPLETE" in text
+    assert "Made two private review samples. They remain with RT" in text
     assert "Companies House file contains live companies only" in text
     assert "One exact live-company match" in text
     assert "Date Inserted (RT registration date)" in text
@@ -178,6 +179,29 @@ def test_count_format_hides_only_positive_small_counts() -> None:
     assert _fmt_count(10, min_cell_n=10) == "10"
 
 
+def test_summary_hides_match_complements_and_rate(tmp_path: Path) -> None:
+    path = tmp_path / "SUMMARY.txt"
+    write_summary(
+        path,
+        {
+            "min_cell_n": 10,
+            "counts": {},
+            "match": {
+                "denominator": 100,
+                "exact_unique": 95,
+                "unmatched": 5,
+                "coverage": 0.95,
+            },
+        },
+    )
+
+    text = path.read_text(encoding="utf-8")
+    assert "One exact live-company match suppressed" in text
+    assert "No match                     suppressed" in text
+    assert "Match rate                   suppressed" in text
+    assert "95.0%" not in text
+
+
 def test_data_audit_reports_date_inserted_literals() -> None:
     judgments = pd.DataFrame(
         {
@@ -196,6 +220,18 @@ def test_data_audit_reports_date_inserted_literals() -> None:
     assert table.loc["Date Inserted (literal) distinct values", "value"] == "2"
     assert table.loc["Date Inserted (literal) minimum", "value"] == "2026-05-31"
     assert table.loc["Date Inserted (literal) maximum", "value"] == "2026-06-01"
+
+
+def test_output_dictionary_is_built_from_written_columns(tmp_path: Path) -> None:
+    pd.DataFrame(columns=["non_events", "satisfaction_cif"]).to_csv(
+        tmp_path / "E4_results.csv", index=False
+    )
+
+    dictionary = build_output_dictionary(tmp_path).set_index("column_name")
+
+    assert set(dictionary.index) == {"non_events", "satisfaction_cif"}
+    assert "cancellations stay separate" in dictionary.loc["non_events", "definition"]
+    assert "recorded satisfaction" in dictionary.loc["satisfaction_cif", "definition"]
 
 
 def test_public_e5_redacts_small_observed_counts(tmp_path: Path) -> None:

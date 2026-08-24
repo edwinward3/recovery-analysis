@@ -67,9 +67,12 @@ jobs:
 
           $required = @(
             "SUMMARY.txt",
-            "E1_data_audit.csv", "E1_data_funnel.csv",
+            "E1_data_audit.csv", "E1_data_funnel.csv", "E1_registration_gate.csv",
+            "E1_registration_counts.csv", "E1_registration_statistics.csv",
             "E2_match_coverage.csv", "E2_unmatched_reasons.csv", "E2_match_methods.csv",
-            "E2_linkage_profile.csv", "E2_linkage_checks.csv",
+            "E2_linkage_profile.csv", "E2_linkage_checks.csv", "E2_population_comparison.csv",
+            "E2_validation_sampling.csv", "E3_outcome_gate.csv", "E3_status_at_extract.csv",
+            "E4_prediction_gate.csv", "E5_artifact_manifest.csv", "E5_output_dictionary.csv",
             "E5_run_log.csv", "E5_run_manifest.json"
           )
           foreach ($name in $required) {
@@ -83,7 +86,7 @@ jobs:
             }
           }
           $summary = Get-Content (Join-Path $run.FullName "results\SUMMARY.txt") -Raw
-          if ($summary -notmatch "MATCHING COMPLETE") { throw "summary is incomplete" }
+          if ($summary -notmatch "ANALYSIS COMPLETE") { throw "summary is incomplete" }
 
           Add-Type -AssemblyName System.IO.Compression.FileSystem
           $archive = [IO.Compression.ZipFile]::OpenRead($zip.FullName)
@@ -92,11 +95,20 @@ jobs:
             if (-not ($names | Where-Object { $_ -like "*/results/SUMMARY.txt" })) {
               throw "ZIP does not contain the summary"
             }
-            if ($names | Where-Object { $_ -match 'synthetic judgments|BasicCompanyData|\.venv' }) {
-              throw "ZIP contains an input or Python environment"
+            if ($names | Where-Object { $_ -match 'synthetic judgments|BasicCompanyData|\.venv|working_files|linkage_validation' }) {
+              throw "ZIP contains private or setup material"
             }
           } finally {
             $archive.Dispose()
+          }
+          $checksum = Get-ChildItem outputs -File -Filter "SEND_TO_EDWIN_*.zip.sha256" | Select-Object -First 1
+          if (-not $checksum) { throw "ZIP checksum is missing" }
+          $checksumParts = @((Get-Content $checksum.FullName -Raw).Trim() -split '\s+', 2)
+          $actualHash = (Get-FileHash -LiteralPath $zip.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($checksumParts.Count -ne 2 -or
+              $checksumParts[0].ToLowerInvariant() -ne $actualHash -or
+              $checksumParts[1] -ne $zip.Name) {
+            throw "ZIP checksum is invalid"
           }
 
       - name: Test repeat setup
@@ -112,33 +124,88 @@ jobs:
           $after = (Get-Item ".venv\.setup-key").LastWriteTimeUtc
           if ($before -ne $after) { throw "packages were reinstalled" }
 
+      - name: Test the GitHub archive
+        shell: pwsh
+        env:
+          RECOVERY_NO_PAUSE: "1"
+        run: |
+          $archive = Join-Path $env:RUNNER_TEMP "source.zip"
+          $unpacked = Join-Path $env:RUNNER_TEMP "source"
+          Invoke-WebRequest "https://github.com/${{ github.repository }}/archive/${{ github.sha }}.zip" -OutFile $archive
+          Expand-Archive $archive $unpacked
+          $root = Get-ChildItem $unpacked -Directory | Select-Object -First 1
+          Push-Location $root.FullName
+          try {
+            python -m recovery.selftest --write-inputs "archive inputs" --n-companies 8000 --no-prior-rows --event-dates
+            cmd.exe /d /c 'RUN.bat "archive inputs\synthetic judgments.xlsx" "archive inputs\BasicCompanyDataAsOneFile-2026-06-01.zip" 2026-06-01 2026-06-01 outputs'
+            if ($LASTEXITCODE -ne 0) { throw "GitHub archive run failed" }
+            $archiveRun = Get-ChildItem outputs -Directory -Filter "run_*" | Select-Object -First 1
+            $archiveZip = Get-ChildItem outputs -File -Filter "SEND_TO_EDWIN_*.zip" | Select-Object -First 1
+            if (-not $archiveRun -or -not $archiveZip -or
+                -not (Test-Path (Join-Path $archiveRun.FullName "results\E3_cumulative_incidence.csv")) -or
+                -not (Test-Path (Join-Path $archiveRun.FullName "results\E4_model_performance.csv"))) {
+              throw "GitHub archive output is missing"
+            }
+          } finally {
+            Pop-Location
+          }
+
   scale:
-    name: 500,000 rows
+    name: 500,000 rows, Python ${{ matrix.python }}
     if: github.event_name == 'workflow_dispatch' && inputs.run_500k
     runs-on: windows-latest
-    timeout-minutes: 360
+    timeout-minutes: 200
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.13", "3.14"]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
-          python-version: "3.13"
+          python-version: ${{ matrix.python }}
       - name: Run the large test
         shell: pwsh
         env:
           RECOVERY_NO_PAUSE: "1"
         run: |
           python -m pip install --require-hashes --only-binary=:all: -r requirements.lock
-          python -m recovery.selftest --write-inputs "scale inputs !" --n-companies 500000 --format csv --no-prior-rows
+          python -m recovery.selftest --write-inputs "scale inputs !" --n-companies 500000 --format csv --no-prior-rows --event-dates
+          $started = Get-Date
           cmd.exe /d /c 'RUN.bat "scale inputs !\synthetic judgments.csv" "scale inputs !\BasicCompanyDataAsOneFile-2026-06-01.zip" 2026-06-01 2026-06-01 "scale outputs !"'
           if ($LASTEXITCODE -ne 0) { throw "500,000-row run failed" }
+          $elapsed = ((Get-Date) - $started).TotalSeconds
+          if ($elapsed -ge 10800) { throw "500,000-row run exceeded three hours" }
           $run = Get-ChildItem "scale outputs !" -Directory -Filter "run_*" | Select-Object -First 1
           $zip = Get-ChildItem "scale outputs !" -File -Filter "SEND_TO_EDWIN_*.zip" | Select-Object -First 1
           if (-not $run -or -not $zip) { throw "large-test output is missing" }
+          $checksum = Get-ChildItem "scale outputs !" -File -Filter "SEND_TO_EDWIN_*.zip.sha256" | Select-Object -First 1
+          if (-not $checksum) { throw "large-test checksum is missing" }
+          $checksumParts = @((Get-Content $checksum.FullName -Raw).Trim() -split '\s+', 2)
+          $actualHash = (Get-FileHash -LiteralPath $zip.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($checksumParts.Count -ne 2 -or
+              $checksumParts[0].ToLowerInvariant() -ne $actualHash -or
+              $checksumParts[1] -ne $zip.Name) {
+            throw "large-test checksum is invalid"
+          }
           $coverage = Import-Csv (Join-Path $run.FullName "results\E2_match_coverage.csv")
           $exact = [int](($coverage | Where-Object tier -eq "exact_unique").rows)
           $unmatched = [int](($coverage | Where-Object tier -eq "unmatched").rows)
           if ($exact -ne 312500 -or $unmatched -ne 187500) {
             throw "large-test matching counts are wrong"
+          }
+          foreach ($name in @(
+            "E3_cumulative_incidence.csv", "E3_fixed_horizon.csv",
+            "E4_cohort_flow.csv", "E4_model_performance.csv", "E4_paired_improvement.csv",
+            "E4_calibration_curve.csv", "E4_ranking.csv"
+          )) {
+            if (-not (Test-Path (Join-Path $run.FullName "results\$name"))) {
+              throw "large-test output is missing: $name"
+            }
+          }
+          $manifest = Get-Content (Join-Path $run.FullName "results\E5_run_manifest.json") -Raw | ConvertFrom-Json
+          if ([double]$manifest.runtime.peak_memory_mb -ge 12288) {
+            throw "500,000-row run exceeded 12 GB peak memory"
           }

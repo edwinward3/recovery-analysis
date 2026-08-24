@@ -168,6 +168,8 @@ class DataAudit:
     raw_header_schema: tuple[tuple[str, str], ...]
     extra_headers: tuple[str, ...]
     absent_optional_columns: tuple[str, ...]
+    unknown_decisive_headers: tuple[str, ...]
+    outcome_issues: dict[str, int]
     raw_source_sha256: str
     raw_header_schema_sha256: str
     analysis_fingerprint: str
@@ -349,11 +351,6 @@ def _standardise_headers(frame: pd.DataFrame) -> pd.DataFrame:
             )
         seen[expected] = original
         rename[original] = expected
-    if decisive_unknown:
-        raise ValueError(
-            "RT extract has unrecognised outcome/history-related column(s): "
-            f"{decisive_unknown}; add an explicit reviewed header alias before use"
-        )
     missing = [column for column in REQUIRED_RT_COLUMNS if column not in seen]
     if missing:
         raise ValueError(f"RT extract is missing required column(s): {missing}")
@@ -369,6 +366,7 @@ def _standardise_headers(frame: pd.DataFrame) -> pd.DataFrame:
     result.attrs["absent_optional"] = absent_optional
     result.attrs["raw_headers"] = raw_headers
     result.attrs["raw_header_schema"] = tuple(raw_header_schema)
+    result.attrs["unknown_decisive_headers"] = tuple(decisive_unknown)
     return result
 
 
@@ -403,7 +401,9 @@ def _parse_required_date(frame: pd.DataFrame, column: str) -> pd.Series:
     return parsed.dt.normalize()
 
 
-def _parse_optional_date(frame: pd.DataFrame, column: str) -> pd.Series:
+def _parse_optional_date(
+    frame: pd.DataFrame, column: str
+) -> tuple[pd.Series, pd.Series]:
     raw = frame[column].astype("string").fillna("").str.strip()
     populated = raw.ne("")
     parsed = pd.Series(pd.NaT, index=frame.index, dtype="datetime64[ns]")
@@ -420,17 +420,22 @@ def _parse_optional_date(frame: pd.DataFrame, column: str) -> pd.Series:
                 raw.loc[other_populated], format="mixed", dayfirst=True, errors="coerce"
             ).astype("datetime64[ns]")
     invalid = populated & parsed.isna()
-    if invalid.any():
-        raise ValueError(f"{column} has {int(invalid.sum())} unparseable row(s)")
-    return parsed.dt.normalize()
+    return parsed.dt.normalize(), invalid
 
 
 def _validate_optional_timing(
     frame: pd.DataFrame,
     observed: pd.Timestamp,
     present_optional: set[str],
-) -> None:
+) -> dict[str, int]:
     """Check supplied event fields against dates and judgment status."""
+
+    issues: dict[str, int] = {}
+
+    def add(name: str, mask: pd.Series) -> None:
+        count = int(mask.sum())
+        if count:
+            issues[name] = count
 
     for column in _OPTIONAL_DATE_COLUMNS:
         if column not in present_optional:
@@ -439,64 +444,33 @@ def _validate_optional_timing(
             frame[column] < frame["JudgmentDate"]
         )
         after_observation = frame[column].notna() & (frame[column] > observed)
-        if before_judgment.any():
-            raise ValueError(
-                f"{column} is before JudgmentDate for "
-                f"{int(before_judgment.sum())} row(s)"
-            )
-        if after_observation.any():
-            raise ValueError(
-                f"{column} is after the RT extract date for "
-                f"{int(after_observation.sum())} row(s)"
-            )
+        key = re.sub(r"[^a-z0-9]+", "_", column.casefold()).strip("_")
+        add(f"{key}_before_judgment", before_judgment)
+        add(f"{key}_after_extract", after_observation)
 
     status = frame["JudgmentStatus"]
     if "Satisfaction Date" in present_optional:
         satisfied_without_date = status.eq("Satisfied") & frame["Satisfaction Date"].isna()
         unsatisfied_with_date = status.eq("Unsatisfied") & frame["Satisfaction Date"].notna()
-        if satisfied_without_date.any():
-            raise ValueError(
-                "Satisfaction Date is present in the schema but missing for "
-                f"{int(satisfied_without_date.sum())} Satisfied row(s)"
-            )
-        if unsatisfied_with_date.any():
-            raise ValueError(
-                "Satisfaction Date is populated for "
-                f"{int(unsatisfied_with_date.sum())} Unsatisfied row(s)"
-            )
+        add("satisfied_without_satisfaction_date", satisfied_without_date)
+        add("unsatisfied_with_satisfaction_date", unsatisfied_with_date)
 
     if "Cancellation Date" in present_optional:
         cancelled_without_date = status.eq("Cancelled") & frame["Cancellation Date"].isna()
         other_with_date = ~status.eq("Cancelled") & frame["Cancellation Date"].notna()
-        if cancelled_without_date.any():
-            raise ValueError(
-                "Cancellation Date is present in the schema but missing for "
-                f"{int(cancelled_without_date.sum())} Cancelled row(s)"
-            )
-        if other_with_date.any():
-            raise ValueError(
-                "Cancellation Date is populated for "
-                f"{int(other_with_date.sum())} non-Cancelled row(s)"
-            )
+        add("cancelled_without_cancellation_date", cancelled_without_date)
+        add("non_cancelled_with_cancellation_date", other_with_date)
 
     if "Cancellation Reason" in present_optional:
         reason_present = frame["Cancellation Reason"].ne("")
         other_with_reason = ~status.eq("Cancelled") & reason_present
-        if other_with_reason.any():
-            raise ValueError(
-                "Cancellation Reason is populated for "
-                f"{int(other_with_reason.sum())} non-Cancelled row(s)"
-            )
+        add("non_cancelled_with_cancellation_reason", other_with_reason)
 
     both_events = frame["Satisfaction Date"].notna() & frame["Cancellation Date"].notna()
     cancellation_before_satisfaction = both_events & (
         frame["Cancellation Date"] < frame["Satisfaction Date"]
     )
-    if cancellation_before_satisfaction.any():
-        raise ValueError(
-            "Cancellation Date is before Satisfaction Date for "
-            f"{int(cancellation_before_satisfaction.sum())} row(s)"
-        )
+    add("cancellation_before_satisfaction", cancellation_before_satisfaction)
 
     if "Status Effective Date" in present_optional:
         satisfied_order = (
@@ -511,31 +485,19 @@ def _validate_optional_timing(
             & frame["Cancellation Date"].notna()
             & (frame["Status Effective Date"] < frame["Cancellation Date"])
         )
-        if satisfied_order.any() or cancelled_order.any():
-            raise ValueError(
-                "Status Effective Date precedes the corresponding event date for "
-                f"{int((satisfied_order | cancelled_order).sum())} row(s)"
-            )
+        add("status_effective_before_event", satisfied_order | cancelled_order)
 
     if "Snapshot Date" in present_optional:
         missing = frame["Snapshot Date"].isna()
-        if missing.any():
-            raise ValueError(
-                "Snapshot Date is present in the schema but missing for "
-                f"{int(missing.sum())} row(s)"
-            )
+        add("snapshot_date_missing", missing)
         distinct = int(frame["Snapshot Date"].nunique())
         if distinct != 1:
-            raise ValueError(
-                f"Snapshot Date has {distinct} distinct values; a cross-sectional "
-                "extract must have exactly one"
-            )
-        snapshot = frame["Snapshot Date"].iloc[0]
-        if snapshot != observed:
-            raise ValueError(
-                f"Snapshot Date {snapshot.date().isoformat()} does not match "
-                f"RT extract date {observed.date().isoformat()}"
-            )
+            issues["snapshot_date_not_single_value"] = int(len(frame))
+        elif frame["Snapshot Date"].notna().any():
+            snapshot = frame["Snapshot Date"].dropna().iloc[0]
+            if snapshot != observed:
+                issues["snapshot_date_does_not_match_extract"] = int(len(frame))
+    return issues
 
 
 def _classify_data_construct(present_optional: set[str]) -> str:
@@ -600,6 +562,9 @@ def read_rt_extract(
     absent_optional = tuple(frame.attrs.get("absent_optional", ()))
     raw_headers = tuple(frame.attrs.get("raw_headers", ()))
     raw_header_schema = tuple(frame.attrs.get("raw_header_schema", ()))
+    unknown_decisive_headers = tuple(
+        frame.attrs.get("unknown_decisive_headers", ())
+    )
     raw_header_schema_sha256 = _sequence_fingerprint(raw_header_schema)
     present_optional = set(OPTIONAL_RT_COLUMNS).difference(absent_optional)
     if frame.empty:
@@ -624,8 +589,14 @@ def read_rt_extract(
     _normalise_coded_columns(frame)
     frame["Date Inserted"] = _parse_required_date(frame, "Date Inserted")
     frame["JudgmentDate"] = _parse_required_date(frame, "JudgmentDate")
+    outcome_issues: dict[str, int] = {}
     for column in _OPTIONAL_DATE_COLUMNS:
-        frame[column] = _parse_optional_date(frame, column)
+        parsed, invalid = _parse_optional_date(frame, column)
+        frame[column] = parsed
+        key = re.sub(r"[^a-z0-9]+", "_", column.casefold()).strip("_")
+        frame[f"_invalid_{key}"] = invalid.astype(bool)
+        if invalid.any():
+            outcome_issues[f"{key}_unparseable"] = int(invalid.sum())
 
     insertion_before_judgment = frame["Date Inserted"] < frame["JudgmentDate"]
     judgment_after_observation = frame["JudgmentDate"] > observed
@@ -647,7 +618,11 @@ def read_rt_extract(
         frame["Cancellation Reason"].astype("string").fillna("").str.strip().astype(str)
     )
 
-    _validate_optional_timing(frame, observed, present_optional)
+    outcome_issues.update(
+        _validate_optional_timing(frame, observed, present_optional)
+    )
+    if unknown_decisive_headers:
+        outcome_issues["unknown_outcome_or_history_header"] = int(len(frame))
 
     amounts, invalid_amounts = _parse_amount(frame["Amount"])
     frame["Amount"] = amounts
@@ -703,6 +678,8 @@ def read_rt_extract(
         raw_header_schema=raw_header_schema,
         extra_headers=extra_headers,
         absent_optional_columns=absent_optional,
+        unknown_decisive_headers=unknown_decisive_headers,
+        outcome_issues=outcome_issues,
         raw_source_sha256=raw_source_sha256,
         raw_header_schema_sha256=raw_header_schema_sha256,
         analysis_fingerprint=analysis_fingerprint,

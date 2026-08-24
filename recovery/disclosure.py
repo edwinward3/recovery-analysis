@@ -62,6 +62,61 @@ _EXACT_IDENTIFIER_COLUMNS = frozenset(
     }
 )
 
+_DISCLOSURE_GROUP_COLUMNS = frozenset(
+    {
+        "cohort",
+        "dimension",
+        "group",
+        "horizon_months",
+        "judgment_cohort",
+        "linkage_group",
+        "measure",
+        "population",
+        "sampling_arm",
+        "stratum",
+    }
+)
+_ASSOCIATED_ESTIMATE_TOKENS = frozenset(
+    {
+        "auc",
+        "brier",
+        "calibration",
+        "cif",
+        "ci",
+        "confidence",
+        "estimate",
+        "hazard",
+        "interval",
+        "intercept",
+        "lcl",
+        "lower",
+        "mean",
+        "median",
+        "odds",
+        "percent",
+        "precision",
+        "probability",
+        "proportion",
+        "rate",
+        "ratio",
+        "recall",
+        "risk",
+        "se",
+        "sensitivity",
+        "share",
+        "slope",
+        "specificity",
+        "standard_error",
+        "stderr",
+        "survival",
+        "ucl",
+        "upper",
+    }
+)
+_ASSOCIATED_ESTIMATE_KEYS = frozenset(
+    {"p_value", "standard_deviation", "standard_error", "std_error"}
+)
+
 
 # Results of the final check
 
@@ -95,31 +150,145 @@ class DisclosureViolation(RuntimeError):
         super().__init__("output disclosure check failed" + (f": {summary}" if summary else ""))
 
 
-# Remove small counts and check for identifying values
+# Suppress small counts and check for identifying values
 
 def suppress_small_cells(
     frame: pd.DataFrame,
     *,
     count_columns: str | Sequence[str],
     min_cell_n: int = 10,
+    group_columns: str | Sequence[str] | None = None,
 ) -> tuple[pd.DataFrame, int]:
-    """Remove aggregate rows supported by fewer than ``min_cell_n`` records."""
+    """Blank small counts and related values."""
 
     if min_cell_n < 1:
         raise ValueError("min_cell_n must be positive")
     columns = (count_columns,) if isinstance(count_columns, str) else tuple(count_columns)
     if not columns:
         raise ValueError("at least one count column is required")
-    suppress = pd.Series(False, index=frame.index)
+    cleaned = frame.copy().reset_index(drop=True)
+    groups = _resolve_group_columns(cleaned, group_columns)
+    if set(columns).intersection(groups):
+        raise ValueError("disclosure count columns cannot also be grouping columns")
+
+    cell_masks: dict[str, pd.Series] = {}
+    primary_masks: dict[str, pd.Series] = {}
     for column in columns:
-        if column not in frame.columns:
+        if column not in cleaned.columns:
             raise ValueError(f"missing disclosure count column {column!r}")
-        counts = pd.to_numeric(frame[column], errors="coerce")
-        if counts.isna().any() or counts.lt(0).any():
-            raise ValueError(f"disclosure count column {column!r} must be non-negative numeric")
-        # Keep zeros; drop a row when any positive count is below the limit.
-        suppress |= counts.gt(0) & counts.lt(min_cell_n)
-    return frame.loc[~suppress].reset_index(drop=True), int(suppress.sum())
+        counts = pd.to_numeric(cleaned[column], errors="coerce")
+        if (counts.notna() & counts.lt(0)).any():
+            raise ValueError(f"disclosure count column {column!r} must be non-negative")
+        primary = counts.notna() & counts.gt(0) & counts.lt(min_cell_n)
+        primary_masks[column] = primary
+        mask = primary.copy()
+        for positions in _group_positions(cleaned, groups):
+            in_group = pd.Series(False, index=cleaned.index)
+            in_group.iloc[positions] = True
+            group_primary = primary & in_group
+            if int(group_primary.sum()) != 1:
+                continue
+            safe = counts.ge(min_cell_n) & in_group
+            if safe.any():
+                smallest = counts.loc[safe].sort_values(kind="stable").index[0]
+                mask.loc[smallest] = True
+        cell_masks[column] = mask
+
+    row_primary = pd.Series(False, index=cleaned.index)
+    for primary in primary_masks.values():
+        row_primary |= primary
+    if row_primary.any():
+        for column in columns:
+            counts = pd.to_numeric(cleaned[column], errors="coerce")
+            cell_masks[column] |= row_primary & counts.gt(0)
+
+    affected = pd.Series(False, index=cleaned.index)
+    for column, mask in cell_masks.items():
+        cleaned[column] = cleaned[column].mask(mask)
+        affected |= mask
+    event_columns = [
+        column
+        for column in columns
+        if _canon_column(column).endswith("_events")
+        or _canon_column(column) in {"censored", "cancellations"}
+    ]
+    if event_columns and any("cif" in _canon_column(column) for column in cleaned):
+        event_primary = pd.Series(False, index=cleaned.index)
+        for column in event_columns:
+            values = pd.to_numeric(frame[column], errors="coerce")
+            event_primary |= values.gt(0) & values.lt(min_cell_n)
+        for column in event_columns:
+            cleaned[column] = cleaned[column].mask(event_primary)
+        curve_affected = event_primary.cummax()
+        if "at_risk" in cleaned:
+            cleaned["at_risk"] = cleaned["at_risk"].mask(curve_affected)
+        affected |= curve_affected
+    for column in _associated_estimate_columns(cleaned, set(columns), set(groups)):
+        cleaned[column] = cleaned[column].mask(affected)
+    for column in columns:
+        values = pd.to_numeric(cleaned[column], errors="coerce")
+        populated = values.dropna()
+        if populated.mod(1).eq(0).all():
+            cleaned[column] = values.astype("Int64")
+    return cleaned, int(affected.sum())
+
+
+def _resolve_group_columns(
+    frame: pd.DataFrame,
+    supplied: str | Sequence[str] | None,
+) -> tuple[str, ...]:
+    if supplied is None:
+        inferred = [
+            str(column)
+            for column in frame.columns
+            if (
+                _canon_column(column) in _DISCLOSURE_GROUP_COLUMNS
+                or _canon_column(column).endswith("_group")
+            )
+            and frame[column].nunique(dropna=False) < len(frame)
+        ]
+        if any(_canon_column(column) == "dimension" for column in inferred):
+            inferred = [
+                column
+                for column in inferred
+                if _canon_column(column) != "measure"
+            ]
+        return tuple(inferred)
+    columns = (supplied,) if isinstance(supplied, str) else tuple(supplied)
+    missing = set(columns) - set(frame.columns)
+    if missing:
+        raise ValueError(f"missing disclosure grouping column(s): {sorted(missing)}")
+    return columns
+
+
+def _group_positions(frame: pd.DataFrame, columns: tuple[str, ...]) -> list[list[int]]:
+    if not columns:
+        return [list(range(len(frame)))]
+    return [
+        list(map(int, positions))
+        for positions in frame.groupby(
+            list(columns), sort=False, dropna=False
+        ).indices.values()
+    ]
+
+
+def _associated_estimate_columns(
+    frame: pd.DataFrame,
+    count_columns: set[str],
+    group_columns: set[str],
+) -> tuple[str, ...]:
+    protected = count_columns | group_columns
+    return tuple(
+        str(column)
+        for column in frame.columns
+        if str(column) not in protected
+        and (
+            _canon_column(column) in _ASSOCIATED_ESTIMATE_KEYS
+            or set(_canon_column(column).split("_")).intersection(
+                _ASSOCIATED_ESTIMATE_TOKENS
+            )
+        )
+    )
 
 
 def scan_identifiers(
@@ -182,12 +351,7 @@ def stage_egress(
     min_cell_n: int = 10,
     known_identifiers: Iterable[str] = (),
 ) -> DisclosureReport:
-    """Copy only the named output files after checking them.
-
-    ``allowlist`` maps each relative filename to its disclosure count column(s),
-    or to ``None`` for a count-free aggregate.  Unlisted source files are never
-    copied. The working-file folder cannot be included.
-    """
+    """Copy and check only the named aggregate files."""
 
     source_root = Path(source_dir).resolve()
     destination = Path(egress_dir)

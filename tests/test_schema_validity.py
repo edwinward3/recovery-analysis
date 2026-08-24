@@ -70,6 +70,21 @@ def test_sample_schema_is_explicitly_cross_sectional_and_needs_no_event_dates(
     }.issubset(audit.absent_optional_columns)
 
 
+def test_unparseable_optional_date_is_kept_as_a_counted_outcome_issue(
+    tmp_path: Path,
+) -> None:
+    row = _row(status="Satisfied")
+    row["Satisfaction Date"] = "not a date"
+
+    frame, audit = read_rt_extract(
+        _write(tmp_path / "bad-optional-date.csv", [row]), OBSERVED
+    )
+
+    assert pd.isna(frame.loc[0, "Satisfaction Date"])
+    assert bool(frame.loc[0, "_invalid_satisfaction_date"])
+    assert audit.outcome_issues["satisfaction_date_unparseable"] == 1
+
+
 def test_event_and_snapshot_aliases_are_preserved_parsed_and_audited(
     tmp_path: Path,
 ) -> None:
@@ -136,32 +151,6 @@ def test_event_and_snapshot_aliases_are_preserved_parsed_and_audited(
     assert "Extract Date -> Snapshot Date" in source_columns
 
 
-def test_one_month_check_uses_a_calendar_month(tmp_path: Path) -> None:
-    within = _row("J-WITHIN", status="Satisfied")
-    within.update(
-        {
-            "JudgmentDate": "31/01/2024",
-            "Date Inserted": "01/02/2024",
-            "Satisfaction Date": "29/02/2024",
-        }
-    )
-    after = _row("J-AFTER", status="Satisfied")
-    after.update(
-        {
-            "JudgmentDate": "31/01/2024",
-            "Date Inserted": "01/02/2024",
-            "Satisfaction Date": "01/03/2024",
-        }
-    )
-    frame, audit = read_rt_extract(
-        _write(tmp_path / "calendar-month.csv", [within, after]), OBSERVED
-    )
-
-    table = build_data_audit_counts(frame, audit)
-    checks = table.loc[table["dimension"].eq("follow_up_check")].set_index("value")
-    assert checks.loc["recorded_satisfaction_within_1_months", "rows"] == 1
-
-
 def test_exact_extra_headers_stay_internal_and_affect_schema_provenance(
     tmp_path: Path,
 ) -> None:
@@ -221,7 +210,7 @@ def test_raw_file_hash_and_all_retained_columns_are_fingerprinted(tmp_path: Path
     "header",
     ["Payment Confirmed At", "Recovery Outcome", "Recovery Date"],
 )
-def test_unrecognised_outcome_or_history_header_fails_closed(
+def test_unrecognised_outcome_or_history_header_blocks_outcome_analysis(
     tmp_path: Path,
     header: str,
 ) -> None:
@@ -229,8 +218,16 @@ def test_unrecognised_outcome_or_history_header_fails_closed(
     row[header] = "01/03/2024"
     path = _write(tmp_path / "unknown-outcome.csv", [row])
 
-    with pytest.raises(ValueError, match="unrecognised outcome/history-related"):
-        read_rt_extract(path, OBSERVED)
+    frame, audit = read_rt_extract(path, OBSERVED)
+
+    assert audit.unknown_decisive_headers == (header,)
+    assert audit.outcome_issues["unknown_outcome_or_history_header"] == 1
+    public_audit = build_data_audit_counts(frame, audit)
+    reported = public_audit.loc[
+        public_audit["dimension"].eq("outcome_or_history_header_not_recognised"),
+        "value",
+    ]
+    assert reported.tolist() == [header]
 
 
 @pytest.mark.parametrize("suffix", [".csv", ".xlsx"])
@@ -297,42 +294,42 @@ def test_cancellation_reason_does_not_imply_event_dates_or_history(tmp_path: Pat
 
 
 @pytest.mark.parametrize(
-    ("status", "extra", "message"),
+    ("status", "extra", "issue"),
     [
         (
             "Satisfied",
             {"Satisfaction Date": "31/12/2023"},
-            "Satisfaction Date is before JudgmentDate",
+            "satisfaction_date_before_judgment",
         ),
         (
             "Satisfied",
             {"Satisfaction Date": "01/01/2025"},
-            "Satisfaction Date is after the RT extract date",
+            "satisfaction_date_after_extract",
         ),
         (
             "Satisfied",
             {"Satisfaction Date": ""},
-            "missing for 1 Satisfied",
+            "satisfied_without_satisfaction_date",
         ),
         (
             "Unsatisfied",
             {"Satisfaction Date": "01/03/2024"},
-            "populated for 1 Unsatisfied",
+            "unsatisfied_with_satisfaction_date",
         ),
         (
             "Cancelled",
             {"Cancellation Date": ""},
-            "missing for 1 Cancelled",
+            "cancelled_without_cancellation_date",
         ),
         (
             "Satisfied",
             {"Cancellation Date": "01/04/2024"},
-            "populated for 1 non-Cancelled",
+            "non_cancelled_with_cancellation_date",
         ),
         (
             "Unsatisfied",
             {"Cancellation Reason": "set aside"},
-            "Cancellation Reason is populated",
+            "non_cancelled_with_cancellation_reason",
         ),
         (
             "Satisfied",
@@ -340,27 +337,28 @@ def test_cancellation_reason_does_not_imply_event_dates_or_history(tmp_path: Pat
                 "Satisfaction Date": "01/03/2024",
                 "Status Effective Date": "01/02/2024",
             },
-            "Status Effective Date precedes",
+            "status_effective_before_event",
         ),
         (
             "Unsatisfied",
             {"Snapshot Date": "30/12/2024"},
-            "does not match RT extract date",
+            "snapshot_date_does_not_match_extract",
         ),
     ],
 )
-def test_optional_timing_and_status_contradictions_fail_closed(
+def test_optional_timing_and_status_contradictions_are_audited(
     tmp_path: Path,
     status: str,
     extra: dict[str, str],
-    message: str,
+    issue: str,
 ) -> None:
     row = _row(status=status)
     row.update(extra)
     path = _write(tmp_path / "contradiction.csv", [row])
 
-    with pytest.raises(ValueError, match=message):
-        read_rt_extract(path, OBSERVED)
+    _, audit = read_rt_extract(path, OBSERVED)
+
+    assert audit.outcome_issues[issue] == 1
 
 
 def test_repeated_ids_with_snapshot_dates_are_identified_as_history(
@@ -381,10 +379,10 @@ def test_snapshot_column_must_be_complete_and_single_valued(tmp_path: Path) -> N
     second = _row("J-2")
     second["Snapshot Date"] = ""
     missing_path = _write(tmp_path / "missing-snapshot.csv", [first, second])
-    with pytest.raises(ValueError, match="Snapshot Date is present.*missing"):
-        read_rt_extract(missing_path, OBSERVED)
+    _, missing_audit = read_rt_extract(missing_path, OBSERVED)
+    assert missing_audit.outcome_issues["snapshot_date_missing"] == 1
 
     second["Snapshot Date"] = "2024-12-30"
     mixed_path = _write(tmp_path / "mixed-snapshot.csv", [first, second])
-    with pytest.raises(ValueError, match="2 distinct values"):
-        read_rt_extract(mixed_path, OBSERVED)
+    _, mixed_audit = read_rt_extract(mixed_path, OBSERVED)
+    assert mixed_audit.outcome_issues["snapshot_date_not_single_value"] == 2

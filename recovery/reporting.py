@@ -7,7 +7,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Iterator, Mapping
 import hashlib
 import json
 import os
@@ -17,6 +17,32 @@ import sys
 import time
 
 import pandas as pd
+
+
+_OUTPUT_DEFINITIONS = {
+    "at_risk": "records still under observation at the start of the month",
+    "bootstrap_successes": "successful company-level bootstrap repeats",
+    "cancellation_cif": "cumulative incidence of recorded cancellation",
+    "cancellation_events": "recorded cancellations in the month",
+    "cancellations": "recorded cancellations by the outcome horizon",
+    "censored": "records ending observation in the month",
+    "ci_high": "upper end of the 95% interval",
+    "ci_low": "lower end of the 95% interval",
+    "companies": "distinct companies",
+    "effective_rows": "effective records used by the smoother",
+    "eligible_rows": "records meeting the stated cohort rules",
+    "event_free_survival": "probability of neither recorded event",
+    "events": "recorded satisfactions by the outcome horizon",
+    "horizon_months": "calendar months after the landmark",
+    "improvement": "paired change; positive values favour the named model",
+    "metric": "reported performance measure",
+    "non_events": "no recorded satisfaction by the horizon; cancellations stay separate",
+    "population_rows": "records in the stated population",
+    "satisfaction_cif": "cumulative incidence of recorded satisfaction",
+    "satisfaction_events": "recorded satisfactions in the month",
+    "share": "rows divided by the relevant group total",
+    "time_origin": "date from which follow-up starts",
+}
 
 
 # Output folders and run times
@@ -68,12 +94,23 @@ def create_run_paths(base: str | Path, run_id: str | None = None) -> RunPaths:
 
 
 def source_fingerprint(package_dir: str | Path, settings_path: str | Path) -> str:
-    """Hash the Python files and settings, but not the data or Python setup."""
+    """Hash the files that define the run."""
 
     digest = hashlib.sha256()
-    sources = sorted(Path(package_dir).glob("*.py")) + [Path(settings_path)]
-    for path in sources:
-        digest.update(path.name.encode("utf-8"))
+    package = Path(package_dir)
+    root = package.parent
+    sources = sorted(package.glob("*.py"))
+    sources += sorted((root / "tests").glob("*.py"))
+    sources += sorted((root / ".github" / "workflows").glob("*.yml"))
+    sources += [
+        root / "README.md",
+        root / "RUN.bat",
+        root / "requirements.txt",
+        root / "requirements.lock",
+        Path(settings_path),
+    ]
+    for path in (item for item in sources if item.is_file()):
+        digest.update(path.relative_to(root).as_posix().encode("utf-8"))
         digest.update(path.read_bytes())
     return digest.hexdigest()
 
@@ -81,6 +118,51 @@ def source_fingerprint(package_dir: str | Path, settings_path: str | Path) -> st
 def write_json(path: str | Path, value: Any) -> None:
     text = json.dumps(value, indent=2, sort_keys=True, default=_json_default)
     Path(path).write_text(text + "\n", encoding="utf-8")
+
+
+def build_artifact_manifest(root: str | Path) -> pd.DataFrame:
+    """List the aggregate files already written."""
+
+    base = Path(root)
+    rows = []
+    for path in sorted(item for item in base.iterdir() if item.is_file()):
+        if path.name == "E5_artifact_manifest.csv":
+            continue
+        content = path.read_bytes()
+        record: dict[str, Any] = {
+            "artifact_name": path.name,
+            "bytes": len(content),
+            "sha256": hashlib.sha256(content).hexdigest(),
+        }
+        if path.suffix.casefold() == ".csv":
+            record["rows"] = int(len(pd.read_csv(path)))
+        else:
+            record["rows"] = pd.NA
+        rows.append(record)
+    return pd.DataFrame(rows)
+
+
+def build_output_dictionary(root: str | Path) -> pd.DataFrame:
+    """List the columns in each aggregate CSV."""
+
+    rows = []
+    for path in sorted(Path(root).glob("*.csv")):
+        if path.name == "E5_output_dictionary.csv":
+            continue
+        for column in pd.read_csv(path, nrows=0).columns:
+            name = str(column)
+            rows.append(
+                {
+                    "artifact_name": path.name,
+                    "column_name": name,
+                    "definition": _output_definition(name),
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+def _output_definition(column: str) -> str:
+    return _OUTPUT_DEFINITIONS.get(column, column.replace("_", " "))
 
 
 # E1 data audit
@@ -255,6 +337,15 @@ def build_data_audit_counts(
                     "share": 1.0,
                 }
             )
+        for column in getattr(audit, "unknown_decisive_headers", ()):
+            rows.append(
+                {
+                    "dimension": "outcome_or_history_header_not_recognised",
+                    "value": str(column),
+                    "rows": support,
+                    "share": 1.0,
+                }
+            )
         if not raw_schema:
             for position, _header in enumerate(
                 getattr(audit, "extra_headers", ()), start=1
@@ -329,52 +420,6 @@ def build_data_audit_counts(
                         "share": event_support / max(support, 1),
                     }
                 )
-        observed_text = getattr(audit, "observation_date", None)
-        if observed_text:
-            observed = pd.Timestamp(observed_text)
-            corporate_ew = frame["DefendantType"].eq("Corporate") & frame[
-                "Jurisdiction"
-            ].eq("England and Wales")
-            target_support = int(corporate_ew.sum())
-            satisfaction_dates = pd.to_datetime(
-                frame.get(
-                    "Satisfaction Date",
-                    pd.Series(pd.NaT, index=frame.index),
-                ),
-                errors="coerce",
-            )
-            for months in (1, 12, 24):
-                horizon = judgment_dates.map(
-                    lambda value: value + pd.DateOffset(months=months)
-                    if pd.notna(value)
-                    else pd.NaT
-                )
-                eligible = corporate_ew & horizon.le(observed)
-                label = (
-                    "corporate_EW_older_than_one_calendar_month"
-                    if months == 1
-                    else f"corporate_EW_with_{months}_month_followup"
-                )
-                rows.append(
-                    {
-                        "dimension": "follow_up_check",
-                        "value": label,
-                        "rows": int(eligible.sum()),
-                        "share": int(eligible.sum()) / max(target_support, 1),
-                    }
-                )
-                if satisfaction_dates.notna().any():
-                    within_horizon = eligible & satisfaction_dates.notna() & (
-                        satisfaction_dates.le(horizon)
-                    )
-                    rows.append(
-                        {
-                            "dimension": "follow_up_check",
-                            "value": f"recorded_satisfaction_within_{months}_months",
-                            "rows": int(within_horizon.sum()),
-                            "share": int(within_horizon.sum()) / max(target_support, 1),
-                        }
-                    )
         for value, count in (
             ("invalid_amount", getattr(audit, "invalid_amount_rows", 0)),
             ("missing_company_name", getattr(audit, "missing_company_name_rows", 0)),
@@ -392,6 +437,15 @@ def build_data_audit_counts(
                 {
                     "dimension": "data_quality_issue",
                     "value": value,
+                    "rows": int(count),
+                    "share": int(count) / max(support, 1),
+                }
+            )
+        for value, count in getattr(audit, "outcome_issues", {}).items():
+            rows.append(
+                {
+                    "dimension": "outcome_issue",
+                    "value": str(value),
                     "rows": int(count),
                     "share": int(count) / max(support, 1),
                 }
@@ -416,6 +470,92 @@ def write_e2(egress: Path, diagnostics: dict[str, pd.DataFrame]) -> list[str]:
     return files
 
 
+def write_tables(egress: Path, tables: Mapping[str, pd.DataFrame]) -> list[str]:
+    """Write named aggregate tables."""
+
+    return [_write_csv(egress / name, table) for name, table in tables.items()]
+
+
+def build_linkage_comparison(
+    judgments: pd.DataFrame, matches: pd.DataFrame
+) -> pd.DataFrame:
+    """Compare linked and unmatched records without identifiers."""
+
+    frame = judgments.merge(
+        matches[["ID", "tier"]], on="ID", how="left", validate="one_to_one"
+    )
+    frame["population"] = frame["tier"].map(
+        {"exact_unique": "exact_linked_live_ch", "unmatched": "not_exact_linked"}
+    )
+    frame["judgment_year"] = frame["JudgmentDate"].dt.year.astype("string")
+    frame["age_band"] = pd.cut(
+        frame["age_at_observation_months"],
+        [-float("inf"), 3, 6, 12, 24, 36, 48, 60, 73, float("inf")],
+        labels=["under_3", "3_5", "6_11", "12_23", "24_35", "36_47", "48_59", "60_72", "over_72"],
+        right=False,
+    ).astype("string").fillna("missing")
+    frame["amount_band"] = pd.cut(
+        frame["Amount"],
+        [-float("inf"), 500, 1_000, 2_500, 5_000, 10_000, 25_000, 100_000, float("inf")],
+        labels=["under_500", "500_999", "1000_2499", "2500_4999", "5000_9999", "10000_24999", "25000_99999", "100000_plus"],
+        right=False,
+    ).astype("string").fillna("missing")
+    rows: list[pd.DataFrame] = []
+    for dimension, column in (
+        ("status", "JudgmentStatus"),
+        ("judgment_year", "judgment_year"),
+        ("age_band", "age_band"),
+        ("amount_band", "amount_band"),
+    ):
+        counts = (
+            frame.groupby(["population", column], observed=True, dropna=False)
+            .size()
+            .rename("rows")
+            .reset_index()
+            .rename(columns={column: "value"})
+        )
+        counts["dimension"] = dimension
+        counts["population_rows"] = counts.groupby("population")["rows"].transform("sum")
+        counts["share"] = counts["rows"] / counts["population_rows"]
+        rows.append(counts)
+    return pd.concat(rows, ignore_index=True)[
+        ["population", "dimension", "value", "rows", "population_rows", "share"]
+    ]
+
+
+def build_validation_sampling(
+    matches: pd.DataFrame,
+    accepted_rows: int,
+    unmatched_rows: int,
+    seed: int,
+) -> pd.DataFrame:
+    """Record how the private review samples were drawn."""
+
+    counts = matches["tier"].value_counts()
+    return pd.DataFrame(
+        [
+            {
+                "sampling_arm": "accepted_exact",
+                "frame_rows": int(counts.get("exact_unique", 0)),
+                "sample_rows": int(accepted_rows),
+                "method": "equal_probability_systematic",
+                "seed": int(seed),
+                "outcomes_excluded": True,
+                "manual_adjudication": "not_completed",
+            },
+            {
+                "sampling_arm": "unmatched",
+                "frame_rows": int(counts.get("unmatched", 0)),
+                "sample_rows": int(unmatched_rows),
+                "method": "hash_random",
+                "seed": int(seed),
+                "outcomes_excluded": True,
+                "manual_adjudication": "not_completed",
+            },
+        ]
+    )
+
+
 # E5 run record and summary
 
 def write_e5(
@@ -435,7 +575,6 @@ def write_e5(
         "python": sys.version,
         "platform": platform.platform(),
         "machine": platform.machine(),
-        "pid": os.getpid(),
         "peak_memory_mb": round(peak_memory_mb(), 1),
     }
     manifest_path = egress / "E5_run_manifest.json"
@@ -456,7 +595,22 @@ def _write_matching_summary(path: str | Path, context: dict[str, Any]) -> None:
     match = context.get("match", {})
     inserted = context.get("date_inserted", {})
     optional = context.get("optional_fields", {})
+    outcome = context.get("outcome", {})
+    prediction = context.get("prediction", {})
     min_cell_n = int(context.get("min_cell_n", 10))
+    exact = match.get("exact_unique")
+    unmatched = match.get("unmatched")
+    hide_match_parts = any(
+        isinstance(value, (int, float)) and 0 < value < min_cell_n
+        for value in (exact, unmatched)
+    )
+    exact_text = "suppressed" if hide_match_parts else _fmt_count(exact, min_cell_n)
+    unmatched_text = (
+        "suppressed" if hide_match_parts else _fmt_count(unmatched, min_cell_n)
+    )
+    coverage_text = (
+        "suppressed" if hide_match_parts else _fmt_percent(match.get("coverage"))
+    )
     file_structure = {
         "status_only_unique_judgment_rows": "status only; one row per judgment",
         "status_with_event_dates_unique_judgment_rows": (
@@ -477,9 +631,9 @@ def _write_matching_summary(path: str | Path, context: dict[str, Any]) -> None:
     }.get(str(context.get("data_construct", "unknown")), "unknown")
     lines = [
         "CONFIDENTIAL — SEND ONLY TO EDWIN",
-        "RT MATCHING CHECK",
-        "=================",
-        "Status                        MATCHING COMPLETE",
+        "RT DATA CHECK",
+        "=============",
+        "Status                        ANALYSIS COMPLETE",
         f"RT extract date                {context.get('observation_date', 'unknown')}",
         f"Companies House file date      {context.get('companies_house_date', 'unknown')}",
         f"File structure                 {file_structure}",
@@ -506,14 +660,15 @@ def _write_matching_summary(path: str | Path, context: dict[str, Any]) -> None:
         "",
         "Exact-name results for corporate E&W records",
         f"  Records checked              {_fmt_count(match.get('denominator'), min_cell_n)}",
-        "  One exact live-company match "
-        f"{_fmt_count(match.get('exact_unique'), min_cell_n)}",
-        f"  No match                     {_fmt_count(match.get('unmatched'), min_cell_n)}",
-        f"  Match rate                   {_fmt_percent(match.get('coverage'))}",
+        f"  One exact live-company match {exact_text}",
+        f"  No match                     {unmatched_text}",
+        f"  Match rate                   {coverage_text}",
         "",
         "This run",
-        "  - Checked every valid RT row.",
-        "  - Made two review samples for Edwin.",
+        "  - Checked every RT row.",
+        "  - Made two private review samples. They remain with RT.",
+        f"  - Outcome analysis: {_fmt(outcome.get('status', 'not run'))}.",
+        f"  - Prediction: {_fmt(prediction.get('status', 'not run'))}.",
         "",
         "Limits",
         "  - After basic name cleaning, a match needs exactly one company in",
@@ -523,14 +678,16 @@ def _write_matching_summary(path: str | Path, context: dict[str, Any]) -> None:
         "  - Date Inserted is the RT registration date; its delay from",
         "    JudgmentDate is reported.",
         "  - The Companies House file contains live companies only.",
+        "  - Outcome results describe records present in the RT extract.",
+        "  - Retention and removal rules still need RT confirmation.",
         "  - Send the ZIP file only to Edwin.",
         "",
         "Files",
         "  E1 file and row checks",
         "  E2 matching results and reasons for no match",
+        "  E3 outcome results",
+        "  E4 prediction check and results, when available",
         "  E5 run details",
-        f"Edwin's matched sample: {context.get('accepted_file', 'not produced')}",
-        f"Edwin's unmatched sample: {context.get('unmatched_file', 'not produced')}",
     ]
     Path(path).write_text("\n".join(lines) + "\n", encoding="utf-8")
 

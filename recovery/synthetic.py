@@ -24,6 +24,7 @@ def make_synthetic_bundle(
     seed: int = 20260618,
     *,
     include_prior_rows: bool = True,
+    include_event_dates: bool = False,
 ) -> SyntheticBundle:
     """Return fake inputs with exact, postcode-change and non-match cases."""
 
@@ -45,6 +46,7 @@ def make_synthetic_bundle(
     latent = -1.9 + 0.045 * company_age - 0.000004 * amounts - 0.55 * prior_flag
     p_satisfied = 1 / (1 + np.exp(-latent))
     satisfied = rng.random(n_companies) < p_satisfied
+    cancelled = (~satisfied) & (rng.random(n_companies) < 0.12)
 
     corruption = np.array(
         [
@@ -130,7 +132,9 @@ def make_synthetic_bundle(
             "ID": [f"J-{i:07d}" for i in company_ids],
             "Date Inserted": pd.Series(target_dates + pd.Timedelta(days=1)).dt.strftime("%d/%m/%Y"),
             "JudgmentDate": pd.Series(target_dates).dt.strftime("%d/%m/%Y"),
-            "JudgmentStatus": np.where(satisfied, "Satisfied", "Unsatisfied"),
+            "JudgmentStatus": np.select(
+                [satisfied, cancelled], ["Satisfied", "Cancelled"], default="Unsatisfied"
+            ),
             "DefendantType": "Corporate",
             "Jurisdiction": "England and Wales",
             "Defendant Company Name": source_names,
@@ -140,6 +144,19 @@ def make_synthetic_bundle(
             "Defendant Address": "",
         }
     )
+    if include_event_dates:
+        landmark = pd.Series(target_dates).map(
+            lambda value: value + pd.DateOffset(months=1)
+        )
+        event_dates = landmark + pd.to_timedelta(
+            rng.integers(1, 330, n_companies), unit="D"
+        )
+        target["Satisfaction Date"] = pd.Series(event_dates).where(satisfied).dt.strftime(
+            "%d/%m/%Y"
+        )
+        target["Cancellation Date"] = pd.Series(event_dates).where(cancelled).dt.strftime(
+            "%d/%m/%Y"
+        )
 
     # Add older judgments to test repeated companies.
     if include_prior_rows:
@@ -164,6 +181,9 @@ def make_synthetic_bundle(
                 "Defendant Address": "",
             }
         )
+        if include_event_dates:
+            prior["Satisfaction Date"] = ""
+            prior["Cancellation Date"] = ""
         judgments = pd.concat([target, prior], ignore_index=True)
     else:
         judgments = target.copy()

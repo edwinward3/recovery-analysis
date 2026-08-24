@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
+import hashlib
 import json
 import unittest
 import zipfile
@@ -108,7 +109,7 @@ class RunTests(unittest.TestCase):
             self.assertEqual(set(unmatched["tier"]), {"unmatched"})
 
             summary = (paths.results / "SUMMARY.txt").read_text(encoding="utf-8")
-            self.assertIn("RT MATCHING CHECK", summary)
+            self.assertIn("RT DATA CHECK", summary)
             self.assertIn("Date Inserted (RT registration date)", summary)
             self.assertIn("Satisfaction Date", summary)
             self.assertIn("absent; 0 filled", summary)
@@ -123,11 +124,187 @@ class RunTests(unittest.TestCase):
             manifest = json.loads(
                 (paths.results / "E5_run_manifest.json").read_text(encoding="utf-8")
             )
-            self.assertEqual(manifest["schema_version"], 6)
+            self.assertEqual(manifest["schema_version"], 7)
             self.assertEqual(
                 manifest["matching_rule"],
                 "unique_date_valid_exact_normalized_name_v1",
             )
+            self.assertEqual(manifest["package_versions"]["scikit-learn"], "1.9.0")
+            self.assertEqual(manifest["package_versions"]["lightgbm"], "4.7.0")
+            self.assertEqual(
+                manifest["academic_design"]["prediction_bootstrap_replicates"],
+                500,
+            )
+
+    def test_complete_event_dates_run_longitudinal_analysis_and_prediction(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            bundle = make_synthetic_bundle(
+                8_000,
+                include_prior_rows=False,
+                include_event_dates=True,
+            )
+            judgments, companies, _ = write_bundle(
+                bundle, root / "inputs", excel=False
+            )
+
+            paths = analyze(
+                judgments_path=judgments,
+                companies_house_path=companies,
+                observation_date=bundle.observation_date,
+                companies_house_date=bundle.observation_date,
+                settings_path=ROOT / "settings.toml",
+                output_base=root / "outputs",
+                run_id="longitudinal",
+            )
+
+            outcome_gate = pd.read_csv(paths.results / "E3_outcome_gate.csv")
+            prediction_gate = pd.read_csv(paths.results / "E4_prediction_gate.csv")
+            cohort_flow = pd.read_csv(paths.results / "E4_cohort_flow.csv")
+            self.assertEqual(outcome_gate.loc[0, "selected_analysis"], "longitudinal")
+            self.assertTrue(prediction_gate["status"].eq("pass").all())
+            self.assertIn("primary_estimand", set(prediction_gate["check"]))
+            self.assertIn("cancellation_treatment", set(prediction_gate["check"]))
+            self.assertIn("final_analysed_cohort", set(cohort_flow["stage"]))
+            for name in (
+                "E3_cumulative_incidence.csv",
+                "E3_fixed_horizon.csv",
+                "E4_cohort_flow.csv",
+                "E4_model_performance.csv",
+                "E4_paired_improvement.csv",
+                "E4_calibration_curve.csv",
+                "E4_ranking.csv",
+            ):
+                self.assertTrue((paths.results / name).is_file(), name)
+            archive = package_results(paths)
+            with zipfile.ZipFile(archive) as package:
+                names = {entry.filename for entry in package.infolist()}
+            self.assertFalse(any("working_files" in name for name in names))
+            self.assertFalse(any("linkage_validation" in name for name in names))
+
+    def test_conflicting_event_dates_select_cross_sectional_fallback(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            bundle = make_synthetic_bundle(
+                200,
+                include_prior_rows=False,
+                include_event_dates=True,
+            )
+            affected = bundle.judgments["JudgmentStatus"].eq("Satisfied")
+            bundle.judgments.loc[affected.idxmax(), "Satisfaction Date"] = ""
+            judgments, companies, _ = write_bundle(
+                bundle, root / "inputs", excel=False
+            )
+
+            paths = analyze(
+                judgments_path=judgments,
+                companies_house_path=companies,
+                observation_date=bundle.observation_date,
+                companies_house_date=bundle.observation_date,
+                settings_path=ROOT / "settings.toml",
+                output_base=root / "outputs",
+                run_id="fallback",
+            )
+
+            outcome = pd.read_csv(paths.results / "E3_outcome_gate.csv")
+            prediction = pd.read_csv(paths.results / "E4_prediction_gate.csv")
+            self.assertEqual(outcome.loc[0, "selected_analysis"], "cross_sectional")
+            self.assertTrue((paths.results / "E3_status_at_extract.csv").is_file())
+            self.assertFalse((paths.results / "E3_cumulative_incidence.csv").exists())
+            self.assertEqual(prediction.loc[0, "status"], "fail")
+
+    def test_unparseable_event_date_selects_cross_sectional_fallback(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            bundle = make_synthetic_bundle(
+                200,
+                include_prior_rows=False,
+                include_event_dates=True,
+            )
+            affected = bundle.judgments["JudgmentStatus"].eq("Satisfied").idxmax()
+            bundle.judgments.loc[affected, "Satisfaction Date"] = "not a date"
+            judgments, companies, _ = write_bundle(
+                bundle, root / "inputs", excel=False
+            )
+
+            paths = analyze(
+                judgments_path=judgments,
+                companies_house_path=companies,
+                observation_date=bundle.observation_date,
+                companies_house_date=bundle.observation_date,
+                settings_path=ROOT / "settings.toml",
+                output_base=root / "outputs",
+                run_id="unparseable_event",
+            )
+
+            outcome = pd.read_csv(paths.results / "E3_outcome_gate.csv")
+            self.assertEqual(outcome.loc[0, "selected_analysis"], "cross_sectional")
+            self.assertTrue((paths.results / "E3_status_at_extract.csv").is_file())
+            self.assertFalse((paths.results / "E3_cumulative_incidence.csv").exists())
+
+    def test_unknown_outcome_header_blocks_outcomes_without_stopping_run(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            bundle = make_synthetic_bundle(200, include_prior_rows=False)
+            bundle.judgments["Payment Confirmed At"] = ""
+            judgments, companies, _ = write_bundle(
+                bundle, root / "inputs", excel=False
+            )
+
+            paths = analyze(
+                judgments_path=judgments,
+                companies_house_path=companies,
+                observation_date=bundle.observation_date,
+                companies_house_date=bundle.observation_date,
+                settings_path=ROOT / "settings.toml",
+                output_base=root / "outputs",
+                run_id="unknown_outcome_header",
+            )
+
+            outcome = pd.read_csv(paths.results / "E3_outcome_gate.csv")
+            audit = pd.read_csv(paths.results / "E1_data_audit.csv")
+            self.assertEqual(outcome.loc[0, "selected_analysis"], "blocked")
+            self.assertFalse((paths.results / "E3_status_at_extract.csv").exists())
+            self.assertFalse((paths.results / "E3_cumulative_incidence.csv").exists())
+            self.assertIn(
+                "Payment Confirmed At",
+                set(
+                    audit.loc[
+                        audit["dimension"].eq(
+                            "outcome_or_history_header_not_recognised"
+                        ),
+                        "value",
+                    ]
+                ),
+            )
+
+    def test_outcome_issue_outside_corporate_ew_does_not_block_longitudinal(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            bundle = make_synthetic_bundle(
+                200,
+                include_prior_rows=False,
+                include_event_dates=True,
+            )
+            affected = bundle.judgments["JudgmentStatus"].eq("Satisfied").idxmax()
+            bundle.judgments.loc[affected, "DefendantType"] = "Consumer"
+            bundle.judgments.loc[affected, "Satisfaction Date"] = ""
+            judgments, companies, _ = write_bundle(
+                bundle, root / "inputs", excel=False
+            )
+
+            paths = analyze(
+                judgments_path=judgments,
+                companies_house_path=companies,
+                observation_date=bundle.observation_date,
+                companies_house_date=bundle.observation_date,
+                settings_path=ROOT / "settings.toml",
+                output_base=root / "outputs",
+                run_id="target_only",
+            )
+
+            outcome = pd.read_csv(paths.results / "E3_outcome_gate.csv")
+            self.assertEqual(outcome.loc[0, "selected_analysis"], "longitudinal")
 
     def test_short_names_are_not_used_as_disclosure_needles(self) -> None:
         from recovery.run import _bounded_known_identifiers
@@ -151,9 +328,20 @@ class RunTests(unittest.TestCase):
             working = root / "working_files"
             results.mkdir(parents=True)
             working.mkdir()
-            (results / "SUMMARY.txt").write_text("complete\n", encoding="utf-8")
+            summary = results / "SUMMARY.txt"
+            summary.write_text("complete\n", encoding="utf-8")
+            pd.DataFrame(
+                [
+                    {
+                        "artifact_name": summary.name,
+                        "bytes": summary.stat().st_size,
+                        "sha256": hashlib.sha256(summary.read_bytes()).hexdigest(),
+                        "rows": pd.NA,
+                    }
+                ]
+            ).to_csv(results / "E5_artifact_manifest.csv", index=False)
             (working / "review.csv").write_text("id\n1\n", encoding="utf-8")
-            paths = SimpleNamespace(root=root)
+            paths = SimpleNamespace(root=root, results=results)
 
             archive = package_results(paths)
 
@@ -162,10 +350,135 @@ class RunTests(unittest.TestCase):
                 self.assertEqual(
                     {entry.filename for entry in package.infolist() if not entry.is_dir()},
                     {
+                        "run_known/results/E5_artifact_manifest.csv",
                         "run_known/results/SUMMARY.txt",
-                        "run_known/working_files/review.csv",
                     },
                 )
+            checksum = archive.with_suffix(".zip.sha256")
+            self.assertEqual(
+                checksum.read_text(encoding="ascii").split(),
+                [hashlib.sha256(archive.read_bytes()).hexdigest(), archive.name],
+            )
+
+    def test_zip_write_failure_leaves_no_send_package(self) -> None:
+        with TemporaryDirectory() as temporary:
+            paths = self._minimal_completed_run(Path(temporary))
+            archive = paths.root.parent / "SEND_TO_EDWIN_known.zip"
+
+            with (
+                patch.object(zipfile.ZipFile, "write", side_effect=OSError("disk full")),
+                self.assertRaisesRegex(OSError, "disk full"),
+            ):
+                package_results(paths)
+
+            self.assertFalse(archive.exists())
+            self.assertFalse(archive.with_suffix(".zip.sha256").exists())
+
+    def test_checksum_write_failure_leaves_no_send_package(self) -> None:
+        with TemporaryDirectory() as temporary:
+            paths = self._minimal_completed_run(Path(temporary))
+            archive = paths.root.parent / "SEND_TO_EDWIN_known.zip"
+            real_write_text = Path.write_text
+
+            def fail_checksum(path: Path, *args: object, **kwargs: object) -> int:
+                if path.name.endswith(".zip.sha256"):
+                    raise OSError("checksum disk full")
+                return real_write_text(path, *args, **kwargs)
+
+            with (
+                patch.object(Path, "write_text", autospec=True, side_effect=fail_checksum),
+                self.assertRaisesRegex(OSError, "checksum disk full"),
+            ):
+                package_results(paths)
+
+            self.assertFalse(archive.exists())
+            self.assertFalse(archive.with_suffix(".zip.sha256").exists())
+
+    def test_archive_publish_failure_removes_published_checksum(self) -> None:
+        with TemporaryDirectory() as temporary:
+            paths = self._minimal_completed_run(Path(temporary))
+            archive = paths.root.parent / "SEND_TO_EDWIN_known.zip"
+            real_replace = Path.replace
+
+            def fail_archive_publish(path: Path, target: Path) -> Path:
+                if Path(target).suffix == ".zip":
+                    raise OSError("archive publish failed")
+                return real_replace(path, target)
+
+            with (
+                patch.object(
+                    Path,
+                    "replace",
+                    autospec=True,
+                    side_effect=fail_archive_publish,
+                ),
+                self.assertRaisesRegex(OSError, "archive publish failed"),
+            ):
+                package_results(paths)
+
+            self.assertFalse(archive.exists())
+            self.assertFalse(archive.with_suffix(".zip.sha256").exists())
+
+    @staticmethod
+    def _minimal_completed_run(output: Path) -> SimpleNamespace:
+        root = output / "run_known"
+        results = root / "results"
+        results.mkdir(parents=True)
+        summary = results / "SUMMARY.txt"
+        summary.write_text("complete\n", encoding="utf-8")
+        pd.DataFrame(
+            [
+                {
+                    "artifact_name": summary.name,
+                    "bytes": summary.stat().st_size,
+                    "sha256": hashlib.sha256(summary.read_bytes()).hexdigest(),
+                    "rows": pd.NA,
+                }
+            ]
+        ).to_csv(results / "E5_artifact_manifest.csv", index=False)
+        return SimpleNamespace(root=root, results=results)
+
+    def test_changed_result_is_not_packaged(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary) / "run_known"
+            results = root / "results"
+            results.mkdir(parents=True)
+            summary = results / "SUMMARY.txt"
+            summary.write_text("complete\n", encoding="utf-8")
+            pd.DataFrame(
+                [
+                    {
+                        "artifact_name": summary.name,
+                        "bytes": summary.stat().st_size,
+                        "sha256": hashlib.sha256(summary.read_bytes()).hexdigest(),
+                        "rows": pd.NA,
+                    }
+                ]
+            ).to_csv(results / "E5_artifact_manifest.csv", index=False)
+            summary.write_text("changed\n", encoding="utf-8")
+
+            with self.assertRaisesRegex(RunFailure, "artifact check failed"):
+                package_results(SimpleNamespace(root=root, results=results))
+
+            self.assertFalse((root.parent / "SEND_TO_EDWIN_known.zip").exists())
+
+    def test_unlisted_nested_file_is_not_packaged(self) -> None:
+        with TemporaryDirectory() as temporary:
+            paths = self._minimal_completed_run(Path(temporary))
+            nested = paths.results / "nested"
+            nested.mkdir()
+            (nested / "private.csv").write_text(
+                "company_name\nPRIVATE COMPANY LIMITED\n", encoding="utf-8"
+            )
+
+            with self.assertRaisesRegex(
+                RunFailure, "results folder contains an unlisted file or folder"
+            ):
+                package_results(paths)
+
+            archive = paths.root.parent / "SEND_TO_EDWIN_known.zip"
+            self.assertFalse(archive.exists())
+            self.assertFalse(archive.with_suffix(".zip.sha256").exists())
 
     def test_empty_review_sample_does_not_stop_the_run(self) -> None:
         for empty_arm in ("accepted", "unmatched"):
