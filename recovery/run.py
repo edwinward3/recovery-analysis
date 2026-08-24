@@ -5,12 +5,14 @@ from __future__ import annotations
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from threading import Event, Thread
 from typing import Any, Callable, Sequence
 import argparse
 import hashlib
 import re
 import shutil
 import sys
+import time
 import zipfile
 
 import pandas as pd
@@ -69,6 +71,7 @@ from .reporting import (
 
 
 MAX_CH_SNAPSHOT_LAG_DAYS = 35
+ELAPSED_UPDATE_SECONDS = 300
 _GLOBAL_OUTCOME_BLOCKERS = frozenset(
     {
         "snapshot_date_does_not_match_extract",
@@ -1117,8 +1120,41 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _format_elapsed(seconds: float) -> str:
+    total = max(0, int(seconds))
+    hours, remainder = divmod(total, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+
+def _elapsed_updates(
+    stop: Event,
+    started: float,
+    interval_seconds: float = ELAPSED_UPDATE_SECONDS,
+) -> None:
+    while not stop.wait(interval_seconds):
+        print(
+            f"Still running. Elapsed time: {_format_elapsed(time.monotonic() - started)}",
+            flush=True,
+        )
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
+    started = time.monotonic()
+    stop = Event()
+    updates = Thread(
+        target=_elapsed_updates,
+        args=(stop, started),
+        name="elapsed-time",
+        daemon=True,
+    )
+    try:
+        updates.start()
+    except (OSError, RuntimeError):
+        updates = None
+    archive: Path | None = None
+    error: Exception | None = None
     try:
         paths = analyze(
             judgments_path=args.judgments,
@@ -1129,12 +1165,21 @@ def main(argv: Sequence[str] | None = None) -> int:
             output_base=args.output_base,
         )
         archive = package_results(paths)
-        print("RUN COMPLETE")
-        print(f"SEND THIS FILE TO EDWIN: {archive}")
-        return 0
     except Exception as exc:
-        print(f"STOP: {type(exc).__name__}: {exc}", file=sys.stderr)
+        error = exc
+    finally:
+        stop.set()
+        if updates is not None:
+            updates.join(1)
+    elapsed = f"Elapsed time: {_format_elapsed(time.monotonic() - started)}"
+    if error is not None:
+        print(f"STOP: {type(error).__name__}: {error}", file=sys.stderr)
+        print(elapsed, file=sys.stderr)
         return 2
+    print("RUN COMPLETE")
+    print(elapsed)
+    print(f"SEND THIS FILE TO EDWIN: {archive}")
+    return 0
 
 
 if __name__ == "__main__":

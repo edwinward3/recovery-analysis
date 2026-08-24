@@ -7,9 +7,10 @@ from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 import hashlib
 import json
+import sys
 import unittest
 import zipfile
-from unittest.mock import call, patch
+from unittest.mock import Mock, call, patch
 
 import pandas as pd
 
@@ -20,6 +21,8 @@ from recovery.matching import (
 )
 from recovery.run import (
     RunFailure,
+    _elapsed_updates,
+    _format_elapsed,
     analyze,
     main,
     package_results,
@@ -32,7 +35,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class RunTests(unittest.TestCase):
-    def test_command_prints_only_the_zip_to_send(self) -> None:
+    def test_command_prints_elapsed_time_and_zip_to_send(self) -> None:
         root = Path("outputs/run_finished").resolve()
         archive = Path("outputs/SEND_TO_EDWIN_finished.zip").resolve()
         paths = SimpleNamespace(root=root)
@@ -59,6 +62,88 @@ class RunTests(unittest.TestCase):
             printer.call_args_list,
             [
                 call("RUN COMPLETE"),
+                call("Elapsed time: 00:00:00"),
+                call(f"SEND THIS FILE TO EDWIN: {archive}"),
+            ],
+        )
+
+    def test_elapsed_time_format_and_heartbeat(self) -> None:
+        stop = Mock()
+        stop.wait.side_effect = [False, True]
+
+        with (
+            patch("recovery.run.time.monotonic", return_value=3662.9),
+            patch("builtins.print") as printer,
+        ):
+            _elapsed_updates(stop, 1.0)
+
+        self.assertEqual(_format_elapsed(-1), "00:00:00")
+        self.assertEqual(_format_elapsed(3661.9), "01:01:01")
+        stop.wait.assert_has_calls([call(300), call(300)])
+        printer.assert_called_once_with(
+            "Still running. Elapsed time: 01:01:01", flush=True
+        )
+
+    def test_elapsed_thread_stops_when_run_fails(self) -> None:
+        arguments = [
+            "analyze",
+            "--judgments",
+            "rt.xlsx",
+            "--companies-house",
+            "BasicCompanyData-2026-08-01.zip",
+            "--observation-date",
+            "2026-08-01",
+            "--companies-house-date",
+            "2026-08-01",
+        ]
+        with (
+            patch("recovery.run.analyze", side_effect=RunFailure("test failure")),
+            patch("recovery.run.Thread") as thread_type,
+            patch("builtins.print") as printer,
+        ):
+            status = main(arguments)
+
+        self.assertEqual(status, 2)
+        thread_type.return_value.start.assert_called_once_with()
+        thread_type.return_value.join.assert_called_once_with(1)
+        self.assertEqual(
+            printer.call_args_list,
+            [
+                call("STOP: RunFailure: test failure", file=sys.stderr),
+                call("Elapsed time: 00:00:00", file=sys.stderr),
+            ],
+        )
+
+    def test_run_continues_if_elapsed_thread_cannot_start(self) -> None:
+        root = Path("outputs/run_finished").resolve()
+        archive = Path("outputs/SEND_TO_EDWIN_finished.zip").resolve()
+        paths = SimpleNamespace(root=root)
+        arguments = [
+            "analyze",
+            "--judgments",
+            "rt.xlsx",
+            "--companies-house",
+            "BasicCompanyData-2026-08-01.zip",
+            "--observation-date",
+            "2026-08-01",
+            "--companies-house-date",
+            "2026-08-01",
+        ]
+        with (
+            patch("recovery.run.analyze", return_value=paths),
+            patch("recovery.run.package_results", return_value=archive),
+            patch("recovery.run.Thread.start", side_effect=RuntimeError),
+            patch("recovery.run.time.monotonic", side_effect=[10.0, 11.0]),
+            patch("builtins.print") as printer,
+        ):
+            status = main(arguments)
+
+        self.assertEqual(status, 0)
+        self.assertEqual(
+            printer.call_args_list,
+            [
+                call("RUN COMPLETE"),
+                call("Elapsed time: 00:00:01"),
                 call(f"SEND THIS FILE TO EDWIN: {archive}"),
             ],
         )
