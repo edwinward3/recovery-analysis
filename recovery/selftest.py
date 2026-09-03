@@ -225,7 +225,6 @@ def _run_full(args: object) -> int:
             judgments_path=judgments,
             companies_house_path=companies,
             observation_date=bundle.observation_date,
-            companies_house_date=bundle.observation_date,
             settings_path=args.settings,
             output_base=root / "outputs !",
             run_id="selftest",

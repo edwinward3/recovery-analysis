@@ -135,7 +135,7 @@ def test_summary_is_short_and_explicit(tmp_path: Path) -> None:
         path,
         {
             "observation_date": "2026-06-01",
-            "companies_house_date": "2026-06-01",
+            "companies_house_filename_date": "2026-06-01",
             "data_construct": "status_only_unique_judgment_rows",
             "optional_fields": {
                 "Satisfaction Date": {"present": False, "rows": 0},

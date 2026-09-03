@@ -70,7 +70,6 @@ from .reporting import (
 )
 
 
-MAX_CH_SNAPSHOT_LAG_DAYS = 35
 ELAPSED_UPDATE_SECONDS = 300
 _GLOBAL_OUTCOME_BLOCKERS = frozenset(
     {
@@ -91,7 +90,6 @@ def analyze(
     judgments_path: str | Path,
     companies_house_path: str | Path,
     observation_date: str | pd.Timestamp | None,
-    companies_house_date: str | pd.Timestamp | None = None,
     settings_path: str | Path,
     output_base: str | Path,
     run_id: str | None = None,
@@ -101,12 +99,9 @@ def analyze(
 
     if observation_date is None:
         raise RunFailure("RT extract date is required; it must not default to today")
-    if companies_house_date is None:
-        raise RunFailure("Companies House file date is required")
     observed = _declared_date(observation_date, "RT extract date")
-    ch_observed = _declared_date(companies_house_date, "Companies House file date")
     companies_file = Path(companies_house_path).resolve()
-    _validate_ch_snapshot(companies_file, observed, ch_observed)
+    ch_filename_date = _companies_house_filename_date(companies_file)
     settings_source = Path(settings_path).resolve()
     settings = load_settings(settings_source)
 
@@ -117,7 +112,7 @@ def analyze(
             judgments_path=judgments_path,
             companies_house_path=companies_file,
             observed=observed,
-            ch_observed=ch_observed,
+            ch_filename_date=ch_filename_date,
             settings_source=settings_source,
             settings=settings,
             paths=paths,
@@ -141,7 +136,7 @@ def _analyze_created_run(
     judgments_path: str | Path,
     companies_house_path: Path,
     observed: pd.Timestamp,
-    ch_observed: pd.Timestamp,
+    ch_filename_date: pd.Timestamp | None,
     settings_source: Path,
     settings: Settings,
     paths: RunPaths,
@@ -281,7 +276,7 @@ def _analyze_created_run(
             aggregate / "SUMMARY.txt",
             _summary_context(
                 audit=audit,
-                ch_observed=ch_observed,
+                ch_filename_date=ch_filename_date,
                 judgments=judgments,
                 matches=matches,
                 settings=settings,
@@ -311,7 +306,7 @@ def _analyze_created_run(
     manifest = _run_manifest(
         paths=paths,
         observed=observed,
-        ch_observed=ch_observed,
+        ch_filename_date=ch_filename_date,
         audit=audit,
         ch_index=ch_index,
         settings=settings,
@@ -716,7 +711,7 @@ def _prediction_tables(
 def _summary_context(
     *,
     audit: DataAudit,
-    ch_observed: pd.Timestamp,
+    ch_filename_date: pd.Timestamp | None,
     judgments: pd.DataFrame,
     matches: pd.DataFrame,
     settings: Settings,
@@ -732,7 +727,11 @@ def _summary_context(
     denominator = int(len(target_matches))
     return {
         "observation_date": audit.observation_date,
-        "companies_house_date": ch_observed.date().isoformat(),
+        "companies_house_filename_date": (
+            ch_filename_date.date().isoformat()
+            if ch_filename_date is not None
+            else "unknown"
+        ),
         "data_construct": audit.data_construct,
         "optional_fields": {
             "Satisfaction Date": {
@@ -784,7 +783,7 @@ def _run_manifest(
     *,
     paths: RunPaths,
     observed: pd.Timestamp,
-    ch_observed: pd.Timestamp,
+    ch_filename_date: pd.Timestamp | None,
     audit: DataAudit,
     ch_index: CHIndex,
     settings: Settings,
@@ -797,13 +796,16 @@ def _run_manifest(
     prediction_status: str,
 ) -> dict[str, Any]:
     return {
-        "schema_version": 7,
+        "schema_version": 8,
         "status": "CONFIDENTIAL - SEND ONLY TO EDWIN",
         "run_id": paths.root.name,
         "schema_construct": audit.data_construct,
         "observation_date": observed.date().isoformat(),
-        "companies_house_snapshot_date": ch_observed.date().isoformat(),
-        "companies_house_snapshot_lag_days": int((observed - ch_observed).days),
+        "companies_house_filename_date": (
+            ch_filename_date.date().isoformat()
+            if ch_filename_date is not None
+            else None
+        ),
         "fingerprints": {
             "rt_raw_file": audit.raw_source_sha256,
             "rt_raw_header_schema": audit.raw_header_schema_sha256,
@@ -981,26 +983,14 @@ def _verify_artifact_manifest(results: Path) -> tuple[Path, ...]:
     return (manifest_path, *(results / name for name in sorted(expected)))
 
 
-def _validate_ch_snapshot(
-    path: Path, observed: pd.Timestamp, ch_observed: pd.Timestamp
-) -> None:
-    lag = int((observed - ch_observed).days)
-    if lag < 0:
-        raise RunFailure("Companies House file date is after the RT extract date")
-    if lag > MAX_CH_SNAPSHOT_LAG_DAYS:
-        raise RunFailure(
-            f"Companies House file is more than {MAX_CH_SNAPSHOT_LAG_DAYS} days "
-            "older than the RT extract"
-        )
+def _companies_house_filename_date(path: Path) -> pd.Timestamp | None:
     embedded = sorted(set(re.findall(r"(?<!\d)(20\d{2}-\d{2}-\d{2})(?!\d)", path.name)))
-    if not embedded:
-        raise RunFailure(
-            "Companies House filename must contain its date as YYYY-MM-DD"
-        )
-    if len(embedded) > 1:
-        raise RunFailure(f"Companies House filename contains conflicting dates: {embedded}")
-    if embedded and pd.Timestamp(embedded[0]).normalize() != ch_observed:
-        raise RunFailure("Companies House file date does not match its filename")
+    if len(embedded) != 1:
+        return None
+    try:
+        return pd.Timestamp(embedded[0]).normalize()
+    except (TypeError, ValueError):
+        return None
 
 
 def _package_versions() -> dict[str, str]:
@@ -1114,7 +1104,6 @@ def _build_parser() -> argparse.ArgumentParser:
     analyze_parser.add_argument("--judgments", required=True)
     analyze_parser.add_argument("--companies-house", required=True)
     analyze_parser.add_argument("--observation-date", required=True)
-    analyze_parser.add_argument("--companies-house-date", required=True)
     analyze_parser.add_argument("--settings", default="settings.toml")
     analyze_parser.add_argument("--output-base", default="outputs")
     return parser
@@ -1160,7 +1149,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             judgments_path=args.judgments,
             companies_house_path=args.companies_house,
             observation_date=args.observation_date,
-            companies_house_date=args.companies_house_date,
             settings_path=args.settings,
             output_base=args.output_base,
         )

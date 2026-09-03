@@ -21,6 +21,7 @@ from recovery.matching import (
 )
 from recovery.run import (
     RunFailure,
+    _companies_house_filename_date,
     _elapsed_updates,
     _format_elapsed,
     analyze,
@@ -46,8 +47,6 @@ class RunTests(unittest.TestCase):
             "--companies-house",
             "BasicCompanyData-2026-08-01.zip",
             "--observation-date",
-            "2026-08-01",
-            "--companies-house-date",
             "2026-08-01",
         ]
         with (
@@ -93,8 +92,6 @@ class RunTests(unittest.TestCase):
             "BasicCompanyData-2026-08-01.zip",
             "--observation-date",
             "2026-08-01",
-            "--companies-house-date",
-            "2026-08-01",
         ]
         with (
             patch("recovery.run.analyze", side_effect=RunFailure("test failure")),
@@ -126,8 +123,6 @@ class RunTests(unittest.TestCase):
             "BasicCompanyData-2026-08-01.zip",
             "--observation-date",
             "2026-08-01",
-            "--companies-house-date",
-            "2026-08-01",
         ]
         with (
             patch("recovery.run.analyze", return_value=paths),
@@ -158,7 +153,6 @@ class RunTests(unittest.TestCase):
                 judgments_path=judgments,
                 companies_house_path=companies,
                 observation_date=bundle.observation_date,
-                companies_house_date=bundle.observation_date,
                 settings_path=ROOT / "settings.toml",
                 output_base=root / "outputs",
                 run_id="matching_only",
@@ -209,7 +203,11 @@ class RunTests(unittest.TestCase):
             manifest = json.loads(
                 (paths.results / "E5_run_manifest.json").read_text(encoding="utf-8")
             )
-            self.assertEqual(manifest["schema_version"], 7)
+            self.assertEqual(manifest["schema_version"], 8)
+            self.assertEqual(
+                manifest["companies_house_filename_date"],
+                pd.Timestamp(bundle.observation_date).date().isoformat(),
+            )
             self.assertEqual(
                 manifest["matching_rule"],
                 "unique_date_valid_exact_normalized_name_v1",
@@ -237,7 +235,6 @@ class RunTests(unittest.TestCase):
                 judgments_path=judgments,
                 companies_house_path=companies,
                 observation_date=bundle.observation_date,
-                companies_house_date=bundle.observation_date,
                 settings_path=ROOT / "settings.toml",
                 output_base=root / "outputs",
                 run_id="longitudinal",
@@ -285,7 +282,6 @@ class RunTests(unittest.TestCase):
                 judgments_path=judgments,
                 companies_house_path=companies,
                 observation_date=bundle.observation_date,
-                companies_house_date=bundle.observation_date,
                 settings_path=ROOT / "settings.toml",
                 output_base=root / "outputs",
                 run_id="fallback",
@@ -316,7 +312,6 @@ class RunTests(unittest.TestCase):
                 judgments_path=judgments,
                 companies_house_path=companies,
                 observation_date=bundle.observation_date,
-                companies_house_date=bundle.observation_date,
                 settings_path=ROOT / "settings.toml",
                 output_base=root / "outputs",
                 run_id="unparseable_event",
@@ -340,7 +335,6 @@ class RunTests(unittest.TestCase):
                 judgments_path=judgments,
                 companies_house_path=companies,
                 observation_date=bundle.observation_date,
-                companies_house_date=bundle.observation_date,
                 settings_path=ROOT / "settings.toml",
                 output_base=root / "outputs",
                 run_id="unknown_outcome_header",
@@ -382,7 +376,6 @@ class RunTests(unittest.TestCase):
                 judgments_path=judgments,
                 companies_house_path=companies,
                 observation_date=bundle.observation_date,
-                companies_house_date=bundle.observation_date,
                 settings_path=ROOT / "settings.toml",
                 output_base=root / "outputs",
                 run_id="target_only",
@@ -593,7 +586,6 @@ class RunTests(unittest.TestCase):
                     judgments_path=judgments,
                     companies_house_path=companies,
                     observation_date=bundle.observation_date,
-                    companies_house_date=bundle.observation_date,
                     settings_path=ROOT / "settings.toml",
                     output_base=root / "outputs",
                     run_id=empty_arm,
@@ -610,7 +602,7 @@ class RunTests(unittest.TestCase):
                     len(unmatched if empty_arm == "accepted" else accepted), 100
                 )
 
-    def test_undated_companies_house_filename_stops_before_output(self) -> None:
+    def test_companies_house_filename_date_is_optional(self) -> None:
         with TemporaryDirectory() as temporary:
             root = Path(temporary)
             bundle = make_synthetic_bundle(1_600, include_prior_rows=False)
@@ -620,16 +612,32 @@ class RunTests(unittest.TestCase):
             companies = dated_companies.with_name("companies-house.zip")
             dated_companies.rename(companies)
             output_base = root / "outputs"
-            with self.assertRaisesRegex(RunFailure, "filename must contain"):
-                analyze(
-                    judgments_path=judgments,
-                    companies_house_path=companies,
-                    observation_date=bundle.observation_date,
-                    companies_house_date=bundle.observation_date,
-                    settings_path=ROOT / "settings.toml",
-                    output_base=output_base,
-                )
-            self.assertFalse(output_base.exists())
+            paths = analyze(
+                judgments_path=judgments,
+                companies_house_path=companies,
+                observation_date=bundle.observation_date,
+                settings_path=ROOT / "settings.toml",
+                output_base=output_base,
+            )
+            summary = (paths.results / "SUMMARY.txt").read_text(encoding="utf-8")
+            manifest = json.loads(
+                (paths.results / "E5_run_manifest.json").read_text(encoding="utf-8")
+            )
+            self.assertIn("Companies House filename date  unknown", summary)
+            self.assertIsNone(manifest["companies_house_filename_date"])
+
+    def test_companies_house_filename_date_is_inferred_only_when_clear(self) -> None:
+        self.assertEqual(
+            _companies_house_filename_date(Path("BasicCompanyData-2026-08-01.zip")),
+            pd.Timestamp("2026-08-01"),
+        )
+        for name in (
+            "BasicCompanyData.zip",
+            "BasicCompanyData-2026-99-99.zip",
+            "BasicCompanyData-2026-07-01-to-2026-08-01.zip",
+        ):
+            with self.subTest(name=name):
+                self.assertIsNone(_companies_house_filename_date(Path(name)))
 
     def test_unsafe_final_report_is_not_copied(self) -> None:
         with TemporaryDirectory() as temporary:
@@ -653,7 +661,6 @@ class RunTests(unittest.TestCase):
                     judgments_path=judgments,
                     companies_house_path=companies,
                     observation_date=bundle.observation_date,
-                    companies_house_date=bundle.observation_date,
                     settings_path=ROOT / "settings.toml",
                     output_base=root / "outputs",
                     run_id="unsafe",

@@ -635,7 +635,8 @@ def _write_matching_summary(path: str | Path, context: dict[str, Any]) -> None:
         "=============",
         "Status                        ANALYSIS COMPLETE",
         f"RT extract date                {context.get('observation_date', 'unknown')}",
-        f"Companies House file date      {context.get('companies_house_date', 'unknown')}",
+        "Companies House filename date  "
+        f"{context.get('companies_house_filename_date', 'unknown')}",
         f"File structure                 {file_structure}",
         "Stock or historical extract    not established by the file columns",
         "",

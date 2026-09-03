@@ -55,7 +55,6 @@ jobs:
           @(
             '"ci inputs !\synthetic judgments.xlsx"',
             '"ci inputs !\BasicCompanyDataAsOneFile-2026-06-01.zip"',
-            "2026-06-01",
             "2026-06-01"
           ) | Set-Content "ci inputs !\answers.txt" -Encoding ascii
           cmd.exe /d /c 'RUN.bat < "ci inputs !\answers.txt"'
@@ -137,7 +136,7 @@ jobs:
           Push-Location $root.FullName
           try {
             python -m recovery.selftest --write-inputs "archive inputs" --n-companies 8000 --no-prior-rows --event-dates
-            cmd.exe /d /c 'RUN.bat "archive inputs\synthetic judgments.xlsx" "archive inputs\BasicCompanyDataAsOneFile-2026-06-01.zip" 2026-06-01 2026-06-01 outputs'
+            cmd.exe /d /c 'RUN.bat "archive inputs\synthetic judgments.xlsx" "archive inputs\BasicCompanyDataAsOneFile-2026-06-01.zip" 2026-06-01 outputs'
             if ($LASTEXITCODE -ne 0) { throw "GitHub archive run failed" }
             $archiveRun = Get-ChildItem outputs -Directory -Filter "run_*" | Select-Object -First 1
             $archiveZip = Get-ChildItem outputs -File -Filter "SEND_TO_EDWIN_*.zip" | Select-Object -First 1
@@ -174,7 +173,7 @@ jobs:
           python -m pip install --require-hashes --only-binary=:all: -r requirements.lock
           python -m recovery.selftest --write-inputs "scale inputs !" --n-companies 500000 --format csv --no-prior-rows --event-dates
           $started = Get-Date
-          cmd.exe /d /c 'RUN.bat "scale inputs !\synthetic judgments.csv" "scale inputs !\BasicCompanyDataAsOneFile-2026-06-01.zip" 2026-06-01 2026-06-01 "scale outputs !"'
+          cmd.exe /d /c 'RUN.bat "scale inputs !\synthetic judgments.csv" "scale inputs !\BasicCompanyDataAsOneFile-2026-06-01.zip" 2026-06-01 "scale outputs !"'
           if ($LASTEXITCODE -ne 0) { throw "500,000-row run failed" }
           $elapsed = ((Get-Date) - $started).TotalSeconds
           if ($elapsed -ge 10800) { throw "500,000-row run exceeded three hours" }

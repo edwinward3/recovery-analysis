@@ -44,8 +44,7 @@ if errorlevel 1 goto run_failed
 set "JUDGMENTS=%~1"
 set "COMPANIES=%~2"
 set "OBSERVATION=%~3"
-set "CH_DATE=%~4"
-set "OUTPUT_BASE=%~5"
+set "OUTPUT_BASE=%~4"
 set "INTERACTIVE="
 
 if defined JUDGMENTS goto have_judgments
@@ -65,16 +64,14 @@ if not exist "%COMPANIES%" goto missing_companies
 
 if not defined INTERACTIVE goto arguments_ready
 if not defined OBSERVATION set /p "OBSERVATION=RT extract date YYYY-MM-DD (required): "
-if not defined CH_DATE set /p "CH_DATE=Companies House file date YYYY-MM-DD (required): "
 
 :arguments_ready
 if not defined OBSERVATION goto missing_observation
-if not defined CH_DATE goto missing_ch_date
 if not defined OUTPUT_BASE set "OUTPUT_BASE=outputs"
 
 echo.
 echo Checking the files and matching companies...
-".venv\Scripts\python.exe" -m recovery.run analyze --judgments "%JUDGMENTS%" --companies-house "%COMPANIES%" --observation-date "%OBSERVATION%" --companies-house-date "%CH_DATE%" --settings "settings.toml" --output-base "%OUTPUT_BASE%"
+".venv\Scripts\python.exe" -m recovery.run analyze --judgments "%JUDGMENTS%" --companies-house "%COMPANIES%" --observation-date "%OBSERVATION%" --settings "settings.toml" --output-base "%OUTPUT_BASE%"
 if errorlevel 1 goto run_failed
 
 :run_succeeded
@@ -112,11 +109,6 @@ goto stop
 :missing_observation
 echo.
 echo STOP: The RT extract date is required in YYYY-MM-DD format.
-goto stop
-
-:missing_ch_date
-echo.
-echo STOP: The Companies House file date is required in YYYY-MM-DD format.
 goto stop
 
 :run_failed
