@@ -176,6 +176,37 @@ def test_prediction_outputs_only_deterministic_aggregate_tables() -> None:
         pd.testing.assert_frame_equal(first[name], second[name])
 
 
+def test_final_test_labels_do_not_change_fitted_predictions(monkeypatch) -> None:
+    cohort = _cohort()
+    last_date = cohort["index_date"].eq(cohort["index_date"].max())
+    cohort.loc[last_date, "cancelled_within_12_months"] = 0
+    changed = cohort.copy()
+    changed.loc[last_date, "satisfied_within_12_months"] = (
+        1 - changed.loc[last_date, "satisfied_within_12_months"]
+    )
+    captured = []
+
+    def capture(outcome, cancellation, companies, predictions, **kwargs):
+        captured.append((
+            outcome.copy(), companies.copy(),
+            {name: values.copy() for name, values in predictions.items()},
+        ))
+        return {}
+
+    monkeypatch.setattr("recovery.prediction._aggregate_evaluation", capture)
+    for frame in (cohort, changed):
+        result = run_12_month_prediction(
+            frame, feature_columns=FEATURES, min_nontrain_class=10,
+        )
+        assert result["gate"]["status"].eq("pass").all()
+
+    assert len(captured) == 2
+    assert np.any(captured[0][0] != captured[1][0])
+    np.testing.assert_array_equal(captured[0][1], captured[1][1])
+    for name in MODEL_NAMES:
+        np.testing.assert_array_equal(captured[0][2][name], captured[1][2][name])
+
+
 def test_landmark_builder_derives_only_locked_point_in_time_features() -> None:
     judgments = pd.DataFrame(
         {

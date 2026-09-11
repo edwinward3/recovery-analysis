@@ -383,22 +383,43 @@ def _normalise_coded_columns(frame: pd.DataFrame) -> None:
         frame[column] = canonical.astype(str)
 
 
+def parse_dates(series: pd.Series) -> pd.Series:
+    raw = series.astype("string").fillna("").str.strip()
+    # Keep the calendar date written in timestamped fields.
+    raw = raw.str.replace(
+        r"(?i)([ T]\d{2}(?::?\d{2}(?::?\d{2}(?:\.\d+)?)?)?)"
+        r"\s*(?:Z|UTC|GMT|[+-](?:[01]\d|2[0-3])(?::?[0-5]\d)?)$",
+        r"\1",
+        regex=True,
+    )
+    year_first = raw.str.fullmatch(
+        r"\d{4}(?:[-/]\d{1,2}[-/]\d{1,2}|\d{4})(?:[ T].*)?",
+        na=False,
+    )
+    parsed = pd.Series(pd.NaT, index=series.index, dtype="datetime64[ns]")
+    for mask, date_format in ((year_first, "ISO8601"), (~year_first, "mixed")):
+        if not mask.any():
+            continue
+        dates = pd.to_datetime(
+            raw.loc[mask],
+            format=date_format,
+            dayfirst=date_format == "mixed",
+            errors="coerce",
+            utc=True,
+        ).dt.tz_localize(None).dt.normalize()
+        dates = dates.where(
+            dates.between(pd.Timestamp.min.ceil("D"), pd.Timestamp.max.floor("D"))
+        )
+        parsed.loc[mask] = dates.astype("datetime64[ns]")
+    return parsed
+
+
 def _parse_required_date(frame: pd.DataFrame, column: str) -> pd.Series:
-    raw = frame[column].astype("string").fillna("").str.strip()
-    iso = raw.str.fullmatch(r"\d{4}-\d{2}-\d{2}(?:[ T].*)?", na=False)
-    parsed = pd.Series(pd.NaT, index=frame.index, dtype="datetime64[ns]")
-    if iso.any():
-        parsed.loc[iso] = pd.to_datetime(
-            raw.loc[iso], format="ISO8601", errors="coerce"
-        ).astype("datetime64[ns]")
-    if (~iso).any():
-        parsed.loc[~iso] = pd.to_datetime(
-            raw.loc[~iso], format="mixed", dayfirst=True, errors="coerce"
-        ).astype("datetime64[ns]")
+    parsed = parse_dates(frame[column])
     invalid = parsed.isna()
     if invalid.any():
         raise ValueError(f"{column} has {int(invalid.sum())} missing or unparseable row(s)")
-    return parsed.dt.normalize()
+    return parsed
 
 
 def _parse_optional_date(
@@ -406,21 +427,9 @@ def _parse_optional_date(
 ) -> tuple[pd.Series, pd.Series]:
     raw = frame[column].astype("string").fillna("").str.strip()
     populated = raw.ne("")
-    parsed = pd.Series(pd.NaT, index=frame.index, dtype="datetime64[ns]")
-    if populated.any():
-        iso = raw.str.fullmatch(r"\d{4}-\d{2}-\d{2}(?:[ T].*)?", na=False)
-        iso_populated = populated & iso
-        other_populated = populated & ~iso
-        if iso_populated.any():
-            parsed.loc[iso_populated] = pd.to_datetime(
-                raw.loc[iso_populated], format="ISO8601", errors="coerce"
-            ).astype("datetime64[ns]")
-        if other_populated.any():
-            parsed.loc[other_populated] = pd.to_datetime(
-                raw.loc[other_populated], format="mixed", dayfirst=True, errors="coerce"
-            ).astype("datetime64[ns]")
+    parsed = parse_dates(raw)
     invalid = populated & parsed.isna()
-    return parsed.dt.normalize(), invalid
+    return parsed, invalid
 
 
 def _validate_optional_timing(
@@ -769,5 +778,6 @@ __all__ = [
     "RT_COLUMNS",
     "frame_fingerprint",
     "iter_ch_chunks",
+    "parse_dates",
     "read_rt_extract",
 ]

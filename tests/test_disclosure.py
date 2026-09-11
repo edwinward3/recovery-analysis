@@ -57,6 +57,18 @@ class DisclosureTests(unittest.TestCase):
         self.assertEqual(cleaned.loc[1, "rows"], 20)
         self.assertEqual(suppressed, 0)
 
+    def test_small_registration_support_hides_all_statistics(self) -> None:
+        frame = pd.DataFrame({
+            "rows": [1],
+            "calendar_day_lag_median": [3.0],
+            "calendar_day_lag_p95": [3.0],
+            "calendar_day_lag_max": [3],
+        })
+
+        cleaned, _ = suppress_small_cells(frame, count_columns="rows")
+
+        self.assertTrue(cleaned.isna().all().all())
+
     def test_grouped_total_gets_one_complementary_suppression(self) -> None:
         frame = pd.DataFrame(
             {
@@ -333,6 +345,96 @@ class DisclosureTests(unittest.TestCase):
                     root / "egress",
                     allowlist={"working_files/pairs.csv": "n"},
                 )
+
+    def test_linkage_dimensions_are_suppressed_across_both_reports(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "candidate"
+            source.mkdir()
+            comparison = pd.DataFrame({
+                "population": ["linked", "linked", "unlinked", "unlinked"],
+                "dimension": ["status"] * 4,
+                "value": ["Satisfied", "Unsatisfied"] * 2,
+                "rows": [1, 99, 19, 81],
+                "population_rows": [100] * 4,
+                "share": [0.01, 0.99, 0.19, 0.81],
+            })
+            comparison.to_csv(source / "E2_population_comparison.csv", index=False)
+            profile = comparison.rename(columns={
+                "population": "linkage_group", "dimension": "measure",
+                "value": "band", "share": "share_within_linkage_group",
+            }).drop(columns="population_rows")
+            profile["measure"] = "judgment_status"
+            profile.to_csv(source / "E2_linkage_profile.csv", index=False)
+            stage_egress(source, root / "egress", allowlist={
+                "E2_population_comparison.csv": ("rows", "population_rows"),
+                "E2_linkage_profile.csv": "rows",
+            })
+
+            for name, columns in (
+                ("E2_population_comparison.csv", ["rows", "population_rows", "share"]),
+                ("E2_linkage_profile.csv", ["rows", "share_within_linkage_group"]),
+            ):
+                table = pd.read_csv(root / "egress" / name)
+                self.assertTrue(table[columns].isna().all().all())
+
+    def test_small_linkage_arm_hides_subtotals_in_other_tables(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "candidate"
+            source.mkdir()
+            pd.DataFrame({"tier": ["exact_unique", "unmatched"], "rows": [95, 5]}).to_csv(
+                source / "E2_match_coverage.csv", index=False
+            )
+            pd.DataFrame({"matched_on": ["company_name"], "rows": [95]}).to_csv(
+                source / "E2_match_methods.csv", index=False
+            )
+            pd.DataFrame({"stage": ["start"], "rows": [95], "companies": [95]}).to_csv(
+                source / "E4_cohort_flow.csv", index=False
+            )
+            stage_egress(source, root / "egress", allowlist={
+                "E2_match_coverage.csv": "rows",
+                "E2_match_methods.csv": "rows",
+                "E4_cohort_flow.csv": ("rows", "companies"),
+            })
+
+            for name in ("E2_match_methods.csv", "E4_cohort_flow.csv"):
+                table = pd.read_csv(root / "egress" / name)
+                self.assertTrue(table["rows"].isna().all())
+
+    def test_sparse_joint_and_quarter_breakdowns_cannot_use_public_marginals(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "candidate"
+            source.mkdir()
+            pd.DataFrame({
+                "dimension": ["JudgmentStatus"] * 2
+                + ["status_x_type_x_jurisdiction_x_vintage"] * 4,
+                "value": ["Satisfied", "Unsatisfied", "one", "two", "three", "four"],
+                "rows": [20, 180, 1, 99, 19, 81],
+            }).to_csv(source / "E1_data_audit.csv", index=False)
+            pd.DataFrame({
+                "horizon_months": [12] * 6,
+                "judgment_cohort": ["all"] * 2 + ["2024Q1"] * 2 + ["2024Q2"] * 2,
+                "status": ["Satisfied", "Unsatisfied"] * 3,
+                "rows": [20, 180, 1, 99, 19, 81],
+            }).to_csv(source / "E3_fixed_horizon.csv", index=False)
+            pd.DataFrame({
+                "dimension": ["overall"] * 2 + ["judgment_quarter"] * 4,
+                "stratum": ["all"] * 2 + ["2024Q1"] * 2 + ["2024Q2"] * 2,
+                "status": ["Satisfied", "Unsatisfied"] * 3,
+                "rows": [20, 180, 1, 99, 19, 81],
+            }).to_csv(source / "E3_status_at_extract.csv", index=False)
+            stage_egress(source, root / "egress", allowlist={
+                "E1_data_audit.csv": "rows",
+                "E3_fixed_horizon.csv": "rows",
+                "E3_status_at_extract.csv": "rows",
+            })
+
+            for name in ("E1_data_audit.csv", "E3_fixed_horizon.csv", "E3_status_at_extract.csv"):
+                table = pd.read_csv(root / "egress" / name)
+                self.assertEqual(table.loc[:1, "rows"].tolist(), [20, 180])
+                self.assertTrue(table.loc[2:, "rows"].isna().all())
 
 
 if __name__ == "__main__":

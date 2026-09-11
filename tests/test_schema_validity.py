@@ -70,11 +70,16 @@ def test_sample_schema_is_explicitly_cross_sectional_and_needs_no_event_dates(
     }.issubset(audit.absent_optional_columns)
 
 
+@pytest.mark.parametrize(
+    "value",
+    ["not a date", "0001-01-01", "9999-12-31", "2024-03-01T00:00:00+25:00"],
+)
 def test_unparseable_optional_date_is_kept_as_a_counted_outcome_issue(
     tmp_path: Path,
+    value: str,
 ) -> None:
     row = _row(status="Satisfied")
-    row["Satisfaction Date"] = "not a date"
+    row["Satisfaction Date"] = value
 
     frame, audit = read_rt_extract(
         _write(tmp_path / "bad-optional-date.csv", [row]), OBSERVED
@@ -83,6 +88,56 @@ def test_unparseable_optional_date_is_kept_as_a_counted_outcome_issue(
     assert pd.isna(frame.loc[0, "Satisfaction Date"])
     assert bool(frame.loc[0, "_invalid_satisfaction_date"])
     assert audit.outcome_issues["satisfaction_date_unparseable"] == 1
+
+
+@pytest.mark.parametrize("suffix", [".csv", ".xlsx"])
+def test_mixed_date_formats_preserve_recorded_calendar_days(
+    tmp_path: Path, suffix: str,
+) -> None:
+    if suffix == ".xlsx":
+        pytest.importorskip("openpyxl")
+    formats = [
+        "%Y-%m-%d",
+        "%d/%m/%Y",
+        "%Y/%m/%d",
+        "%Y%m%d",
+        "%Y-%m-%dT00:00:00Z",
+        "%Y-%m-%dT00:00:00+01:00",
+        "%Y-%m-%dT23:30:00-05:00",
+        "%d/%m/%Y 00:00:00+01:00",
+    ]
+    rows = []
+    for position, date_format in enumerate(formats):
+        row = _row(f"J-{position}", status="Satisfied")
+        row["JudgmentDate"] = pd.Timestamp("2024-03-01").strftime(date_format)
+        row["Date Inserted"] = pd.Timestamp("2024-03-02").strftime(date_format)
+        row["DateSatisfied"] = pd.Timestamp("2024-05-01").strftime(date_format)
+        rows.append(row)
+    path = tmp_path / f"mixed-dates{suffix}"
+    source = pd.DataFrame(rows)
+    if suffix == ".csv":
+        source.to_csv(path, index=False)
+    else:
+        source.to_excel(path, index=False)
+
+    frame, audit = read_rt_extract(path, OBSERVED)
+
+    assert frame["JudgmentDate"].eq(pd.Timestamp("2024-03-01")).all()
+    assert frame["Date Inserted"].eq(pd.Timestamp("2024-03-02")).all()
+    assert frame["Satisfaction Date"].eq(pd.Timestamp("2024-05-01")).all()
+    assert frame["date_inserted_minus_judgment_days"].eq(1).all()
+    assert not audit.outcome_issues
+
+
+@pytest.mark.parametrize("value", ["0001-01-01", "9999-12-31"])
+def test_out_of_range_required_date_has_a_plain_validation_error(
+    tmp_path: Path, value: str,
+) -> None:
+    row = _row()
+    row["JudgmentDate"] = value
+
+    with pytest.raises(ValueError, match="JudgmentDate has 1 missing or unparseable"):
+        read_rt_extract(_write(tmp_path / "invalid-required-date.csv", [row]), OBSERVED)
 
 
 def test_event_and_snapshot_aliases_are_preserved_parsed_and_audited(
@@ -176,7 +231,7 @@ def test_exact_extra_headers_stay_internal_and_affect_schema_provenance(
         .loc[lambda table: table["dimension"].eq("source_column"), "value"]
     )
     assert "Source Batch -> <unrecognised>" not in public_columns
-    assert "extra_column_1 -> <unrecognised>" in public_columns
+    assert "extra_column_12 -> <unrecognised>" in public_columns
 
 
 def test_raw_file_hash_and_all_retained_columns_are_fingerprinted(tmp_path: Path) -> None:
@@ -227,7 +282,7 @@ def test_unrecognised_outcome_or_history_header_blocks_outcome_analysis(
         public_audit["dimension"].eq("outcome_or_history_header_not_recognised"),
         "value",
     ]
-    assert reported.tolist() == [header]
+    assert reported.tolist() == ["extra_column_12"]
 
 
 @pytest.mark.parametrize("suffix", [".csv", ".xlsx"])

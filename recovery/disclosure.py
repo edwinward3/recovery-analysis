@@ -86,13 +86,20 @@ _ASSOCIATED_ESTIMATE_TOKENS = frozenset(
         "confidence",
         "estimate",
         "hazard",
+        "improvement",
         "interval",
         "intercept",
         "lcl",
+        "lift",
         "lower",
+        "max",
+        "maximum",
         "mean",
         "median",
+        "min",
+        "minimum",
         "odds",
+        "p95",
         "percent",
         "precision",
         "probability",
@@ -291,6 +298,75 @@ def _associated_estimate_columns(
     )
 
 
+def _overlapping_breakdown_rows(root: Path, min_cell_n: int) -> dict[str, set[int]]:
+    masks: dict[str, set[int]] = {}
+    tables: dict[str, pd.DataFrame] = {}
+
+    def read(name: str) -> pd.DataFrame:
+        if name not in tables:
+            path = root / name
+            tables[name] = pd.read_csv(path) if path.is_file() else pd.DataFrame()
+        return tables[name]
+
+    def small(values: pd.Series) -> pd.Series:
+        counts = pd.to_numeric(values, errors="coerce")
+        return counts.gt(0) & counts.lt(min_cell_n)
+
+    def mark(name: str, affected: pd.Series) -> None:
+        masks.setdefault(name, set()).update(affected.index[affected].tolist())
+
+    coverage = read("E2_match_coverage.csv")
+    if "rows" in coverage and small(coverage["rows"]).any():
+        for path in sorted(root.glob("E[24]_*.csv")):
+            table = read(path.name)
+            masks[path.name] = set(range(len(table)))
+
+    dimensions = {
+        "judgment_status": "status",
+        "age_band_months": "age_band",
+    }
+    profiles = (
+        ("E2_linkage_profile.csv", "measure"),
+        ("E2_population_comparison.csv", "dimension"),
+    )
+    sensitive: set[str] = set()
+    for name, column in profiles:
+        table = read(name)
+        if {column, "rows"}.issubset(table):
+            labels = table[column].replace(dimensions)
+            sensitive.update(labels[small(table["rows"])].tolist())
+    for name, column in profiles:
+        table = read(name)
+        if column in table:
+            mark(name, table[column].replace(dimensions).isin(sensitive))
+
+    name = "E1_data_audit.csv"
+    table = read(name)
+    if {"dimension", "rows"}.issubset(table):
+        joint = table["dimension"].eq("status_x_type_x_jurisdiction_x_vintage")
+        if (joint & small(table["rows"])).any():
+            mark(name, joint)
+
+    name = "E3_status_at_extract.csv"
+    table = read(name)
+    if {"dimension", "rows"}.issubset(table):
+        quarters = table["dimension"].eq("judgment_quarter")
+        if (quarters & small(table["rows"])).any():
+            mark(name, quarters)
+
+    name = "E3_fixed_horizon.csv"
+    table = read(name)
+    if {"horizon_months", "judgment_cohort", "rows"}.issubset(table):
+        quarters = table["judgment_cohort"].ne("all")
+        count_columns = [column for column in table if column == "rows" or column.endswith("_rows")]
+        rare = pd.Series(False, index=table.index)
+        for column in count_columns:
+            rare |= small(table[column])
+        horizons = table.loc[quarters & rare, "horizon_months"]
+        mark(name, quarters & table["horizon_months"].isin(horizons))
+    return masks
+
+
 def scan_identifiers(
     root: str | Path,
     *,
@@ -385,6 +461,7 @@ def stage_egress(
             raise ValueError("small-cell count columns may only be assigned to CSV artefacts")
         policies.append((relative, counts))
 
+    protected_rows = _overlapping_breakdown_rows(source_root, min_cell_n)
     suppressed: list[tuple[str, int]] = []
     staged_names = tuple(str(relative) for relative, _ in policies)
     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -394,11 +471,19 @@ def stage_egress(
             target = staging / relative
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(source_root / relative, target)
-            if count_columns:
+            extra_rows = protected_rows.get(relative.as_posix(), set())
+            if count_columns or extra_rows:
                 frame = pd.read_csv(target)
-                cleaned, removed = suppress_small_cells(
-                    frame, count_columns=count_columns, min_cell_n=min_cell_n
-                )
+                if count_columns:
+                    cleaned, _ = suppress_small_cells(
+                        frame, count_columns=count_columns, min_cell_n=min_cell_n
+                    )
+                else:
+                    cleaned = frame.copy()
+                if extra_rows:
+                    columns = (*count_columns, *_associated_estimate_columns(frame, set(count_columns), set()))
+                    cleaned.loc[sorted(extra_rows), list(columns)] = pd.NA
+                removed = int((frame.notna() & cleaned.isna()).any(axis=1).sum())
                 cleaned.to_csv(target, index=False)
                 if removed:
                     suppressed.append((str(relative), removed))

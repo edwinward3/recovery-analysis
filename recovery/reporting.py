@@ -287,11 +287,9 @@ def build_data_audit_counts(
     support = int(len(frame))
     raw_schema = tuple(getattr(audit, "raw_header_schema", ())) if audit else ()
     if raw_schema:
-        extra_position = 0
-        for original, standardised in raw_schema:
+        for position, (original, standardised) in enumerate(raw_schema, start=1):
             if standardised == "<unrecognised>":
-                extra_position += 1
-                original = f"extra_column_{extra_position}"
+                original = f"extra_column_{position}"
             rows.append(
                 {
                     "dimension": "source_column",
@@ -337,11 +335,17 @@ def build_data_audit_counts(
                     "share": 1.0,
                 }
             )
-        for column in getattr(audit, "unknown_decisive_headers", ()):
+        header_positions = {
+            original: position
+            for position, (original, _) in enumerate(raw_schema, start=1)
+        }
+        for fallback_position, column in enumerate(
+            getattr(audit, "unknown_decisive_headers", ()), start=1
+        ):
             rows.append(
                 {
                     "dimension": "outcome_or_history_header_not_recognised",
-                    "value": str(column),
+                    "value": f"extra_column_{header_positions.get(column, fallback_position)}",
                     "rows": support,
                     "share": 1.0,
                 }
@@ -415,7 +419,8 @@ def build_data_audit_counts(
                 rows.append(
                     {
                         "dimension": f"{column} minus JudgmentDate {statistic}",
-                        "value": str(value),
+                        "value": "",
+                        "estimate": value,
                         "rows": event_support,
                         "share": event_support / max(support, 1),
                     }
@@ -845,9 +850,11 @@ def _redact_small_count(value: Any, min_cell_n: int) -> Any:
 
 
 def _public_run_log(log: pd.DataFrame, min_cell_n: int) -> pd.DataFrame:
-    public = log.copy()
-    for column in _RUN_LOG_COUNT_COLUMNS & set(public.columns):
-        public[column] = public[column].map(
+    public = log.drop(
+        columns=list((_RUN_LOG_COUNT_COLUMNS - {"suppressed_rows"}) & set(log.columns))
+    ).copy()
+    if "suppressed_rows" in public:
+        public["suppressed_rows"] = public["suppressed_rows"].map(
             lambda value: _redact_small_count(value, min_cell_n)
         )
     return public
@@ -857,11 +864,7 @@ def _public_manifest(manifest: dict[str, Any], min_cell_n: int) -> dict[str, Any
     """Redact small counts from the public run details."""
 
     public = deepcopy(manifest)
-    stats = public.get("ch_index_stats", {})
-    if isinstance(stats, dict):
-        for key, value in list(stats.items()):
-            if key != "analysis_fingerprint":
-                stats[key] = _redact_small_count(value, min_cell_n)
+    public.pop("ch_index_stats", None)
 
     disclosure = public.get("disclosure", {})
     suppressed = disclosure.get("suppressed_rows", []) if isinstance(disclosure, dict) else []

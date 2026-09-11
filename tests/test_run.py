@@ -203,7 +203,7 @@ class RunTests(unittest.TestCase):
             manifest = json.loads(
                 (paths.results / "E5_run_manifest.json").read_text(encoding="utf-8")
             )
-            self.assertEqual(manifest["schema_version"], 8)
+            self.assertEqual(manifest["schema_version"], 9)
             self.assertEqual(
                 manifest["companies_house_filename_date"],
                 pd.Timestamp(bundle.observation_date).date().isoformat(),
@@ -263,6 +263,71 @@ class RunTests(unittest.TestCase):
                 names = {entry.filename for entry in package.infolist()}
             self.assertFalse(any("working_files" in name for name in names))
             self.assertFalse(any("linkage_validation" in name for name in names))
+
+    def test_satisfaction_export_without_cancellations_finishes_and_packages(self) -> None:
+        for excel in (False, True):
+            with self.subTest(excel=excel), TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                bundle = make_synthetic_bundle(
+                    200, include_prior_rows=False, include_event_dates=True
+                )
+                bundle.judgments = bundle.judgments.loc[
+                    bundle.judgments["JudgmentStatus"].ne("Cancelled")
+                ].drop(columns="Cancellation Date").rename(
+                    columns={"Satisfaction Date": "DateSatisfied"}
+                )
+                for column, date_format in (
+                    ("JudgmentDate", "%Y/%m/%d"),
+                    ("Date Inserted", "%Y%m%d"),
+                    ("DateSatisfied", "%Y-%m-%dT00:00:00+01:00"),
+                ):
+                    bundle.judgments[column] = pd.to_datetime(
+                        bundle.judgments[column], dayfirst=True, errors="coerce"
+                    ).dt.strftime(date_format)
+                judgments, dated_companies, _ = write_bundle(
+                    bundle, root / "inputs !", excel=excel
+                )
+                companies = dated_companies.rename(
+                    dated_companies.with_name("companies-house.zip")
+                )
+                output = root / "outputs !"
+                with patch("builtins.print") as printer:
+                    result = main([
+                        "analyze", "--judgments", str(judgments),
+                        "--companies-house", str(companies),
+                        "--observation-date", str(bundle.observation_date),
+                        "--settings", str(ROOT / "settings.toml"),
+                        "--output-base", str(output),
+                    ])
+                self.assertEqual(result, 0)
+                self.assertIn(call("RUN COMPLETE"), printer.call_args_list)
+                archive = next(output.glob("SEND_TO_EDWIN_*.zip"))
+                with zipfile.ZipFile(archive) as package:
+                    self.assertIsNone(package.testzip())
+                    names = package.namelist()
+                    self.assertFalse(any("working_files" in name for name in names))
+                    gate_name = next(name for name in names if name.endswith("/E3_outcome_gate.csv"))
+                    with package.open(gate_name) as handle:
+                        gate = pd.read_csv(handle)
+                    self.assertEqual(gate.loc[0, "selected_analysis"], "cross_sectional")
+                    self.assertTrue(gate.loc[0, "satisfaction_date_supplied"])
+                    self.assertFalse(gate.loc[0, "cancellation_date_supplied"])
+                    self.assertTrue(pd.isna(gate.loc[0, "landmark_at_risk_rows"]))
+                    self.assertFalse(any(name.endswith("/E4_model_performance.csv") for name in names))
+                    audit_name = next(name for name in names if name.endswith("/E1_data_audit.csv"))
+                    with package.open(audit_name) as handle:
+                        audit = pd.read_csv(handle)
+                    populated = audit.loc[
+                        audit["dimension"].eq("optional_field_populated")
+                        & audit["value"].eq("Satisfaction Date"), "rows"
+                    ]
+                    self.assertEqual(int(populated.iloc[0]), int(
+                        bundle.judgments["JudgmentStatus"].eq("Satisfied").sum()
+                    ))
+                self.assertEqual(
+                    archive.with_suffix(".zip.sha256").read_text().split(),
+                    [hashlib.sha256(archive.read_bytes()).hexdigest(), archive.name],
+                )
 
     def test_conflicting_event_dates_select_cross_sectional_fallback(self) -> None:
         with TemporaryDirectory() as temporary:
@@ -325,7 +390,9 @@ class RunTests(unittest.TestCase):
     def test_unknown_outcome_header_blocks_outcomes_without_stopping_run(self) -> None:
         with TemporaryDirectory() as temporary:
             root = Path(temporary)
-            bundle = make_synthetic_bundle(200, include_prior_rows=False)
+            bundle = make_synthetic_bundle(
+                200, include_prior_rows=False, include_event_dates=True
+            )
             bundle.judgments["Payment Confirmed At"] = ""
             judgments, companies, _ = write_bundle(
                 bundle, root / "inputs", excel=False
@@ -343,10 +410,13 @@ class RunTests(unittest.TestCase):
             outcome = pd.read_csv(paths.results / "E3_outcome_gate.csv")
             audit = pd.read_csv(paths.results / "E1_data_audit.csv")
             self.assertEqual(outcome.loc[0, "selected_analysis"], "blocked")
+            self.assertTrue(outcome.loc[0, [
+                "landmark_at_risk_rows", "mature_12_month_rows", "mature_24_month_rows"
+            ]].isna().all())
             self.assertFalse((paths.results / "E3_status_at_extract.csv").exists())
             self.assertFalse((paths.results / "E3_cumulative_incidence.csv").exists())
             self.assertIn(
-                "Payment Confirmed At",
+                f"extra_column_{len(bundle.judgments.columns)}",
                 set(
                     audit.loc[
                         audit["dimension"].eq(

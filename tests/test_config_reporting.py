@@ -12,6 +12,7 @@ import pandas as pd
 import pytest
 
 from recovery.config import Settings, load_settings
+from recovery.disclosure import suppress_small_cells
 from recovery.reporting import (
     RunRecorder,
     _fmt_count,
@@ -234,15 +235,15 @@ def test_output_dictionary_is_built_from_written_columns(tmp_path: Path) -> None
     assert "recorded satisfaction" in dictionary.loc["satisfaction_cif", "definition"]
 
 
-def test_public_e5_redacts_small_observed_counts(tmp_path: Path) -> None:
+def test_public_e5_does_not_duplicate_observed_counts(tmp_path: Path) -> None:
     recorder = RunRecorder(
         stages=[
             {
                 "stage": "E2_match",
                 "status": "ok",
-                "judgments_matched": 4,
-                "accepted_sample_rows": 3,
-                "unmatched_sample_rows": 0,
+                "judgments_matched": 95,
+                "accepted_sample_rows": 95,
+                "unmatched_sample_rows": 5,
                 "elapsed_seconds": 0.2,
                 "peak_memory_mb": 100.0,
             }
@@ -251,8 +252,9 @@ def test_public_e5_redacts_small_observed_counts(tmp_path: Path) -> None:
     manifest = {
         "schema_version": 1,
         "ch_index_stats": {
-            "ch_rows_read": 100,
-            "companies_retained": 3,
+            "ch_rows_retained": 101,
+            "companies_retained": 100,
+            "duplicate_company_rows": 1,
             "analysis_fingerprint": "a" * 64,
         },
         "disclosure": {
@@ -261,13 +263,11 @@ def test_public_e5_redacts_small_observed_counts(tmp_path: Path) -> None:
         },
     }
     write_e5(tmp_path, recorder, manifest, min_cell_n=10)
-    log = (tmp_path / "E5_run_log.csv").read_text(encoding="utf-8")
     public = json.loads((tmp_path / "E5_run_manifest.json").read_text())
-    assert "<10" in log
     run_log = pd.read_csv(tmp_path / "E5_run_log.csv", dtype="string")
-    assert run_log.loc[0, "accepted_sample_rows"] == "<10"
-    assert run_log.loc[0, "unmatched_sample_rows"] == "0"
-    assert public["ch_index_stats"]["companies_retained"] == "<10"
+    assert not {"judgments_matched", "accepted_sample_rows", "unmatched_sample_rows"}.intersection(run_log)
+    assert "elapsed_seconds" in run_log and "peak_memory_mb" in run_log
+    assert "ch_index_stats" not in public
     assert public["disclosure"]["suppressed_rows"][0]["rows"] == "<10"
 
 
@@ -294,6 +294,49 @@ def test_extra_input_heading_is_not_copied_to_public_audit() -> None:
     table = build_data_audit_counts(judgments, audit)
     assert "PRIVATE CLIENT NAME" not in table["value"].astype(str).tolist()
     assert "extra_column_1" in table["value"].astype(str).tolist()
+
+
+def test_unknown_outcome_heading_uses_its_original_column_position() -> None:
+    judgments = pd.DataFrame(
+        {
+            "JudgmentStatus": ["Unsatisfied"] * 10,
+            "DefendantType": ["Corporate"] * 10,
+            "Jurisdiction": ["England and Wales"] * 10,
+            "JudgmentDate": pd.to_datetime(["2024-01-01"] * 10),
+        }
+    )
+    private_header = "Payment recorded at 44 Orchard Road"
+    audit = type("Audit", (), {
+        "raw_header_schema": tuple((column, column) for column in judgments)
+        + ((private_header, "<unrecognised>"),),
+        "unknown_decisive_headers": (private_header,),
+    })()
+
+    table = build_data_audit_counts(judgments, audit)
+
+    assert private_header not in table.to_csv(index=False)
+    row = table.loc[table["dimension"].eq("outcome_or_history_header_not_recognised")]
+    assert row.iloc[0]["value"] == "extra_column_5"
+    assert "extra_column_5 -> <unrecognised>" in set(table["value"])
+
+
+def test_event_delay_estimates_are_hidden_with_small_support() -> None:
+    judgments = pd.DataFrame(
+        {
+            "JudgmentStatus": ["Satisfied"] + ["Unsatisfied"] * 9,
+            "DefendantType": ["Corporate"] * 10,
+            "Jurisdiction": ["England and Wales"] * 10,
+            "JudgmentDate": pd.to_datetime(["2024-01-01"] * 10),
+            "Satisfaction Date": pd.to_datetime(["2024-07-01"] + [None] * 9),
+        }
+    )
+    table = build_data_audit_counts(judgments, object())
+    cleaned, _ = suppress_small_cells(table, count_columns="rows")
+    estimates = cleaned.loc[cleaned["dimension"].str.startswith("Satisfaction Date minus")]
+
+    assert len(estimates) == 3
+    assert estimates["value"].eq("").all()
+    assert estimates[["rows", "estimate", "share"]].isna().all().all()
 
 
 def test_synthetic_dates_reproduce_rt_semantics(tmp_path: Path) -> None:

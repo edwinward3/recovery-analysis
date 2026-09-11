@@ -390,6 +390,53 @@ def test_companies_house_iso_dates_are_not_read_day_first(tmp_path: Path) -> Non
     assert matched.loc["J-ISO", "tier"] == "exact_unique"
 
 
+@pytest.mark.parametrize(
+    "date_format",
+    ["%Y/%m/%d", "%Y%m%d", "%Y-%m-%dT00:00:00+01:00"],
+)
+def test_companies_house_date_formats_preserve_name_validity(
+    tmp_path: Path, date_format: str,
+) -> None:
+    judgments = pd.DataFrame([
+        _rt_row("BEFORE", "Old Example Limited", "AA1 1AA", "28/02/2024"),
+        _rt_row("FORMER", "Old Example Limited", "AA1 1AA", "01/03/2024"),
+        _rt_row("CURRENT", "New Example Limited", "AA1 1AA", "02/03/2024"),
+    ])
+    company = _ch_row(
+        "00000001", "NEW EXAMPLE LIMITED", "AA1 1AA",
+        pd.Timestamp("2024-03-01").strftime(date_format),
+        former_name="OLD EXAMPLE LIMITED",
+        former_change=pd.Timestamp("2024-03-02").strftime(date_format),
+    )
+    judgments, ch_path = _write_inputs(tmp_path, judgments.to_dict("records"), [company])
+
+    matched = match_judgments(
+        judgments, build_relevant_ch_index(judgments, ch_path),
+    ).set_index("ID")
+
+    assert matched.loc["BEFORE", "tier"] == "unmatched"
+    assert matched.loc["FORMER", "matched_company_number"] == "00000001"
+    assert matched.loc["FORMER", "matched_name_kind"] == "former"
+    assert matched.loc["CURRENT", "matched_company_number"] == "00000001"
+    assert matched.loc["CURRENT", "matched_name_kind"] == "current"
+
+
+@pytest.mark.parametrize("invalid_date", ["0001-01-01", "9999-12-31"])
+def test_out_of_range_company_date_leaves_link_unverifiable(
+    tmp_path: Path, invalid_date: str,
+) -> None:
+    judgments, ch_path = _write_inputs(
+        tmp_path,
+        [_rt_row("J-1", "Example Limited", "AA1 1AA")],
+        [_ch_row("00000001", "EXAMPLE LIMITED", "AA1 1AA", invalid_date)],
+    )
+
+    matched = match_judgments(judgments, build_relevant_ch_index(judgments, ch_path))
+
+    assert matched.loc[0, "tier"] == "unmatched"
+    assert matched.loc[0, "reason"] == "exact_name_missing_incorporation_date"
+
+
 def test_date_valid_former_names_and_incorporation_guard(tmp_path: Path) -> None:
     judgment_rows = [
         _rt_row("J-FORMER", "Old Echo Limited", "EE1 1EE", "01/06/2020"),

@@ -396,11 +396,13 @@ def _evaluate_gate(
         ).min(axis=1)
     )
     at_risk = registered & ~early_cancellation & observable
-    mature_counts: dict[str, int] = {}
+    mature_counts: dict[str, int | None] = {}
     for months in FIXED_HORIZONS:
         cutoff = _add_calendar_months(frame["_landmark"], months)
-        mature_counts[f"mature_{months}_month_rows"] = int(
-            (at_risk & cutoff.le(extract) & cutoff.le(frame["_retention_end"])).sum()
+        mature_counts[f"mature_{months}_month_rows"] = (
+            int((at_risk & cutoff.le(extract) & cutoff.le(frame["_retention_end"])).sum())
+            if design == "longitudinal"
+            else None
         )
     return {
         "design": design,
@@ -408,7 +410,7 @@ def _evaluate_gate(
         "rows": int(len(frame)),
         "satisfaction_date_source_present": satisfaction_source,
         "cancellation_date_source_present": cancellation_source,
-        "landmark_at_risk_rows": int(at_risk.sum()),
+        "landmark_at_risk_rows": int(at_risk.sum()) if design == "longitudinal" else None,
         **mature_counts,
         "invalid_counts": invalid_counts,
         "reasons": reasons,
@@ -431,9 +433,9 @@ def outcome_validity_gate(
             "rows": int(len(judgments)),
             "satisfaction_date_source_present": False,
             "cancellation_date_source_present": False,
-            "landmark_at_risk_rows": 0,
-            "mature_12_month_rows": 0,
-            "mature_24_month_rows": 0,
+            "landmark_at_risk_rows": None,
+            "mature_12_month_rows": None,
+            "mature_24_month_rows": None,
             "invalid_counts": {},
             "reasons": (str(exc),),
         }

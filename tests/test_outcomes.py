@@ -125,6 +125,24 @@ def test_status_only_schema_selects_cross_sectional_design() -> None:
         "Satisfaction Date was not supplied",
         "Cancellation Date was not supplied",
     )
+    assert gate["landmark_at_risk_rows"] is None
+    assert gate["mature_12_month_rows"] is None
+    assert gate["mature_24_month_rows"] is None
+
+
+def test_satisfaction_dates_without_cancellation_dates_leave_risk_counts_unknown() -> None:
+    frame = _frame(
+        [_row(status="Satisfied", satisfaction="2020-03-29"), _row()]
+    ).drop(columns="Cancellation Date")
+    frame.attrs["raw_header_schema"] = (("Satisfaction Date", "Satisfaction Date"),)
+
+    gate = outcome_validity_gate(frame, "2022-12-31")
+
+    assert gate["design"] == "cross_sectional"
+    assert gate["reasons"] == ("Cancellation Date was not supplied",)
+    assert gate["landmark_at_risk_rows"] is None
+    assert gate["mature_12_month_rows"] is None
+    assert gate["mature_24_month_rows"] is None
 
 
 def test_complete_exclusive_event_dates_select_longitudinal_design() -> None:
@@ -206,6 +224,9 @@ def test_validity_gate_selects_safe_fallback_for_timing_or_state_contradictions(
     assert gate["design"] == expected_design
     assert gate["invalid_counts"][invalid_key] == 1
     assert f"{invalid_key}=1" in gate["reasons"]
+    assert gate["landmark_at_risk_rows"] is None
+    assert gate["mature_12_month_rows"] is None
+    assert gate["mature_24_month_rows"] is None
 
 
 def test_validity_gate_returns_blocked_aggregate_for_missing_required_data() -> None:
@@ -214,6 +235,9 @@ def test_validity_gate_returns_blocked_aggregate_for_missing_required_data() -> 
     assert gate["design"] == "blocked"
     assert gate["rows"] == 1
     assert "missing required" in gate["reasons"][0]
+    assert gate["landmark_at_risk_rows"] is None
+    assert gate["mature_12_month_rows"] is None
+    assert gate["mature_24_month_rows"] is None
 
 
 def test_status_effective_date_is_reported_but_not_used_without_semantics() -> None:

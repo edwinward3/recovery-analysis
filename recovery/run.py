@@ -216,6 +216,9 @@ def _analyze_created_run(
             outcome_gate = {
                 **outcome_gate,
                 "design": "blocked",
+                "landmark_at_risk_rows": None,
+                "mature_12_month_rows": None,
+                "mature_24_month_rows": None,
                 "invalid_counts": {
                     **outcome_gate["invalid_counts"],
                     **{
@@ -796,7 +799,7 @@ def _run_manifest(
     prediction_status: str,
 ) -> dict[str, Any]:
     return {
-        "schema_version": 8,
+        "schema_version": 9,
         "status": "CONFIDENTIAL - SEND ONLY TO EDWIN",
         "run_id": paths.root.name,
         "schema_construct": audit.data_construct,

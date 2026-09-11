@@ -12,7 +12,7 @@ import unicodedata
 import pandas as pd
 
 from .config import Settings
-from .data import iter_ch_chunks
+from .data import iter_ch_chunks, parse_dates
 
 
 CH_REQUIRED_COLUMNS: tuple[str, ...] = (
@@ -232,21 +232,6 @@ def _validate_live_company_status(series: pd.Series) -> None:
         )
 
 
-def _parse_dates(series: pd.Series) -> pd.Series:
-    raw = series.astype("string").fillna("").str.strip()
-    iso = raw.str.fullmatch(r"\d{4}-\d{2}-\d{2}(?:[ T].*)?", na=False)
-    parsed = pd.Series(pd.NaT, index=series.index, dtype="datetime64[ns]")
-    if iso.any():
-        parsed.loc[iso] = pd.to_datetime(
-            raw.loc[iso], format="ISO8601", errors="coerce"
-        ).astype("datetime64[ns]")
-    if (~iso).any():
-        parsed.loc[~iso] = pd.to_datetime(
-            raw.loc[~iso], format="mixed", dayfirst=True, errors="coerce"
-        ).astype("datetime64[ns]")
-    return parsed.dt.normalize()
-
-
 def _name_periods(
     current_name: str,
     incorporation_date: pd.Timestamp | None,
@@ -361,7 +346,7 @@ def build_relevant_ch_index(
         kept = chunk.loc[retain].copy()
         rows_retained += len(kept)
         kept["__postcode"] = kept["RegAddress.PostCode"].map(normalize_postcode)
-        kept["__incorporation"] = _parse_dates(kept["IncorporationDate"])
+        kept["__incorporation"] = parse_dates(kept["IncorporationDate"])
         previous_numbers = sorted(
             {
                 int(match.group(1))
@@ -372,7 +357,7 @@ def build_relevant_ch_index(
         for number in previous_numbers:
             date_column = f"PreviousName_{number}.CONDATE"
             if date_column in kept:
-                kept[f"__former_date_{number}"] = _parse_dates(kept[date_column])
+                kept[f"__former_date_{number}"] = parse_dates(kept[date_column])
 
         arrays = {column: kept[column].to_numpy() for column in kept.columns}
         for position in range(len(kept)):
