@@ -203,7 +203,7 @@ class RunTests(unittest.TestCase):
             manifest = json.loads(
                 (paths.results / "E5_run_manifest.json").read_text(encoding="utf-8")
             )
-            self.assertEqual(manifest["schema_version"], 9)
+            self.assertEqual(manifest["schema_version"], 10)
             self.assertEqual(
                 manifest["companies_house_filename_date"],
                 pd.Timestamp(bundle.observation_date).date().isoformat(),
@@ -218,6 +218,9 @@ class RunTests(unittest.TestCase):
                 manifest["academic_design"]["prediction_bootstrap_replicates"],
                 500,
             )
+            timing = pd.read_csv(paths.results / "E3_satisfaction_timing.csv")
+            self.assertTrue(timing["status"].eq("not_run").all())
+            self.assertTrue(timing["estimate"].isna().all())
 
     def test_complete_event_dates_run_longitudinal_analysis_and_prediction(self) -> None:
         with TemporaryDirectory() as temporary:
@@ -271,9 +274,14 @@ class RunTests(unittest.TestCase):
                 bundle = make_synthetic_bundle(
                     200, include_prior_rows=False, include_event_dates=True
                 )
-                bundle.judgments = bundle.judgments.loc[
-                    bundle.judgments["JudgmentStatus"].ne("Cancelled")
-                ].drop(columns="Cancellation Date").rename(
+                bundle.judgments["JudgmentStatus"] = ["Satisfied"] * 100 + ["Unsatisfied"] * 100
+                bundle.judgments["JudgmentDate"] = "01/01/2023"
+                bundle.judgments["Date Inserted"] = "02/01/2023"
+                bundle.judgments["Satisfaction Date"] = [
+                    (pd.Timestamp("2023-01-01") + pd.Timedelta(days=delay)).strftime("%d/%m/%Y")
+                    for delay in (60, 120, 240, 500, 800) for _ in range(20)
+                ] + [""] * 100
+                bundle.judgments = bundle.judgments.drop(columns="Cancellation Date").rename(
                     columns={"Satisfaction Date": "DateSatisfied"}
                 )
                 for column, date_format in (
@@ -324,10 +332,74 @@ class RunTests(unittest.TestCase):
                     self.assertEqual(int(populated.iloc[0]), int(
                         bundle.judgments["JudgmentStatus"].eq("Satisfied").sum()
                     ))
+                    timing_name = next(name for name in names if name.endswith("/E3_satisfaction_timing.csv"))
+                    with package.open(timing_name) as handle:
+                        timing = pd.read_csv(handle)
+                    self.assertTrue(timing["status"].eq("completed").all())
+                    disposition = timing.loc[timing["dimension"].eq("disposition")].set_index("measure")
+                    self.assertEqual(disposition["rows"].to_dict(), {
+                        "included": 100, "missing_date": 0, "invalid_date": 0,
+                    })
+                    bands = timing.loc[timing["dimension"].eq("delay_band")]
+                    self.assertEqual(len(bands), 5)
+                    self.assertTrue(bands["rows"].eq(20).all())
+                    self.assertTrue(bands["share"].eq(0.2).all())
+                    statistics = timing.loc[timing["dimension"].eq("statistic")].set_index("measure")
+                    self.assertTrue(statistics["rows"].eq(100).all())
+                    self.assertEqual(statistics["estimate"].to_dict(), {
+                        "mean_days": 344, "q25_days": 120, "median_days": 240,
+                        "q75_days": 500, "p95_days": 800,
+                    })
                 self.assertEqual(
                     archive.with_suffix(".zip.sha256").read_text().split(),
                     [hashlib.sha256(archive.read_bytes()).hexdigest(), archive.name],
                 )
+
+    def test_sparse_missing_satisfaction_date_cannot_be_reconstructed_from_zip(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            bundle = make_synthetic_bundle(200, include_prior_rows=False)
+            bundle.judgments["JudgmentStatus"] = ["Satisfied"] * 100 + ["Unsatisfied"] * 100
+            bundle.judgments["JudgmentDate"] = "01/01/2023"
+            bundle.judgments["Date Inserted"] = "02/01/2023"
+            bundle.judgments["DateSatisfied"] = [""] + ["02/03/2023"] * 99 + [""] * 100
+            judgments, companies, _ = write_bundle(bundle, root / "inputs", excel=False)
+            paths = analyze(
+                judgments_path=judgments,
+                companies_house_path=companies,
+                observation_date=bundle.observation_date,
+                settings_path=ROOT / "settings.toml",
+                output_base=root / "outputs",
+                run_id="sparse_timing",
+            )
+
+            archive = package_results(paths)
+
+            with zipfile.ZipFile(archive) as package:
+                self.assertIsNone(package.testzip())
+                names = package.namelist()
+                timing_name = next(name for name in names if name.endswith("/E3_satisfaction_timing.csv"))
+                with package.open(timing_name) as handle:
+                    timing = pd.read_csv(handle)
+                self.assertTrue(timing["status"].eq("completed").all())
+                self.assertTrue(timing["rows"].isna().all())
+                self.assertTrue(timing["share"].isna().all())
+                statistics = timing.loc[timing["dimension"].eq("statistic")]
+                self.assertEqual(len(statistics), 5)
+                self.assertTrue(statistics["estimate"].eq(60).all())
+                audit_name = next(name for name in names if name.endswith("/E1_data_audit.csv"))
+                with package.open(audit_name) as handle:
+                    audit = pd.read_csv(handle)
+                related = (
+                    audit["dimension"].eq("optional_field_populated")
+                    & audit["value"].eq("Satisfaction Date")
+                ) | audit["dimension"].str.startswith("Satisfaction Date minus JudgmentDate")
+                self.assertGreater(int(related.sum()), 1)
+                self.assertTrue(audit.loc[related, ["rows", "share", "estimate"]].isna().all().all())
+                summary_name = next(name for name in names if name.endswith("/SUMMARY.txt"))
+                summary = package.read(summary_name).decode("utf-8")
+                satisfaction_line = next(line for line in summary.splitlines() if line.strip().startswith("Satisfaction Date"))
+                self.assertIn("present; suppressed filled", satisfaction_line)
 
     def test_conflicting_event_dates_select_cross_sectional_fallback(self) -> None:
         with TemporaryDirectory() as temporary:
@@ -415,6 +487,9 @@ class RunTests(unittest.TestCase):
             ]].isna().all())
             self.assertFalse((paths.results / "E3_status_at_extract.csv").exists())
             self.assertFalse((paths.results / "E3_cumulative_incidence.csv").exists())
+            timing = pd.read_csv(paths.results / "E3_satisfaction_timing.csv")
+            self.assertTrue(timing["status"].eq("not_run").all())
+            self.assertTrue(timing[["rows", "share", "estimate"]].isna().all().all())
             self.assertIn(
                 f"extra_column_{len(bundle.judgments.columns)}",
                 set(

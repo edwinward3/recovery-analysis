@@ -13,6 +13,7 @@ from recovery.disclosure import (
     scan_identifiers,
     stage_egress,
     suppress_small_cells,
+    timing_counts_require_suppression,
     validate_egress,
 )
 
@@ -435,6 +436,68 @@ class DisclosureTests(unittest.TestCase):
                 table = pd.read_csv(root / "egress" / name)
                 self.assertEqual(table.loc[:1, "rows"].tolist(), [20, 180])
                 self.assertTrue(table.loc[2:, "rows"].isna().all())
+
+    def test_blocked_timing_counts_hide_related_support(self) -> None:
+        table = pd.DataFrame({
+            "dimension": ["disposition"] * 3,
+            "rows": [pd.NA] * 3,
+        })
+
+        self.assertTrue(timing_counts_require_suppression(table))
+        self.assertFalse(timing_counts_require_suppression(table.iloc[:0]))
+        self.assertFalse(timing_counts_require_suppression(pd.DataFrame()))
+
+    def test_timing_keeps_supported_estimates_without_revealing_excluded_counts(self) -> None:
+        for included, missing, invalid, bands in (
+            (100, 0, 0, [10, 20, 30, 20, 20]),
+            (99, 1, 0, [10, 19, 30, 20, 20]),
+            (99, 0, 1, [10, 19, 30, 20, 20]),
+            (100, 0, 0, [5, 15, 30, 20, 30]),
+            (5, 95, 0, [1, 4, 0, 0, 0]),
+        ):
+            with self.subTest(included=included, missing=missing, invalid=invalid, bands=bands), TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                source = root / "candidate"
+                source.mkdir()
+                table = pd.DataFrame({
+                    "dimension": ["disposition"] * 3 + ["delay_band"] * 5 + ["statistic"] * 5,
+                    "measure": ["included", "missing_date", "invalid_date"]
+                    + ["0_90", "91_180", "181_365", "366_730", "731_plus"]
+                    + ["mean_days", "q25_days", "median_days", "q75_days", "p95_days"],
+                    "rows": [included, missing, invalid] + bands + [included] * 5,
+                    "share": [included / 100, missing / 100, invalid / 100]
+                    + [value / included for value in bands] + [None] * 5,
+                    "estimate": [None] * 8 + [300, 100, 250, 500, 800],
+                })
+                table.to_csv(source / "E3_satisfaction_timing.csv", index=False)
+                pd.DataFrame({
+                    "dimension": ["optional_field_populated", "Satisfaction Date minus JudgmentDate median"],
+                    "value": ["Satisfaction Date", ""],
+                    "rows": [included, included],
+                    "share": [included / 100, included / 100],
+                    "estimate": [None, 250],
+                }).to_csv(source / "E1_data_audit.csv", index=False)
+                stage_egress(source, root / "egress", allowlist={
+                    "E3_satisfaction_timing.csv": "rows",
+                    "E1_data_audit.csv": "rows",
+                })
+                cleaned = pd.read_csv(root / "egress" / "E3_satisfaction_timing.csv")
+                statistics = cleaned.loc[cleaned["dimension"].eq("statistic")]
+                rare_disposition = timing_counts_require_suppression(table)
+                self.assertEqual(rare_disposition, any(0 < value < 10 for value in (included, missing, invalid)))
+                if included < 10:
+                    self.assertTrue(statistics[["rows", "estimate"]].isna().all().all())
+                else:
+                    self.assertEqual(statistics["estimate"].tolist(), [300, 100, 250, 500, 800])
+                    self.assertEqual(statistics["rows"].isna().all(), rare_disposition)
+                hide_histogram = rare_disposition or any(0 < value < 10 for value in bands)
+                histogram = cleaned.loc[cleaned["dimension"].eq("delay_band")]
+                self.assertEqual(histogram[["rows", "share"]].isna().all().all(), hide_histogram)
+                if rare_disposition:
+                    disposition = cleaned.loc[cleaned["dimension"].eq("disposition")]
+                    self.assertTrue(disposition[["rows", "share"]].isna().all().all())
+                    audit = pd.read_csv(root / "egress" / "E1_data_audit.csv")
+                    self.assertTrue(audit[["rows", "share", "estimate"]].isna().all().all())
 
 
 if __name__ == "__main__":

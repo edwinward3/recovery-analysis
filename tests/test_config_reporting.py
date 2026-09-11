@@ -180,6 +180,22 @@ def test_count_format_hides_only_positive_small_counts() -> None:
     assert _fmt_count(10, min_cell_n=10) == "10"
 
 
+def test_summary_hides_timing_support_when_a_date_exclusion_is_small(tmp_path: Path) -> None:
+    path = tmp_path / "SUMMARY.txt"
+    write_summary(path, {
+        "optional_fields": {
+            "Satisfaction Date": {"present": True, "rows": 99, "suppress_count": True},
+            "Cancellation Date": {"present": True, "rows": 20},
+        },
+    })
+
+    text = path.read_text(encoding="utf-8")
+
+    assert "Satisfaction Date       present; suppressed filled" in text
+    assert "Cancellation Date       present; 20 filled" in text
+    assert "99 filled" not in text
+
+
 def test_summary_hides_match_complements_and_rate(tmp_path: Path) -> None:
     path = tmp_path / "SUMMARY.txt"
     write_summary(

@@ -5,12 +5,21 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
+from .data import parse_dates
+
 
 STATUSES: tuple[str, ...] = ("Satisfied", "Unsatisfied", "Cancelled")
 LANDMARK_MONTHS = 1
 FIXED_HORIZONS = (12, 24)
 PRIMARY_HORIZON_MONTHS = FIXED_HORIZONS[0]
 RETENTION_MONTHS = 72
+SATISFACTION_DELAY_BANDS = (
+    (90, "0_to_90_days"),
+    (180, "91_to_180_days"),
+    (365, "181_to_365_days"),
+    (730, "366_to_730_days"),
+    (float("inf"), "731_plus_days"),
+)
 HOLIDAY_CALENDAR_SOURCE = (
     "GOV.UK bank holidays in England and Wales; embedded calendar 2019-2027"
 )
@@ -823,3 +832,113 @@ def cross_sectional_status_aggregates(
     result["extract_date"] = extract.date().isoformat()
     result["estimand"] = "status_among_records_present_at_extract"
     return result
+
+
+def satisfaction_timing_aggregates(
+    judgments: pd.DataFrame,
+    extract_date: str | pd.Timestamp,
+) -> pd.DataFrame:
+    """Describe recording delays among retained satisfied corporate judgments."""
+
+    _require_columns(
+        judgments,
+        ("JudgmentDate", "Date Inserted", "JudgmentStatus", "DefendantType", "Jurisdiction"),
+    )
+    extract = _extract_timestamp(extract_date)
+    scope = (
+        judgments["DefendantType"].eq("Corporate")
+        & judgments["Jurisdiction"].eq("England and Wales")
+        & judgments["JudgmentStatus"].eq("Satisfied")
+    )
+    frame = judgments.loc[scope].reset_index(drop=True)
+    judgment = _required_dates(frame, "JudgmentDate")
+    inserted = _required_dates(frame, "Date Inserted")
+    dates: dict[str, pd.Series] = {}
+    invalid: dict[str, pd.Series] = {}
+    for column in ("Satisfaction Date", "Cancellation Date", "Status Effective Date", "Snapshot Date"):
+        raw = frame.get(column, pd.Series(pd.NaT, index=frame.index))
+        populated = raw.notna() & raw.astype("string").str.strip().ne("")
+        dates[column] = parse_dates(raw)
+        flag = f"_invalid_{column.lower().replace(' ', '_')}"
+        invalid[column] = (populated & dates[column].isna()) | frame.get(
+            flag, pd.Series(False, index=frame.index)
+        ).fillna(False).astype(bool)
+
+    def supplied(column: str) -> bool:
+        if "absent_optional" in judgments.attrs or "raw_header_schema" in judgments.attrs:
+            return _source_column_present(judgments, column, dates[column])
+        return column in judgments
+
+    satisfaction = dates["Satisfaction Date"]
+    effective = dates["Status Effective Date"]
+    snapshot = dates["Snapshot Date"]
+    reason_present = frame.get(
+        "Cancellation Reason", pd.Series("", index=frame.index)
+    ).astype("string").fillna("").str.strip().ne("")
+    conflicting = (
+        invalid["Satisfaction Date"]
+        | invalid["Cancellation Date"]
+        | invalid["Status Effective Date"]
+        | invalid["Snapshot Date"]
+        | dates["Cancellation Date"].notna()
+        | reason_present
+        | inserted.lt(judgment)
+        | inserted.gt(extract)
+        | satisfaction.le(_add_calendar_months(judgment, LANDMARK_MONTHS))
+        | satisfaction.lt(inserted)
+        | satisfaction.gt(extract)
+        | satisfaction.gt(_add_calendar_months(judgment, RETENTION_MONTHS))
+        | (effective.notna() & (effective.lt(satisfaction) | effective.gt(extract)))
+    )
+    if supplied("Snapshot Date"):
+        conflicting |= snapshot.isna() | snapshot.ne(extract)
+    missing = satisfaction.isna() & ~invalid["Satisfaction Date"]
+    included = satisfaction.notna() & ~conflicting
+    invalid_rows = ~missing & ~included
+    delays = (satisfaction.loc[included] - judgment.loc[included]).dt.days
+    support = int(len(delays))
+    if not supplied("Satisfaction Date"):
+        status, reason = "not_run", "Satisfaction Date was not supplied"
+    elif not len(frame):
+        status, reason = "not_run", "No satisfied corporate England and Wales records"
+    elif not support:
+        status, reason = "not_run", "No consistent recorded satisfaction dates"
+    else:
+        status, reason = "completed", ""
+
+    rows = [
+        {"dimension": "disposition", "measure": measure, "rows": int(mask.sum()),
+         "share": float(mask.mean()) if len(frame) else np.nan, "estimate": np.nan}
+        for measure, mask in (("included", included), ("missing_date", missing), ("invalid_date", invalid_rows))
+    ]
+    bands = pd.cut(
+        delays, bins=(0, *(bound for bound, _ in SATISFACTION_DELAY_BANDS)),
+        labels=[label for _, label in SATISFACTION_DELAY_BANDS], include_lowest=True,
+    ).value_counts(sort=False)
+    rows.extend(
+        {"dimension": "delay_band", "measure": label, "rows": int(bands[label]),
+         "share": float(bands[label] / support) if support else np.nan, "estimate": np.nan}
+        for _, label in SATISFACTION_DELAY_BANDS
+    )
+    statistics = {"mean_days": delays.mean()}
+    statistics.update(
+        (name, delays.quantile(quantile))
+        for name, quantile in (("q25_days", 0.25), ("median_days", 0.5), ("q75_days", 0.75), ("p95_days", 0.95))
+    )
+    rows.extend(
+        {"dimension": "statistic", "measure": name, "rows": support,
+         "share": np.nan, "estimate": float(np.rint(value)) if support else np.nan}
+        for name, value in statistics.items()
+    )
+    return pd.DataFrame(rows).assign(
+        status=status,
+        reason=reason,
+        extract_date=extract.date().isoformat(),
+        population="satisfied_corporate_England_and_Wales_records_present_at_extract",
+        time_origin="JudgmentDate",
+        interpretation=(
+            "Calendar days to recorded satisfaction among satisfied records with consistent dates "
+            "in the supplied extract. Summary estimates are rounded to whole calendar days; "
+            "not payment time or a future probability."
+        ),
+    )

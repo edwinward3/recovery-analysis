@@ -298,6 +298,18 @@ def _associated_estimate_columns(
     )
 
 
+def timing_counts_require_suppression(table: pd.DataFrame, min_cell_n: int = 10) -> bool:
+    if not {"dimension", "rows"}.issubset(table):
+        return False
+    counts = pd.to_numeric(
+        table.loc[table["dimension"].eq("disposition"), "rows"], errors="coerce"
+    )
+    return bool(
+        not counts.empty
+        and (counts.isna().all() or (counts.gt(0) & counts.lt(min_cell_n)).any())
+    )
+
+
 def _overlapping_breakdown_rows(root: Path, min_cell_n: int) -> dict[str, set[int]]:
     masks: dict[str, set[int]] = {}
     tables: dict[str, pd.DataFrame] = {}
@@ -364,6 +376,22 @@ def _overlapping_breakdown_rows(root: Path, min_cell_n: int) -> dict[str, set[in
             rare |= small(table[column])
         horizons = table.loc[quarters & rare, "horizon_months"]
         mark(name, quarters & table["horizon_months"].isin(horizons))
+
+    name = "E3_satisfaction_timing.csv"
+    table = read(name)
+    if {"dimension", "measure", "rows"}.issubset(table):
+        histogram = table["dimension"].eq("delay_band")
+        if timing_counts_require_suppression(table, min_cell_n):
+            mark(name, histogram | table["dimension"].eq("disposition"))
+            audit = read("E1_data_audit.csv")
+            if {"dimension", "value"}.issubset(audit):
+                related = (
+                    audit["dimension"].eq("optional_field_populated")
+                    & audit["value"].eq("Satisfaction Date")
+                ) | audit["dimension"].str.startswith("Satisfaction Date minus JudgmentDate")
+                mark("E1_data_audit.csv", related)
+        elif (histogram & small(table["rows"])).any():
+            mark(name, histogram)
     return masks
 
 
@@ -483,6 +511,11 @@ def stage_egress(
                 if extra_rows:
                     columns = (*count_columns, *_associated_estimate_columns(frame, set(count_columns), set()))
                     cleaned.loc[sorted(extra_rows), list(columns)] = pd.NA
+                if (
+                    relative.name == "E3_satisfaction_timing.csv"
+                    and timing_counts_require_suppression(frame, min_cell_n)
+                ):
+                    cleaned.loc[frame["dimension"].eq("statistic"), list(count_columns)] = pd.NA
                 removed = int((frame.notna() & cleaned.isna()).any(axis=1).sum())
                 cleaned.to_csv(target, index=False)
                 if removed:

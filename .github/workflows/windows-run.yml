@@ -76,6 +76,7 @@ jobs:
             "E2_match_coverage.csv", "E2_unmatched_reasons.csv", "E2_match_methods.csv",
             "E2_linkage_profile.csv", "E2_linkage_checks.csv", "E2_population_comparison.csv",
             "E2_validation_sampling.csv", "E3_outcome_gate.csv", "E3_status_at_extract.csv",
+            "E3_satisfaction_timing.csv",
             "E4_prediction_gate.csv", "E5_artifact_manifest.csv", "E5_output_dictionary.csv",
             "E5_run_log.csv", "E5_run_manifest.json"
           )
@@ -148,6 +149,7 @@ jobs:
             $archiveZip = Get-ChildItem outputs -File -Filter "SEND_TO_EDWIN_*.zip" | Select-Object -First 1
             if (-not $archiveRun -or -not $archiveZip -or
                 -not (Test-Path (Join-Path $archiveRun.FullName "results\E3_cumulative_incidence.csv")) -or
+                -not (Test-Path (Join-Path $archiveRun.FullName "results\E3_satisfaction_timing.csv")) -or
                 -not (Test-Path (Join-Path $archiveRun.FullName "results\E4_model_performance.csv"))) {
               throw "GitHub archive output is missing"
             }
@@ -210,7 +212,7 @@ jobs:
             throw "large-test matching counts are wrong"
           }
           foreach ($name in @(
-            "E3_cumulative_incidence.csv", "E3_fixed_horizon.csv",
+            "E3_cumulative_incidence.csv", "E3_fixed_horizon.csv", "E3_satisfaction_timing.csv",
             "E4_cohort_flow.csv", "E4_model_performance.csv", "E4_paired_improvement.csv",
             "E4_calibration_curve.csv", "E4_ranking.csv"
           )) {

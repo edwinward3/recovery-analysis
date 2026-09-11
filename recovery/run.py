@@ -19,7 +19,7 @@ import pandas as pd
 
 from .config import Settings, load_settings
 from .data import DataAudit, read_rt_extract
-from .disclosure import stage_egress
+from .disclosure import stage_egress, timing_counts_require_suppression
 from .matching import (
     ACCEPTED_LINKAGE_VALIDATION_FILENAME,
     UNMATCHED_LINKAGE_VALIDATION_FILENAME,
@@ -38,6 +38,7 @@ from .outcomes import (
     mature_fixed_horizon_outcomes,
     outcome_validity_gate,
     registration_working_day_aggregates,
+    satisfaction_timing_aggregates,
 )
 from .prediction import (
     BOOTSTRAP_REPLICATES,
@@ -275,18 +276,21 @@ def _analyze_created_run(
                 **prediction_tables,
             },
         )
-        write_summary(
-            aggregate / "SUMMARY.txt",
-            _summary_context(
-                audit=audit,
-                ch_filename_date=ch_filename_date,
-                judgments=judgments,
-                matches=matches,
-                settings=settings,
-                outcome_status=outcome_status,
-                prediction_status=prediction_status,
-            ),
+        summary = _summary_context(
+            audit=audit,
+            ch_filename_date=ch_filename_date,
+            judgments=judgments,
+            matches=matches,
+            settings=settings,
+            outcome_status=outcome_status,
+            prediction_status=prediction_status,
         )
+        summary["optional_fields"]["Satisfaction Date"]["suppress_count"] = (
+            timing_counts_require_suppression(
+                outcome_tables["E3_satisfaction_timing.csv"], settings.min_cell_n
+            )
+        )
+        write_summary(aggregate / "SUMMARY.txt", summary)
 
     pd.DataFrame(
         columns=["artifact_name", "bytes", "sha256", "rows"]
@@ -458,8 +462,15 @@ def _outcome_tables(
             }
         ]
     )
-    tables = {"E3_outcome_gate.csv": gate_table}
+    timing = satisfaction_timing_aggregates(judgments, observed)
+    tables = {
+        "E3_outcome_gate.csv": gate_table,
+        "E3_satisfaction_timing.csv": timing,
+    }
     if selected == "blocked":
+        timing[["rows", "share", "estimate"]] = pd.NA
+        timing["status"] = "not_run"
+        timing["reason"] = f"The outcome checks did not pass: {reasons}"
         return tables
     if selected == "cross_sectional":
         tables["E3_status_at_extract.csv"] = cross_sectional_status_aggregates(
@@ -799,7 +810,7 @@ def _run_manifest(
     prediction_status: str,
 ) -> dict[str, Any]:
     return {
-        "schema_version": 9,
+        "schema_version": 10,
         "status": "CONFIDENTIAL - SEND ONLY TO EDWIN",
         "run_id": paths.root.name,
         "schema_construct": audit.data_construct,

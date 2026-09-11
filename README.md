@@ -12,7 +12,7 @@ You need:
 2. Open the extracted folder and double-click `RUN.bat`.
 3. Drag in the complete RT file when asked.
 4. Drag in the Companies House ZIP when asked.
-5. Enter the RT extract date, then the date shown in the Companies House filename.
+5. Enter the RT extract date.
 6. Wait for **RUN COMPLETE** and send Edwin the ZIP file marked **SEND_TO_EDWIN**.
 
 The check will usually take about an hour. On a slower computer it may take up to three hours.

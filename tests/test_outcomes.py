@@ -17,6 +17,7 @@ from recovery.outcomes import (
     one_calendar_month_landmark,
     outcome_validity_gate,
     registration_working_day_aggregates,
+    satisfaction_timing_aggregates,
 )
 
 
@@ -411,3 +412,164 @@ def test_cross_sectional_aggregate_rejects_future_judgments() -> None:
     frame = _frame([_row(judgment="2025-01-02", inserted="2025-01-03")])
     with pytest.raises(ValueError, match="after the extract"):
         cross_sectional_status_aggregates(frame, "2025-01-01")
+
+
+def _timing_frame(rows: list[dict[str, object]]) -> pd.DataFrame:
+    frame = pd.DataFrame(rows)
+    if "DefendantType" not in frame:
+        frame["DefendantType"] = "Corporate"
+    frame.attrs["raw_header_schema"] = tuple((column, column) for column in frame)
+    return frame
+
+
+def test_satisfaction_timing_uses_only_scoped_satisfied_records_and_exact_bands() -> None:
+    judgment = pd.Timestamp("2020-01-01")
+    delays = [32, 90, 91, 180, 181, 365, 366, 730, 731]
+    rows = [
+        _row(status="Satisfied", judgment=str(judgment.date()), inserted="2020-01-02",
+             satisfaction=str((judgment + pd.Timedelta(days=days)).date()))
+        for days in delays
+    ]
+    for row in rows:
+        row["DefendantType"] = "Corporate"
+        row.pop("Cancellation Date")
+    outside = [
+        {**rows[0], "JudgmentStatus": "Unsatisfied"},
+        {**rows[0], "JudgmentStatus": "Cancelled"},
+        {**rows[0], "DefendantType": "Consumer"},
+        {**rows[0], "Jurisdiction": "Scotland"},
+    ]
+    frame = _timing_frame(rows + outside)
+    frame["tier"] = ["unmatched"] * 4 + ["exact_unique"] * (len(frame) - 4)
+
+    table = satisfaction_timing_aggregates(frame, "2024-12-31")
+    indexed = table.set_index("measure")
+
+    assert len(table) == 13
+    assert table["status"].eq("completed").all()
+    assert indexed.loc["included", "rows"] == len(delays)
+    bands = table.loc[table["dimension"].eq("delay_band")]
+    assert bands["rows"].tolist() == [2, 2, 2, 2, 1]
+    assert bands["share"].sum() == pytest.approx(1)
+    statistics = table.loc[table["dimension"].eq("statistic")]
+    assert statistics["estimate"].tolist() == [307, 91, 181, 366, 731]
+    assert statistics["rows"].eq(len(delays)).all()
+    assert statistics["share"].isna().all()
+    assert "ID" not in table
+    assert "minimum" not in indexed.index and "maximum" not in indexed.index
+    assert table["time_origin"].eq("JudgmentDate").all()
+    assert table["interpretation"].str.contains("not payment time or a future probability", regex=False).all()
+    shuffled = frame.sample(frac=1, random_state=3)
+    shuffled.index = np.arange(100, 100 + 2 * len(shuffled), 2)
+    pd.testing.assert_frame_equal(table, satisfaction_timing_aggregates(shuffled, "2024-12-31"))
+
+
+@pytest.mark.parametrize(
+    ("judgment", "landmark", "following"),
+    [("2024-01-31", "2024-02-29", "2024-03-01"),
+     ("2023-01-31", "2023-02-28", "2023-03-01"),
+     ("2024-02-29", "2024-03-29", "2024-03-30")],
+)
+def test_satisfaction_timing_requires_strictly_after_calendar_landmark(
+    judgment: str, landmark: str, following: str,
+) -> None:
+    rows = [
+        _row(status="Satisfied", judgment=judgment, inserted=judgment, satisfaction=date)
+        for date in (landmark, following)
+    ]
+
+    table = satisfaction_timing_aggregates(_timing_frame(rows), "2024-12-31").set_index("measure")
+
+    assert table.loc["included", "rows"] == 1
+    assert table.loc["invalid_date", "rows"] == 1
+    assert table.loc["missing_date", "rows"] == 0
+
+
+@pytest.mark.parametrize(
+    "changed",
+    [
+        {"Date Inserted": "2019-12-31"},
+        {"Date Inserted": "2024-01-02"},
+        {"Date Inserted": "2020-04-02"},
+        {"Satisfaction Date": "2024-01-02"},
+        {"Satisfaction Date": "bad date"},
+        {"Satisfaction Date": pd.NaT, "_invalid_satisfaction_date": True},
+        {"Cancellation Date": "2020-04-01"},
+        {"Cancellation Date": "bad date"},
+        {"Cancellation Date": pd.NaT, "_invalid_cancellation_date": True},
+        {"Cancellation Reason": "cancelled"},
+        {"Status Effective Date": "2020-03-31"},
+        {"Status Effective Date": "2024-01-02"},
+        {"Status Effective Date": "bad date"},
+        {"Status Effective Date": pd.NaT, "_invalid_status_effective_date": True},
+        {"Snapshot Date": "2023-12-31"},
+        {"Snapshot Date": pd.NaT},
+        {"Snapshot Date": "bad date"},
+        {"Snapshot Date": pd.NaT, "_invalid_snapshot_date": True},
+    ],
+)
+def test_satisfaction_timing_excludes_conflicting_populated_dates(changed) -> None:
+    row = _row(status="Satisfied", judgment="2020-01-01", inserted="2020-01-02", satisfaction="2020-04-01")
+    row.update(changed)
+
+    table = satisfaction_timing_aggregates(_timing_frame([row]), "2024-01-01")
+    counts = table.loc[table["dimension"].eq("disposition")].set_index("measure")["rows"]
+
+    assert table["status"].eq("not_run").all()
+    assert counts.to_dict() == {"included": 0, "missing_date": 0, "invalid_date": 1}
+    assert table.loc[table["dimension"].eq("statistic"), "estimate"].isna().all()
+
+
+def test_satisfaction_timing_allows_retention_and_extract_boundary_dates() -> None:
+    rows = [
+        _row(status="Satisfied", judgment="2020-01-01", inserted="2020-01-02", satisfaction=date)
+        for date in ("2026-01-01", "2026-01-02")
+    ]
+    table = satisfaction_timing_aggregates(_timing_frame(rows), "2026-01-02").set_index("measure")
+    assert table.loc["included", "rows"] == 1
+    assert table.loc["invalid_date", "rows"] == 1
+    table = satisfaction_timing_aggregates(_timing_frame(rows[:1]), "2026-01-01").set_index("measure")
+    assert table.loc["included", "rows"] == 1
+
+
+def test_satisfaction_timing_keeps_consistent_registration_and_optional_dates() -> None:
+    row = _row(status="Satisfied", judgment="2020-01-01", inserted="2020-04-01", satisfaction="2020-04-01")
+    row.update({"Status Effective Date": "2020-04-01", "Snapshot Date": "2024-01-01", "Cancellation Reason": ""})
+
+    table = satisfaction_timing_aggregates(_timing_frame([row]), "2024-01-01").set_index("measure")
+
+    assert table.loc["included", "rows"] == 1
+    assert table["status"].eq("completed").all()
+    assert table["interpretation"].str.contains("Summary estimates are rounded to whole calendar days", regex=False).all()
+
+
+def test_satisfaction_timing_missing_and_invalid_dates_partition_satisfied_records() -> None:
+    row = _row(status="Satisfied", judgment="2020-01-01", inserted="2020-01-02", satisfaction="2020-04-01")
+    rows = [row, {**row, "Satisfaction Date": ""}, {**row, "Satisfaction Date": "invalid"}]
+
+    table = satisfaction_timing_aggregates(_timing_frame(rows), "2024-12-31")
+    disposition = table.loc[table["dimension"].eq("disposition")]
+
+    assert disposition["rows"].tolist() == [1, 1, 1]
+    assert disposition["share"].tolist() == pytest.approx([1 / 3] * 3)
+    assert table.loc[table["dimension"].eq("delay_band"), "share"].sum() == pytest.approx(1)
+
+
+@pytest.mark.parametrize("case", ["absent", "blank", "zero_satisfied", "empty"])
+def test_satisfaction_timing_without_usable_dates_returns_stable_not_run_table(case) -> None:
+    row = _row(status="Satisfied")
+    if case == "absent":
+        row.pop("Satisfaction Date")
+    elif case == "zero_satisfied":
+        row["JudgmentStatus"] = "Unsatisfied"
+    frame = _timing_frame([row])
+    if case == "empty":
+        frame = frame.iloc[:0]
+
+    table = satisfaction_timing_aggregates(frame, "2024-12-31")
+
+    assert len(table) == 13
+    assert table["status"].eq("not_run").all()
+    assert table["reason"].str.len().gt(0).all()
+    assert table.loc[table["dimension"].ne("disposition"), "rows"].eq(0).all()
+    assert table["estimate"].isna().all()

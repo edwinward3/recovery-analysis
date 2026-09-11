@@ -35,6 +35,7 @@ _MATCHING_EGRESS = {
     "E2_population_comparison.csv",
     "E2_validation_sampling.csv",
     "E3_outcome_gate.csv",
+    "E3_satisfaction_timing.csv",
     "E3_status_at_extract.csv",
     "E4_prediction_gate.csv",
     "E5_artifact_manifest.csv",

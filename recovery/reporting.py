@@ -805,7 +805,11 @@ def _optional_field_lines(optional: Any, min_cell_n: int) -> list[str]:
     ):
         details = optional.get(name, {}) if isinstance(optional, dict) else {}
         presence = "present" if details.get("present") else "absent"
-        count = _fmt_count(details.get("rows", 0), min_cell_n)
+        count = (
+            "suppressed"
+            if details.get("suppress_count")
+            else _fmt_count(details.get("rows", 0), min_cell_n)
+        )
         lines.append(f"  {name:<23} {presence}; {count} filled")
     return lines
 
